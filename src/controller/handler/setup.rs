@@ -4,7 +4,9 @@
 
 //! Driver setup flow: discovery, pairing and reconfiguration.
 
-use crate::config_store::{DeviceConfig, backup_json, device_key, parse_backup};
+use crate::config_store::{
+    DeviceConfig, DriverSettings, SiriTiming, backup_json, device_key, parse_backup,
+};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
@@ -143,7 +145,7 @@ impl Handler<SetupDriverMsg> for Controller {
             ctx.run_later(ACK_DELAY, move |act, ctx| {
                 if act.is_setup_flow(flow, &ws_id) {
                     act.setup = Some(SetupState::RestoreChoice);
-                    let page = restore_choice_page(act.driver_settings.debug_log);
+                    let page = restore_choice_page(act.driver_settings);
                     act.request_input(&ws_id, page, ctx);
                 }
             });
@@ -379,6 +381,7 @@ impl Controller {
     ) {
         let debug_log = parse_bool(values, "debug_log", self.driver_settings.debug_log);
         self.set_debug_log(&ws_id, debug_log);
+        self.set_siri_timing(&ws_id, values);
         let flow = self.setup_flow;
         let restore = parse_bool(values, "restore_from_backup", false);
         ctx.run_later(ACK_DELAY, move |act, ctx| {
@@ -488,6 +491,7 @@ impl Controller {
             &ws_id,
             parse_bool(values, "debug_log", self.driver_settings.debug_log),
         );
+        self.set_siri_timing(&ws_id, values);
         match action {
             "settings" => self.finish_setup_later(ws_id, ctx),
             "add" => {
@@ -604,6 +608,25 @@ impl Controller {
         } else {
             info!("[{ws_id}] debug log {}", if on { "on" } else { "off" });
         }
+        if let Err(e) = self.store.save_settings(self.driver_settings) {
+            warn!("[{ws_id}] saving the settings failed: {e}");
+        }
+    }
+
+    /// Set the Siri timing from the setup page and save it.
+    fn set_siri_timing(&mut self, ws_id: &str, values: &HashMap<String, String>) {
+        let Some(timing) = values
+            .get("siri_timing")
+            .and_then(|v| SiriTiming::from_id(v))
+        else {
+            return;
+        };
+        if self.driver_settings.siri_timing == timing {
+            return;
+        }
+        self.driver_settings.siri_timing = timing;
+        self.device_ctx.set_siri_timing(timing);
+        info!("[{ws_id}] Siri timing: {}", timing.label());
         if let Err(e) = self.store.save_settings(self.driver_settings) {
             warn!("[{ws_id}] saving the settings failed: {e}");
         }
@@ -890,9 +913,7 @@ impl Controller {
     fn request_input_again(&mut self, ws_id: &str, message: &str, ctx: &mut Context<Self>) {
         let page = match &self.setup {
             Some(SetupState::Discover) => Some(discover_page()),
-            Some(SetupState::RestoreChoice) => {
-                Some(restore_choice_page(self.driver_settings.debug_log))
-            }
+            Some(SetupState::RestoreChoice) => Some(restore_choice_page(self.driver_settings)),
             Some(SetupState::Restore) => Some(restore_page()),
             Some(SetupState::Backup) => backup_json(&self.sorted_configs())
                 .as_deref()
@@ -1025,7 +1046,8 @@ impl Controller {
                     "label": { "en": "Action" },
                     "field": { "dropdown": { "value": "add", "items": actions } }
                 },
-                debug_log_field(self.driver_settings.debug_log)
+                debug_log_field(self.driver_settings.debug_log),
+                siri_timing_field(self.driver_settings.siri_timing)
             ]
         })
     }
@@ -1034,7 +1056,7 @@ impl Controller {
 /// Shown for invalid restore data. It must not contain the data.
 const RESTORE_FAILED: &str = "Restore failed or invalid backup data. Please try again.";
 
-fn restore_choice_page(debug_log: bool) -> Value {
+fn restore_choice_page(settings: DriverSettings) -> Value {
     json!({
         "title": { "en": "Restore" },
         "settings": [
@@ -1048,7 +1070,8 @@ fn restore_choice_page(debug_log: bool) -> Value {
                 "label": { "en": "Restore from backup" },
                 "field": { "checkbox": { "value": false } }
             },
-            debug_log_field(debug_log)
+            debug_log_field(settings.debug_log),
+            siri_timing_field(settings.siri_timing)
         ]
     })
 }
@@ -1112,6 +1135,18 @@ fn debug_log_field(value: bool) -> Value {
         "id": "debug_log",
         "label": { "en": "Debug log (for error reports, more log lines)" },
         "field": { "checkbox": { "value": value } }
+    })
+}
+
+fn siri_timing_field(value: SiriTiming) -> Value {
+    let items: Vec<Value> = SiriTiming::ALL
+        .iter()
+        .map(|t| json!({ "id": t.id(), "label": { "en": t.label() } }))
+        .collect();
+    json!({
+        "id": "siri_timing",
+        "label": { "en": "Siri timing (test)" },
+        "field": { "dropdown": { "value": value.id(), "items": items } }
     })
 }
 

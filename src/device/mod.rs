@@ -11,7 +11,7 @@ pub mod state;
 
 pub use actor::AppleTvActor;
 
-use crate::config_store::{ConfigStore, DeviceConfig};
+use crate::config_store::{ConfigStore, DeviceConfig, SiriTiming};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::server::ArtworkStore;
@@ -20,6 +20,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use uc_api::intg::AssistantEvent;
 use uc_api::intg::ws::BrowseMediaResponseMsgData;
 use uc_api::model::Paging;
@@ -34,6 +35,18 @@ pub struct DeviceContext {
     pub http_port: u16,
     pub store: ConfigStore,
     pub artwork: ArtworkStore,
+    /// [`SiriTiming`] as `u8`. The setup can change it.
+    pub siri_timing: AtomicU8,
+}
+
+impl DeviceContext {
+    pub fn siri_timing(&self) -> SiriTiming {
+        SiriTiming::from_u8(self.siri_timing.load(Ordering::Relaxed))
+    }
+
+    pub fn set_siri_timing(&self, timing: SiriTiming) {
+        self.siri_timing.store(timing as u8, Ordering::Relaxed);
+    }
 }
 
 /// Current time in MRP time, for playback positions.

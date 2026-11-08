@@ -149,6 +149,56 @@ pub struct DriverSettings {
     /// Log debug messages of the driver and ratv.
     #[serde(default)]
     pub debug_log: bool,
+    #[serde(default)]
+    pub siri_timing: SiriTiming,
+}
+
+/// How the Siri audio is sent to the Apple TV. A test setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SiriTiming {
+    /// Audio kept while Siri starts is sent at once.
+    #[default]
+    Normal,
+    /// Audio is sent no faster than real time.
+    Paced,
+    /// Paced, and Siri is released 250 ms after the last audio.
+    PacedDelay,
+}
+
+impl SiriTiming {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Paced, Self::PacedDelay];
+
+    /// Id in the setup page.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Paced => "paced",
+            Self::PacedDelay => "paced_delay",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Paced => "Paced",
+            Self::PacedDelay => "Paced + 250 ms release delay",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.id() == id)
+    }
+
+    /// Value of `self as u8`. Unknown values give `Normal`.
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Paced,
+            2 => Self::PacedDelay,
+            _ => Self::Normal,
+        }
+    }
 }
 
 /// Load the driver settings. A missing or broken file gives the defaults.
@@ -481,6 +531,18 @@ mod tests {
     }
 
     #[test]
+    fn siri_timing_ids() {
+        for t in SiriTiming::ALL {
+            assert_eq!(Some(t), SiriTiming::from_id(t.id()));
+            assert_eq!(t, SiriTiming::from_u8(t as u8));
+        }
+        assert_eq!(None, SiriTiming::from_id("fast"));
+        // Older settings files have no Siri timing.
+        let old: DriverSettings = serde_json::from_str(r#"{"debug_log":true}"#).expect("json");
+        assert_eq!(SiriTiming::Normal, old.siri_timing);
+    }
+
+    #[test]
     fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!(
             "uc-intg-appletv-test-settings-{}",
@@ -490,7 +552,10 @@ mod tests {
         assert_eq!(DriverSettings::default(), load_settings(&dir));
 
         let store = ConfigStore::new(&dir);
-        let settings = DriverSettings { debug_log: true };
+        let settings = DriverSettings {
+            debug_log: true,
+            siri_timing: SiriTiming::PacedDelay,
+        };
         store.save_settings(settings).expect("save");
         store.writer.flush();
         assert_eq!(settings, load_settings(&dir));
