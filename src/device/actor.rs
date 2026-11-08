@@ -3,7 +3,7 @@
 
 //! Actor for one Apple TV: connection, state updates and commands.
 
-use crate::config_store::{DeviceConfig, fnv1a};
+use crate::config_store::{DeviceConfig, SiriTiming, fnv1a};
 use crate::device::commands::{Call, Planner, Seek, exec_all};
 use crate::device::state::{
     ARTWORK_SIZE, AccountInfo, AppInfo, Dirty, ItemArtwork, Power, Snapshot,
@@ -63,6 +63,8 @@ const SIRI_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const SIRI_QUEUE: usize = 256;
 /// Longest wait for the session before to end.
 const SIRI_WAIT: Duration = Duration::from_secs(15);
+/// Wait after the last audio before Siri is released, with [`SiriTiming::PacedDelay`].
+const SIRI_RELEASE_DELAY: Duration = Duration::from_millis(250);
 /// Screen events come in bursts. Act after the last one.
 const SCREEN_SETTLE: Duration = Duration::from_millis(1500);
 /// Now playing changes right after the Home Screen shows belong to the switch.
@@ -1146,6 +1148,12 @@ impl AppleTvActor {
             replaced: replaced.clone(),
         });
 
+        let timing = self.ctx.siri_timing();
+        debug!(
+            "[{}] Siri session {session_id}: timing {}",
+            self.cfg.name,
+            timing.label()
+        );
         let entity_id = EntityKind::VoiceAssistant.entity_id(&self.key);
         let controller = self.controller.clone();
         let ready_id = entity_id.clone();
@@ -1166,6 +1174,10 @@ impl AppleTvActor {
                 return Ok(None);
             }
             let mut siri = tv.start_siri().await?;
+            siri.set_paced(timing != SiriTiming::Normal);
+            if timing == SiriTiming::PacedDelay {
+                siri.set_release_delay(SIRI_RELEASE_DELAY);
+            }
             controller.do_send(DeviceEvent::Assistant(AssistantEvent::Ready {
                 entity_id: ready_id,
                 session_id,

@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 use uc_api::intg::{DeviceState, IntegrationDriverUpdate};
 use uc_api::ws::{EventCategory, WsMessage};
@@ -138,6 +139,7 @@ impl Controller {
             http_port: settings.http_port,
             store: store.clone(),
             artwork,
+            siri_timing: AtomicU8::new(driver_settings.siri_timing as u8),
         });
         Self {
             sessions: HashMap::default(),
