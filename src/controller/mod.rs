@@ -139,7 +139,7 @@ impl Controller {
             http_port: settings.http_port,
             store: store.clone(),
             artwork,
-            siri_timing: AtomicU8::new(driver_settings.siri_timing as u8),
+            siri_mode: AtomicU8::new(driver_settings.siri_mode as u8),
         });
         Self {
             sessions: HashMap::default(),
