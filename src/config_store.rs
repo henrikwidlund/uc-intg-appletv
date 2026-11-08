@@ -153,41 +153,35 @@ pub struct DriverSettings {
     pub siri_mode: SiriMode,
 }
 
-/// How the Siri audio is sent to the Apple TV. A test setting.
+/// Protocol for the Siri audio.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum SiriMode {
     /// Companion, as the iPhone remote sends it. MRP if Companion is not connected.
+    /// Also loads the removed test modes.
     #[default]
+    #[serde(alias = "mrp_paced", alias = "mrp_paced_delay")]
     Auto,
-    /// MRP. Audio kept while Siri starts is sent at once.
+    /// MRP only. Some devices with tvOS 27 record but do not hear this audio.
     Mrp,
-    /// MRP. Audio is sent no faster than real time.
-    MrpPaced,
-    /// MRP, paced, and Siri is released 250 ms after the last audio.
-    MrpPacedDelay,
 }
 
 impl SiriMode {
-    pub const ALL: [Self; 4] = [Self::Auto, Self::Mrp, Self::MrpPaced, Self::MrpPacedDelay];
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Mrp];
 
     /// Id in the setup page.
     pub const fn id(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Mrp => "mrp",
-            Self::MrpPaced => "mrp_paced",
-            Self::MrpPacedDelay => "mrp_paced_delay",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto (Companion, else MRP)",
-            Self::Mrp => "MRP",
-            Self::MrpPaced => "MRP, paced",
-            Self::MrpPacedDelay => "MRP, paced + 250 ms release delay",
+            Self::Mrp => "MRP only",
         }
     }
 
@@ -199,8 +193,6 @@ impl SiriMode {
     pub const fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Mrp,
-            2 => Self::MrpPaced,
-            3 => Self::MrpPacedDelay,
             _ => Self::Auto,
         }
     }
@@ -547,6 +539,11 @@ mod tests {
             serde_json::from_str(r#"{"debug_log":true,"siri_timing":"paced_delay"}"#)
                 .expect("json");
         assert_eq!(SiriMode::Auto, old.siri_mode);
+        let test: DriverSettings =
+            serde_json::from_str(r#"{"debug_log":true,"siri_mode":"mrp_paced_delay"}"#)
+                .expect("json");
+        assert!(test.debug_log);
+        assert_eq!(SiriMode::Auto, test.siri_mode);
     }
 
     #[test]
@@ -561,7 +558,7 @@ mod tests {
         let store = ConfigStore::new(&dir);
         let settings = DriverSettings {
             debug_log: true,
-            siri_mode: SiriMode::MrpPacedDelay,
+            siri_mode: SiriMode::Mrp,
         };
         store.save_settings(settings).expect("save");
         store.writer.flush();

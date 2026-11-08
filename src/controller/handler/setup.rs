@@ -613,17 +613,17 @@ impl Controller {
         }
     }
 
-    /// Set the Siri timing from the setup page and save it.
+    /// Set the Siri mode from the setup page and save it.
     fn set_siri_mode(&mut self, ws_id: &str, values: &HashMap<String, String>) {
-        let Some(timing) = values.get("siri_mode").and_then(|v| SiriMode::from_id(v)) else {
+        let Some(mode) = values.get("siri_mode").and_then(|v| SiriMode::from_id(v)) else {
             return;
         };
-        if self.driver_settings.siri_mode == timing {
+        if self.driver_settings.siri_mode == mode {
             return;
         }
-        self.driver_settings.siri_mode = timing;
-        self.device_ctx.set_siri_mode(timing);
-        info!("[{ws_id}] Siri timing: {}", timing.label());
+        self.driver_settings.siri_mode = mode;
+        self.device_ctx.set_siri_mode(mode);
+        info!("[{ws_id}] Siri mode: {}", mode.label());
         if let Err(e) = self.store.save_settings(self.driver_settings) {
             warn!("[{ws_id}] saving the settings failed: {e}");
         }
@@ -1142,7 +1142,7 @@ fn siri_mode_field(value: SiriMode) -> Value {
         .collect();
     json!({
         "id": "siri_mode",
-        "label": { "en": "Siri mode (test)" },
+        "label": { "en": "Siri protocol (change only to find errors)" },
         "field": { "dropdown": { "value": value.id(), "items": items } }
     })
 }

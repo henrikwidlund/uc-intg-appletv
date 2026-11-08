@@ -63,8 +63,6 @@ const SIRI_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const SIRI_QUEUE: usize = 256;
 /// Longest wait for the session before to end.
 const SIRI_WAIT: Duration = Duration::from_secs(15);
-/// Wait after the last audio before Siri is released, with [`SiriMode::MrpPacedDelay`].
-const SIRI_RELEASE_DELAY: Duration = Duration::from_millis(250);
 /// Screen events come in bursts. Act after the last one.
 const SCREEN_SETTLE: Duration = Duration::from_millis(1500);
 /// Now playing changes right after the Home Screen shows belong to the switch.
@@ -1225,19 +1223,13 @@ impl AppleTvActor {
 
 /// Starts Siri on the path of `mode`.
 async fn start_siri(tv: &AppleTv, mode: SiriMode) -> Result<ratv::Siri, ratv::Error> {
-    if mode == SiriMode::Auto {
-        return tv.start_siri().await;
+    match mode {
+        SiriMode::Auto => tv.start_siri().await,
+        SiriMode::Mrp => {
+            let mrp = tv.mrp().ok_or(ratv::Error::NotConnected("MRP"))?;
+            mrp.start_siri().await.map(ratv::Siri::Mrp)
+        }
     }
-    let mut siri = tv
-        .mrp()
-        .ok_or(ratv::Error::NotConnected("MRP"))?
-        .start_siri()
-        .await?;
-    siri.set_paced(mode != SiriMode::Mrp);
-    if mode == SiriMode::MrpPacedDelay {
-        siri.set_release_delay(SIRI_RELEASE_DELAY);
-    }
-    Ok(ratv::Siri::Mrp(siri))
 }
 
 /// Assistant event for the end of a Siri session. `chunks` is the number of audio chunks sent to

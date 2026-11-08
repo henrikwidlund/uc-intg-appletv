@@ -44,8 +44,8 @@ impl DeviceContext {
         SiriMode::from_u8(self.siri_mode.load(Ordering::Relaxed))
     }
 
-    pub fn set_siri_mode(&self, timing: SiriMode) {
-        self.siri_mode.store(timing as u8, Ordering::Relaxed);
+    pub fn set_siri_mode(&self, mode: SiriMode) {
+        self.siri_mode.store(mode as u8, Ordering::Relaxed);
     }
 }
 
