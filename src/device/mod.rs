@@ -11,7 +11,7 @@ pub mod state;
 
 pub use actor::AppleTvActor;
 
-use crate::config_store::{ConfigStore, DeviceConfig, SiriTiming};
+use crate::config_store::{ConfigStore, DeviceConfig, SiriMode};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::server::ArtworkStore;
@@ -35,17 +35,17 @@ pub struct DeviceContext {
     pub http_port: u16,
     pub store: ConfigStore,
     pub artwork: ArtworkStore,
-    /// [`SiriTiming`] as `u8`. The setup can change it.
-    pub siri_timing: AtomicU8,
+    /// [`SiriMode`] as `u8`. The setup can change it.
+    pub siri_mode: AtomicU8,
 }
 
 impl DeviceContext {
-    pub fn siri_timing(&self) -> SiriTiming {
-        SiriTiming::from_u8(self.siri_timing.load(Ordering::Relaxed))
+    pub fn siri_mode(&self) -> SiriMode {
+        SiriMode::from_u8(self.siri_mode.load(Ordering::Relaxed))
     }
 
-    pub fn set_siri_timing(&self, timing: SiriTiming) {
-        self.siri_timing.store(timing as u8, Ordering::Relaxed);
+    pub fn set_siri_mode(&self, timing: SiriMode) {
+        self.siri_mode.store(timing as u8, Ordering::Relaxed);
     }
 }
 

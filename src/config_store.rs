@@ -150,40 +150,44 @@ pub struct DriverSettings {
     #[serde(default)]
     pub debug_log: bool,
     #[serde(default)]
-    pub siri_timing: SiriTiming,
+    pub siri_mode: SiriMode,
 }
 
 /// How the Siri audio is sent to the Apple TV. A test setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum SiriTiming {
-    /// Audio kept while Siri starts is sent at once.
+pub enum SiriMode {
+    /// Companion, as the iPhone remote sends it. MRP if Companion is not connected.
     #[default]
-    Normal,
-    /// Audio is sent no faster than real time.
-    Paced,
-    /// Paced, and Siri is released 250 ms after the last audio.
-    PacedDelay,
+    Auto,
+    /// MRP. Audio kept while Siri starts is sent at once.
+    Mrp,
+    /// MRP. Audio is sent no faster than real time.
+    MrpPaced,
+    /// MRP, paced, and Siri is released 250 ms after the last audio.
+    MrpPacedDelay,
 }
 
-impl SiriTiming {
-    pub const ALL: [Self; 3] = [Self::Normal, Self::Paced, Self::PacedDelay];
+impl SiriMode {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Mrp, Self::MrpPaced, Self::MrpPacedDelay];
 
     /// Id in the setup page.
     pub const fn id(self) -> &'static str {
         match self {
-            Self::Normal => "normal",
-            Self::Paced => "paced",
-            Self::PacedDelay => "paced_delay",
+            Self::Auto => "auto",
+            Self::Mrp => "mrp",
+            Self::MrpPaced => "mrp_paced",
+            Self::MrpPacedDelay => "mrp_paced_delay",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Normal => "Normal",
-            Self::Paced => "Paced",
-            Self::PacedDelay => "Paced + 250 ms release delay",
+            Self::Auto => "Auto (Companion, else MRP)",
+            Self::Mrp => "MRP",
+            Self::MrpPaced => "MRP, paced",
+            Self::MrpPacedDelay => "MRP, paced + 250 ms release delay",
         }
     }
 
@@ -191,12 +195,13 @@ impl SiriTiming {
         Self::ALL.into_iter().find(|t| t.id() == id)
     }
 
-    /// Value of `self as u8`. Unknown values give `Normal`.
+    /// Value of `self as u8`. Unknown values give `Auto`.
     pub const fn from_u8(v: u8) -> Self {
         match v {
-            1 => Self::Paced,
-            2 => Self::PacedDelay,
-            _ => Self::Normal,
+            1 => Self::Mrp,
+            2 => Self::MrpPaced,
+            3 => Self::MrpPacedDelay,
+            _ => Self::Auto,
         }
     }
 }
@@ -531,15 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn siri_timing_ids() {
-        for t in SiriTiming::ALL {
-            assert_eq!(Some(t), SiriTiming::from_id(t.id()));
-            assert_eq!(t, SiriTiming::from_u8(t as u8));
+    fn siri_mode_ids() {
+        for t in SiriMode::ALL {
+            assert_eq!(Some(t), SiriMode::from_id(t.id()));
+            assert_eq!(t, SiriMode::from_u8(t as u8));
         }
-        assert_eq!(None, SiriTiming::from_id("fast"));
-        // Older settings files have no Siri timing.
-        let old: DriverSettings = serde_json::from_str(r#"{"debug_log":true}"#).expect("json");
-        assert_eq!(SiriTiming::Normal, old.siri_timing);
+        assert_eq!(None, SiriMode::from_id("fast"));
+        // Older settings files have no Siri mode, or the Siri timing of v0.0.2-pre03.
+        let old: DriverSettings =
+            serde_json::from_str(r#"{"debug_log":true,"siri_timing":"paced_delay"}"#)
+                .expect("json");
+        assert_eq!(SiriMode::Auto, old.siri_mode);
     }
 
     #[test]
@@ -554,7 +561,7 @@ mod tests {
         let store = ConfigStore::new(&dir);
         let settings = DriverSettings {
             debug_log: true,
-            siri_timing: SiriTiming::PacedDelay,
+            siri_mode: SiriMode::MrpPacedDelay,
         };
         store.save_settings(settings).expect("save");
         store.writer.flush();

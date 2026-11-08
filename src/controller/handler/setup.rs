@@ -5,7 +5,7 @@
 //! Driver setup flow: discovery, pairing and reconfiguration.
 
 use crate::config_store::{
-    DeviceConfig, DriverSettings, SiriTiming, backup_json, device_key, parse_backup,
+    DeviceConfig, DriverSettings, SiriMode, backup_json, device_key, parse_backup,
 };
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
@@ -381,7 +381,7 @@ impl Controller {
     ) {
         let debug_log = parse_bool(values, "debug_log", self.driver_settings.debug_log);
         self.set_debug_log(&ws_id, debug_log);
-        self.set_siri_timing(&ws_id, values);
+        self.set_siri_mode(&ws_id, values);
         let flow = self.setup_flow;
         let restore = parse_bool(values, "restore_from_backup", false);
         ctx.run_later(ACK_DELAY, move |act, ctx| {
@@ -491,7 +491,7 @@ impl Controller {
             &ws_id,
             parse_bool(values, "debug_log", self.driver_settings.debug_log),
         );
-        self.set_siri_timing(&ws_id, values);
+        self.set_siri_mode(&ws_id, values);
         match action {
             "settings" => self.finish_setup_later(ws_id, ctx),
             "add" => {
@@ -614,18 +614,15 @@ impl Controller {
     }
 
     /// Set the Siri timing from the setup page and save it.
-    fn set_siri_timing(&mut self, ws_id: &str, values: &HashMap<String, String>) {
-        let Some(timing) = values
-            .get("siri_timing")
-            .and_then(|v| SiriTiming::from_id(v))
-        else {
+    fn set_siri_mode(&mut self, ws_id: &str, values: &HashMap<String, String>) {
+        let Some(timing) = values.get("siri_mode").and_then(|v| SiriMode::from_id(v)) else {
             return;
         };
-        if self.driver_settings.siri_timing == timing {
+        if self.driver_settings.siri_mode == timing {
             return;
         }
-        self.driver_settings.siri_timing = timing;
-        self.device_ctx.set_siri_timing(timing);
+        self.driver_settings.siri_mode = timing;
+        self.device_ctx.set_siri_mode(timing);
         info!("[{ws_id}] Siri timing: {}", timing.label());
         if let Err(e) = self.store.save_settings(self.driver_settings) {
             warn!("[{ws_id}] saving the settings failed: {e}");
@@ -1047,7 +1044,7 @@ impl Controller {
                     "field": { "dropdown": { "value": "add", "items": actions } }
                 },
                 debug_log_field(self.driver_settings.debug_log),
-                siri_timing_field(self.driver_settings.siri_timing)
+                siri_mode_field(self.driver_settings.siri_mode)
             ]
         })
     }
@@ -1071,7 +1068,7 @@ fn restore_choice_page(settings: DriverSettings) -> Value {
                 "field": { "checkbox": { "value": false } }
             },
             debug_log_field(settings.debug_log),
-            siri_timing_field(settings.siri_timing)
+            siri_mode_field(settings.siri_mode)
         ]
     })
 }
@@ -1138,14 +1135,14 @@ fn debug_log_field(value: bool) -> Value {
     })
 }
 
-fn siri_timing_field(value: SiriTiming) -> Value {
-    let items: Vec<Value> = SiriTiming::ALL
+fn siri_mode_field(value: SiriMode) -> Value {
+    let items: Vec<Value> = SiriMode::ALL
         .iter()
         .map(|t| json!({ "id": t.id(), "label": { "en": t.label() } }))
         .collect();
     json!({
-        "id": "siri_timing",
-        "label": { "en": "Siri timing (test)" },
+        "id": "siri_mode",
+        "label": { "en": "Siri mode (test)" },
         "field": { "dropdown": { "value": value.id(), "items": items } }
     })
 }

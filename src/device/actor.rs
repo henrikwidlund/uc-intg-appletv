@@ -3,7 +3,7 @@
 
 //! Actor for one Apple TV: connection, state updates and commands.
 
-use crate::config_store::{DeviceConfig, SiriTiming, fnv1a};
+use crate::config_store::{DeviceConfig, SiriMode, fnv1a};
 use crate::device::commands::{Call, Planner, Seek, exec_all};
 use crate::device::state::{
     ARTWORK_SIZE, AccountInfo, AppInfo, Dirty, ItemArtwork, Power, Snapshot,
@@ -63,7 +63,7 @@ const SIRI_AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const SIRI_QUEUE: usize = 256;
 /// Longest wait for the session before to end.
 const SIRI_WAIT: Duration = Duration::from_secs(15);
-/// Wait after the last audio before Siri is released, with [`SiriTiming::PacedDelay`].
+/// Wait after the last audio before Siri is released, with [`SiriMode::MrpPacedDelay`].
 const SIRI_RELEASE_DELAY: Duration = Duration::from_millis(250);
 /// Screen events come in bursts. Act after the last one.
 const SCREEN_SETTLE: Duration = Duration::from_millis(1500);
@@ -416,7 +416,7 @@ impl AppleTvActor {
             (false, _) => {
                 Some("Companion: power state, apps, accounts and swipes are not available")
             }
-            (_, false) => Some("MRP: now playing, volume, outputs and Siri are not available"),
+            (_, false) => Some("MRP: now playing, volume and outputs are not available"),
         };
         if let Some(missing) = missing {
             warn!("[{}] not connected: {missing}", self.cfg.name);
@@ -1129,8 +1129,10 @@ impl AppleTvActor {
         let connecting = self.running_connect();
         if connecting.is_none() {
             let tv = self.tv.as_ref().ok_or(ServiceError::NotConnected)?;
-            if tv.mrp().is_none() {
-                return Err(ServiceError::ServiceUnavailable("Siri needs MRP".into()));
+            if tv.companion().is_none() && tv.mrp().is_none() {
+                return Err(ServiceError::ServiceUnavailable(
+                    "Siri needs Companion or MRP".into(),
+                ));
             }
         }
         if let Some(old) = self.siri.take() {
@@ -1148,11 +1150,11 @@ impl AppleTvActor {
             replaced: replaced.clone(),
         });
 
-        let timing = self.ctx.siri_timing();
+        let mode = self.ctx.siri_mode();
         debug!(
-            "[{}] Siri session {session_id}: timing {}",
+            "[{}] Siri session {session_id}: mode {}",
             self.cfg.name,
-            timing.label()
+            mode.label()
         );
         let entity_id = EntityKind::VoiceAssistant.entity_id(&self.key);
         let controller = self.controller.clone();
@@ -1162,9 +1164,6 @@ impl AppleTvActor {
         // Returns the number of audio chunks sent to the Apple TV.
         let fut = move |tv: Option<AppleTv>| async move {
             let tv = tv.ok_or(ratv::Error::NotConnected("Apple TV"))?;
-            if tv.mrp().is_none() {
-                return Err(ratv::Error::NotConnected("MRP"));
-            }
             // ratv allows one session. The session before ends after its audio is sent.
             let _active = tokio::time::timeout(SIRI_WAIT, lock.lock_owned())
                 .await
@@ -1173,11 +1172,7 @@ impl AppleTvActor {
             if replaced.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let mut siri = tv.start_siri().await?;
-            siri.set_paced(timing != SiriTiming::Normal);
-            if timing == SiriTiming::PacedDelay {
-                siri.set_release_delay(SIRI_RELEASE_DELAY);
-            }
+            let mut siri = start_siri(&tv, mode).await?;
             controller.do_send(DeviceEvent::Assistant(AssistantEvent::Ready {
                 entity_id: ready_id,
                 session_id,
@@ -1197,6 +1192,10 @@ impl AppleTvActor {
                         );
                         siri.push_pcm(&pcm).await?;
                         chunks += 1;
+                        // The Apple TV ended Siri by itself.
+                        if siri.ended() {
+                            break;
+                        }
                     }
                     // End of audio, session replaced or timeout.
                     _ => break,
@@ -1222,6 +1221,23 @@ impl AppleTvActor {
         }));
         Ok(())
     }
+}
+
+/// Starts Siri on the path of `mode`.
+async fn start_siri(tv: &AppleTv, mode: SiriMode) -> Result<ratv::Siri, ratv::Error> {
+    if mode == SiriMode::Auto {
+        return tv.start_siri().await;
+    }
+    let mut siri = tv
+        .mrp()
+        .ok_or(ratv::Error::NotConnected("MRP"))?
+        .start_siri()
+        .await?;
+    siri.set_paced(mode != SiriMode::Mrp);
+    if mode == SiriMode::MrpPacedDelay {
+        siri.set_release_delay(SIRI_RELEASE_DELAY);
+    }
+    Ok(ratv::Siri::Mrp(siri))
 }
 
 /// Assistant event for the end of a Siri session. `chunks` is the number of audio chunks sent to
