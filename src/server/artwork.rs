@@ -73,7 +73,7 @@ impl ArtworkStore {
         mime_type: Option<&str>,
         data: &[u8],
     ) -> io::Result<String> {
-        let ext = extension(mime_type.unwrap_or("image/jpeg"));
+        let ext = mime_type.map_or_else(|| sniff(data), extension);
         let name = format!("{:016x}.{ext}", fnv1a(artwork_id.as_bytes()));
         let removed = {
             let mut files = self.lock();
@@ -184,6 +184,15 @@ fn remove_files(paths: Vec<PathBuf>) {
         {
             warn!("Could not remove {}: {e}", path.display());
         }
+    }
+}
+
+/// File extension from the first bytes of an image. JPEG if unknown.
+fn sniff(data: &[u8]) -> &'static str {
+    if data.starts_with(b"\x89PNG") {
+        "png"
+    } else {
+        "jpg"
     }
 }
 
