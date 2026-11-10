@@ -30,11 +30,33 @@ pub fn definition(mut entity: AvailableIntgEntity) -> AvailableIntgEntity {
 
 /// Insert the state attribute.
 pub fn attributes(s: &Snapshot, out: &mut Map<String, Value>) {
-    // Siri needs MRP.
-    let state = if s.connected && s.mrp {
+    let state = if s.connected && s.siri {
         "ON"
     } else {
         "UNAVAILABLE"
     };
     out.insert("state".into(), state.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attributes;
+    use crate::device::state::Snapshot;
+    use serde_json::{Map, json};
+
+    #[test]
+    fn unavailable_when_siri_is_off() {
+        let mut s = Snapshot {
+            connected: true,
+            siri: true,
+            ..Snapshot::default()
+        };
+        let mut out = Map::new();
+        attributes(&s, &mut out);
+        assert_eq!(Some(&json!("ON")), out.get("state"));
+
+        s.siri = false;
+        attributes(&s, &mut out);
+        assert_eq!(Some(&json!("UNAVAILABLE")), out.get("state"));
+    }
 }

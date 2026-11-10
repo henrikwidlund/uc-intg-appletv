@@ -426,6 +426,7 @@ impl AppleTvActor {
         let mut dirty = Dirty::CONNECTION;
         self.s.connected = true;
         self.s.mrp = tv.mrp().is_some();
+        self.s.siri = siri_available(&tv);
         let own_uid = tv.mrp().and_then(|m| m.device_info().device_uid.clone());
         if self.s.own_output_uid != own_uid {
             self.s.own_output_uid = own_uid;
@@ -1233,6 +1234,11 @@ impl AppleTvActor {
     }
 }
 
+/// Siri can start: Companion or MRP is connected, and Siri is not off on the device.
+fn siri_available(tv: &AppleTv) -> bool {
+    (tv.companion().is_some() || tv.mrp().is_some()) && tv.siri_enabled() != Some(false)
+}
+
 /// Starts Siri on the path of `mode`.
 async fn start_siri(tv: &AppleTv, mode: SiriMode) -> Result<ratv::Siri, ratv::Error> {
     match mode {
@@ -1361,6 +1367,18 @@ impl Handler<CompanionEvent> for AppleTvActor {
         }
         match msg.event {
             Some(Event::SystemStatus(state)) => self.set_attention(state),
+            Some(Event::SiriStatus { enabled }) => {
+                info!(
+                    "[{}] Siri is {}",
+                    self.cfg.name,
+                    if enabled { "on" } else { "off" }
+                );
+                let siri = self.tv.as_ref().is_some_and(siri_available);
+                if self.s.siri != siri {
+                    self.s.siri = siri;
+                    self.emit(Dirty::SIRI);
+                }
+            }
             Some(Event::ScreenChanged { .. }) => self.screen_changed(ctx),
             Some(Event::MediaControl(flags)) => {
                 self.media_flags = Some(flags.0);
