@@ -175,7 +175,7 @@ pub fn attributes(
             }
         }
         EntityKind::VoiceAssistant => {
-            if dirty.any(Dirty::CONNECTION | Dirty::SIRI) {
+            if dirty.any(Dirty::CONNECTION) {
                 voice::attributes(s, out);
             }
         }
