@@ -41,34 +41,6 @@ struct VoiceCount {
     session_id: u32,
     chunks: u32,
     bytes: u64,
-    /// Highest absolute sample value. Only counted with the debug log.
-    peak: u16,
-    /// Sum of the squared sample values. Only counted with the debug log.
-    sum_sq: u64,
-}
-
-impl VoiceCount {
-    /// Adds the level of signed 16-bit little-endian PCM.
-    fn add_level(&mut self, pcm: &[u8]) {
-        for &s in pcm.as_chunks::<2>().0 {
-            let v = i16::from_le_bytes(s);
-            self.peak = self.peak.max(v.unsigned_abs());
-            self.sum_sq += u64::from(v.unsigned_abs()).pow(2);
-        }
-    }
-
-    /// Peak and RMS level in dBFS. Silence is `-inf`.
-    fn levels(&self) -> (f64, f64) {
-        let dbfs = |v: f64| 20.0 * (v / 32768.0).log10();
-        let samples = self.bytes / 2;
-        #[allow(clippy::cast_precision_loss)]
-        let rms = if samples == 0 {
-            0.0
-        } else {
-            (self.sum_sq as f64 / samples as f64).sqrt()
-        };
-        (dbfs(f64::from(self.peak)), dbfs(rms))
-    }
 }
 
 impl WsConn {
