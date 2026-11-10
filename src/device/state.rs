@@ -156,6 +156,8 @@ pub struct Snapshot {
     pub subtitle_language: Option<LanguageOption>,
     /// Subtitles are set to Auto. `subtitle_language` is then the Auto option.
     pub subtitles_auto: bool,
+    /// True if subtitles are shown, from Companion.
+    pub captions_enabled: Option<bool>,
     pub chapters: Vec<Chapter>,
     pub up_next: Vec<QueueItem>,
     /// Rates as the app lists them, to find changes.
@@ -284,6 +286,12 @@ impl Snapshot {
             Dirty::LANGUAGES,
             self.subtitles_auto,
             np.subtitles_auto()
+        );
+        update!(
+            d,
+            Dirty::LANGUAGES,
+            self.captions_enabled,
+            np.captions_enabled
         );
         update!(d, Dirty::CHAPTERS, self.chapters, np.chapters);
         update!(d, Dirty::QUEUE, self.up_next, np.up_next);
