@@ -1255,7 +1255,18 @@ fn siri_event(
                 session_id,
             };
         }
-        // Seen when Siri is off on the Apple TV.
+        Err(e @ ratv::Error::SiriDisabled) => {
+            warn!("[{name}] Siri failed: {e}");
+            return AssistantEvent::Error {
+                entity_id,
+                session_id,
+                data: AssistantError {
+                    code: AssistantErrorCode::ServiceUnavailable,
+                    message: "Siri is off on the Apple TV: Settings > General > Siri.".to_string(),
+                },
+            };
+        }
+        // Seen on MRP when Siri is off on the Apple TV.
         Err(e @ ratv::Error::SiriNotRecording) => {
             warn!("[{name}] Siri failed: {e}. Is Siri on in the Apple TV settings?");
             "Apple TV did not start listening. Check that Siri is on: Settings > General > Siri."

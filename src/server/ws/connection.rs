@@ -12,7 +12,7 @@ use crate::server::ws::{VoiceCount, WsConn};
 use actix::{Actor, ActorFutureExt, Addr, AsyncContext, Handler, WrapFuture};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use bytes::Bytes;
-use log::{Level, debug, error, info, log_enabled, warn};
+use log::{debug, error, info, warn};
 use prost::Message;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -331,9 +331,6 @@ impl WsConn {
                 }
                 self.voice.chunks += 1;
                 self.voice.bytes += data.samples.len() as u64;
-                if log_enabled!(Level::Debug) {
-                    self.voice.add_level(&data.samples);
-                }
                 match self
                     .controller_addr
                     .send(R2AudioChunkMsg {
@@ -452,18 +449,10 @@ fn log_voice_end(id: &str, session_id: u32, count: VoiceCount) {
         "[{id}] => voice_end({session_id}): {} chunks, {} bytes, {secs:.2} s of audio",
         count.chunks, count.bytes
     );
-    if log_enabled!(Level::Debug) && count.bytes > 0 {
-        // Speech is about -30 to -10 dBFS RMS. Silence is below -60.
-        let (peak, rms) = count.levels();
-        debug!(
-            "[{id}] voice_end({session_id}): audio level peak {peak:.1} dBFS, RMS {rms:.1} dBFS"
-        );
-    }
 }
 #[cfg(test)]
 mod tests {
     use super::is_backup_message;
-    use crate::server::ws::VoiceCount;
 
     #[test]
     fn backup_messages_are_found() {
@@ -472,26 +461,5 @@ mod tests {
         ));
         assert!(is_backup_message(r#"{"settings":[{"id":"backup_data"}]}"#));
         assert!(!is_backup_message(r#"{"input_values":{"pin":"1234"}}"#));
-    }
-
-    #[test]
-    fn voice_levels() {
-        let mut count = VoiceCount::default();
-        let pcm: Vec<u8> = [16384i16, -16384]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        count.bytes = pcm.len() as u64;
-        count.add_level(&pcm);
-        let (peak, rms) = count.levels();
-        assert!((peak + 6.02).abs() < 0.01);
-        assert!((rms + 6.02).abs() < 0.01);
-
-        let mut silent = VoiceCount {
-            bytes: 4,
-            ..VoiceCount::default()
-        };
-        silent.add_level(&[0; 4]);
-        assert_eq!(f64::NEG_INFINITY, silent.levels().1);
     }
 }
