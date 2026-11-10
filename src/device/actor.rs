@@ -777,13 +777,14 @@ impl AppleTvActor {
             o.map(|o| (o.identifier.clone(), o.language_tag.clone()))
         };
         debug!(
-            "[{}] audio: {:?} of {:?}, subtitles: {:?} of {:?}, auto: {}",
+            "[{}] audio: {:?} of {:?}, subtitles: {:?} of {:?}, auto: {}, shown: {:?}",
             self.cfg.name,
             id(self.s.audio_language.as_ref()),
             ids(&self.s.audio_languages),
             id(self.s.subtitle_language.as_ref()),
             ids(&self.s.subtitle_languages),
-            self.s.subtitles_auto
+            self.s.subtitles_auto,
+            self.s.captions_enabled
         );
     }
 

@@ -115,6 +115,9 @@ pub fn current(s: &Snapshot, kind: SelectKind, now: f64) -> Option<Cow<'_, str>>
                 None
             } else if s.subtitles_auto {
                 Some(Cow::Borrowed(SUBTITLES_AUTO))
+            } else if s.captions_enabled == Some(false) {
+                // Companion says that no subtitles are shown.
+                Some(Cow::Borrowed(SUBTITLES_OFF))
             } else {
                 current_language(&s.subtitle_languages, s.subtitle_language.as_ref())
                     .or(Some(Cow::Borrowed(SUBTITLES_OFF)))
@@ -407,6 +410,29 @@ mod tests {
             opts(&["Off", "English"]),
             options(&s, SelectKind::Subtitles)
         );
+        assert_eq!(
+            Some(Cow::Borrowed("Off")),
+            current(&s, SelectKind::Subtitles, 0.0)
+        );
+    }
+
+    #[test]
+    fn captions_off_shows_off() {
+        let en = LanguageOption {
+            display_name: Some("English".into()),
+            identifier: Some("en".into()),
+            ..LanguageOption::default()
+        };
+        let mut s = Snapshot {
+            subtitle_languages: vec![en.clone()],
+            subtitle_language: Some(en),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            Some(Cow::Borrowed("English")),
+            current(&s, SelectKind::Subtitles, 0.0)
+        );
+        s.captions_enabled = Some(false);
         assert_eq!(
             Some(Cow::Borrowed("Off")),
             current(&s, SelectKind::Subtitles, 0.0)
