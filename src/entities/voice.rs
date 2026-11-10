@@ -45,7 +45,7 @@ mod tests {
     use serde_json::{Map, json};
 
     #[test]
-    fn unavailable_when_siri_is_off() {
+    fn unavailable_without_companion_and_mrp() {
         let mut s = Snapshot {
             connected: true,
             siri: true,

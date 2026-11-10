@@ -44,7 +44,6 @@ impl Dirty {
     pub const ACCOUNTS: Self = Self(1 << 14);
     /// The current chapter changed, but not the list.
     pub const CHAPTER: Self = Self(1 << 15);
-    pub const SIRI: Self = Self(1 << 16);
     pub const ALL: Self = Self(u32::MAX);
 
     /// Returns `true` if any group of `other` is dirty.
@@ -125,7 +124,7 @@ pub struct Snapshot {
     pub connected: bool,
     /// MRP is connected: needed for now playing and volume.
     pub mrp: bool,
-    /// Siri can start: Companion or MRP is connected, and Siri is not off on the device.
+    /// Companion or MRP is connected: needed for Siri.
     pub siri: bool,
     pub power: Power,
     pub name: String,
