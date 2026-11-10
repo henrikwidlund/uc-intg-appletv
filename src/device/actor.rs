@@ -821,7 +821,7 @@ impl AppleTvActor {
         let generation = self.generation;
         // The Apple TV scales the image.
         ctx.spawn(
-            async move { tv.artwork(f64::from(ARTWORK_SIZE), -1.0).await }
+            async move { tv.artwork(ARTWORK_SIZE, 0).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     if act.generation != generation || act.artwork_seq != seq {

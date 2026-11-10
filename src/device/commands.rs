@@ -394,8 +394,8 @@ pub async fn exec(tv: &AppleTv, call: Call) -> Result<(), ratv::Error> {
         Call::DisableSubtitles => tv.disable_subtitles().await,
         Call::NextChapter => tv.next_chapter().await,
         Call::PreviousChapter => tv.previous_chapter().await,
-        Call::Like => tv.like(true).await,
-        Call::Dislike => tv.dislike(true).await,
+        Call::Like => tv.set_liked(true).await,
+        Call::Dislike => tv.set_disliked(true).await,
         Call::SwitchAccount(id, _) => tv.switch_account(&id).await,
         Call::PlaybackRate(r) => tv.set_playback_rate(r).await,
         Call::Sleep(d) => {
