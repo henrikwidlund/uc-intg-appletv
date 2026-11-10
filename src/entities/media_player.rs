@@ -149,7 +149,8 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
     if dirty.any(Dirty::METADATA | Dirty::POWER | Dirty::CONNECTION) {
         metadata_attributes(s, off, out);
     }
-    if dirty.any(Dirty::POSITION | Dirty::POWER | Dirty::CONNECTION) {
+    // With PLAYBACK, so a resume sends a new timestamp.
+    if dirty.any(Dirty::POSITION | Dirty::PLAYBACK | Dirty::POWER | Dirty::CONNECTION) {
         position_attributes(s, off, now, out);
     }
     if dirty.any(Dirty::ARTWORK | Dirty::POWER | Dirty::CONNECTION) {
@@ -163,6 +164,8 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
     if dirty.any(Dirty::APPS | Dirty::CONNECTION) {
         let list: Vec<&str> = s.apps.iter().map(|a| a.name.as_str()).collect();
         set(out, Attr::SourceList, json!(list));
+    }
+    if dirty.any(Dirty::APPS | Dirty::APP | Dirty::CONNECTION) {
         set(out, Attr::Source, current_app(s).unwrap_or("").into());
     }
     if dirty.any(Dirty::OUTPUTS | Dirty::CONNECTION) {
@@ -219,13 +222,13 @@ fn position_attributes(s: &Snapshot, off: bool, now: f64, out: &mut Map<String, 
         Attr::MediaDuration,
         duration.map_or(0, |d| d.round() as u64).into(),
     );
-    set(
-        out,
-        Attr::MediaPositionUpdatedAt,
-        chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
-            .into(),
-    );
+    // The controller sets the time only if it sends the position, see [`position_timestamp`].
+    set(out, Attr::MediaPositionUpdatedAt, Value::Null);
+}
+
+/// Time for `media_position_updated_at`, like `2026-11-04T15:37:27.106292+00:00`.
+pub fn position_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
 }
 
 fn shuffle_repeat_attributes(s: &Snapshot, out: &mut Map<String, Value>) {
@@ -668,16 +671,8 @@ mod tests {
 
     #[test]
     fn position_timestamp_has_microseconds_and_offset() {
-        let s = Snapshot {
-            connected: true,
-            ..Snapshot::default()
-        };
-        let mut attrs = Map::new();
-        position_attributes(&s, false, 0.0, &mut attrs);
-        let ts = attrs
-            .get("media_position_updated_at")
-            .and_then(Value::as_str)
-            .expect("timestamp");
+        let ts = position_timestamp();
+        let ts = ts.as_str();
         // Same shape as `2026-11-04T15:37:27.106292+00:00`.
         assert_eq!(32, ts.len(), "{ts}");
         assert!(ts.ends_with("+00:00"), "{ts}");

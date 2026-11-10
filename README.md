@@ -13,8 +13,8 @@ The driver id is `appletv_rs`, so it can run next to the Apple TV integration th
 - **Remote**: buttons, hold, repeat and button sequences.
 - **Selects**: app, audio output, audio language, subtitles, account, chapter, Up Next, playback speed,
   shuffle and repeat.
-- **Sensors**: the current value of each select, episode, genre, content rating, audio format,
-  live content and volume control.
+- **Sensors**: app, audio output, audio language, subtitles, playback speed, shuffle and repeat (the same
+  values as the selects), episode, genre, content rating, audio format, live content and volume control.
 - **Voice assistant**: Siri with the voice button of the Remote.
 
 One pairing with one PIN covers all features.
@@ -53,7 +53,8 @@ One pairing with one PIN covers all features.
 ## Known limits
 
 - Volume control works only if the Apple TV can change the volume of the TV or receiver (HDMI CEC).
-  Otherwise the volume features are removed.
+  Otherwise the volume controls stay on the Remote, but they return an error, and the _Volume control_
+  sensor shows off.
 - The Apple TV does not report the app in front. The app select shows the app opened through the driver or
   the app that plays media.
 - The Apple TV does not report the current account. The account select shows the last account chosen
@@ -89,7 +90,7 @@ cargo run --release
 
 | Variable                   | Default             | Description                                                            |
 |----------------------------|---------------------|------------------------------------------------------------------------|
-| `UC_CONFIG_HOME`           | working directory   | Folder for the configuration, cache and artwork files.                 |
+| `UC_CONFIG_HOME`           | working directory   | Folder for the configuration and cache files.                          |
 | `UC_INTEGRATION_INTERFACE` | `0.0.0.0`           | Network interface to listen on.                                        |
 | `UC_INTEGRATION_HTTP_PORT` | `9090`              | WebSocket and artwork port.                                            |
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                  |
@@ -116,18 +117,21 @@ docker run -d --name uc-intg-appletv --network host \
 
 ## Debug log
 
-For an error report, turn on the debug log: tick _Debug log_ on the first page of a new setup, or run the setup
-again, tick _Debug log_ and choose _Save settings_.
+For an error report, turn on the debug log: tick _Debug log_ on the _Restore_ page of a new setup, or run the
+setup again, tick _Debug log_ and choose _Save settings_.
 The driver and ratv then write more lines to the log. It takes effect at once and stays on after a restart.
 Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
+
+_Siri protocol_ is on the same pages. Keep it at _Auto_: Siri then uses the same protocol as the iPhone remote.
+_MRP only_ is only for finding errors.
 
 ## Backup and restore
 
 Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a text field.
 Copy it and keep it in a safe place.
 
-To restore, choose _Restore configuration from backup_ in the setup, or tick _Restore from backup_ on the first
-page of a new setup. Paste the data. It replaces all configured devices.
+To restore, choose _Restore configuration from backup_ in the setup, or tick _Restore from backup_ on the
+_Restore_ page of a new setup. Paste the data. It replaces all configured devices.
 
 The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never writes the backup
 data to the log. With `UC_API_MSG_TRACING`, the messages with backup data are hidden.

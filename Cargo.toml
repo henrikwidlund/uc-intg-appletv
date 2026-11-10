@@ -16,7 +16,7 @@ mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "f3d145376143d25c7245af661804c5e722753b92", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "b23d40bdad013b7ff672602af45aae9f1825f280", features = ["opus"] }
 
 # WebSocket server
 actix = "0.13.5"
@@ -39,7 +39,8 @@ rust-fsm = "0.8.0"
 const_format = "0.2.37"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+bytestring = "1.5.1"
 uuid = { version = "1.29.1", features = ["v4"] }
 
 # Logging. The `log` feature of tracing forwards ratv log events to env_logger.

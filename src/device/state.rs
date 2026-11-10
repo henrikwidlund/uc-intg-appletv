@@ -34,16 +34,25 @@ impl Dirty {
     pub const POSITION: Self = Self(1 << 4);
     pub const ARTWORK: Self = Self(1 << 5);
     pub const VOLUME: Self = Self(1 << 6);
+    /// The app list changed.
     pub const APPS: Self = Self(1 << 7);
     pub const OUTPUTS: Self = Self(1 << 8);
+    /// The language lists changed.
     pub const LANGUAGES: Self = Self(1 << 9);
     pub const CHAPTERS: Self = Self(1 << 10);
     pub const QUEUE: Self = Self(1 << 11);
+    /// The playback rate changed.
     pub const RATE: Self = Self(1 << 12);
     pub const SHUFFLE_REPEAT: Self = Self(1 << 13);
     pub const ACCOUNTS: Self = Self(1 << 14);
     /// The current chapter changed, but not the list.
     pub const CHAPTER: Self = Self(1 << 15);
+    /// The current app changed, but not the list.
+    pub const APP: Self = Self(1 << 16);
+    /// The current languages changed, but not the lists.
+    pub const LANGUAGE: Self = Self(1 << 17);
+    /// The supported playback rates changed.
+    pub const RATES: Self = Self(1 << 18);
     pub const ALL: Self = Self(u32::MAX);
 
     /// Returns `true` if any group of `other` is dirty.
@@ -122,7 +131,7 @@ pub struct OutputCombo {
 #[allow(clippy::struct_excessive_bools)]
 pub struct Snapshot {
     pub connected: bool,
-    /// MRP is connected: needed for now playing and volume.
+    /// MRP is connected: needed for volume and the full now playing.
     pub mrp: bool,
     /// Companion or MRP is connected: needed for Siri.
     pub siri: bool,
@@ -232,12 +241,17 @@ impl Snapshot {
             self.prev_item_lasted = self.item_started.map(|t| now - t);
             self.item_started = Some(now);
         }
+        let had_state = self.state.is_some();
         update!(d, Dirty::PLAYBACK, self.state, np.state);
-        if np.app.is_some() && self.app != np.app && self.launched_app.take().is_some() {
-            d |= Dirty::APPS;
+        // The image is only shown and fetched with a state.
+        if had_state != self.state.is_some() {
+            d |= Dirty::ARTWORK;
         }
-        update!(d, Dirty::APPS, self.app, np.app);
-        update!(d, Dirty::APPS, self.app_name, np.app_name);
+        if np.app.is_some() && self.app != np.app && self.launched_app.take().is_some() {
+            d |= Dirty::APP;
+        }
+        update!(d, Dirty::APP, self.app, np.app);
+        update!(d, Dirty::APP, self.app_name, np.app_name);
         update!(d, Dirty::METADATA, self.title, np.title);
         update!(d, Dirty::METADATA, self.subtitle, np.subtitle);
         update!(d, Dirty::METADATA, self.artist, np.artist);
@@ -276,22 +290,17 @@ impl Snapshot {
             self.subtitle_languages,
             np.subtitle_languages
         );
-        update!(d, Dirty::LANGUAGES, self.audio_language, np.audio_language);
+        update!(d, Dirty::LANGUAGE, self.audio_language, np.audio_language);
         update!(
             d,
-            Dirty::LANGUAGES,
+            Dirty::LANGUAGE,
             self.subtitle_language,
             np.subtitle_language
         );
+        update!(d, Dirty::LANGUAGE, self.subtitles_auto, np.subtitles_auto());
         update!(
             d,
-            Dirty::LANGUAGES,
-            self.subtitles_auto,
-            np.subtitles_auto()
-        );
-        update!(
-            d,
-            Dirty::LANGUAGES,
+            Dirty::LANGUAGE,
             self.captions_enabled,
             np.captions_enabled
         );
@@ -303,7 +312,7 @@ impl Snapshot {
             let speeds = np.playback_speeds();
             if self.supported_rates != speeds {
                 self.supported_rates = speeds;
-                d |= Dirty::RATE;
+                d |= Dirty::RATES;
             }
         }
         // Used only for commands.
@@ -369,9 +378,19 @@ impl Snapshot {
         update!(d, Dirty::VOLUME, self.muted, v.muted);
         update!(d, Dirty::VOLUME, self.volume_available, v.available);
         if self.outputs != v.outputs {
+            // The volume of an output changes often. The combinations only depend on the group.
+            let group_changed = self.outputs.len() != v.outputs.len()
+                || self
+                    .outputs
+                    .iter()
+                    .zip(&v.outputs)
+                    .any(|(a, b)| a.uid != b.uid || a.name != b.name);
             self.outputs.clone_from(&v.outputs);
-            d |= Dirty::VOLUME | Dirty::OUTPUTS;
-            self.rebuild_output_combos();
+            d |= Dirty::VOLUME;
+            if group_changed {
+                d |= Dirty::OUTPUTS;
+                self.rebuild_output_combos();
+            }
         }
         d
     }
@@ -656,6 +675,19 @@ mod tests {
     }
 
     #[test]
+    fn artwork_again_when_the_state_comes() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.title = Some("Show".into());
+        np.artwork_id = Some("a".into());
+        s.update_now_playing(&np);
+        np.state = Some(PlaybackState::Playing);
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        np.state = Some(PlaybackState::Paused);
+        assert!(!s.update_now_playing(&np).any(Dirty::ARTWORK));
+    }
+
+    #[test]
     fn companion_artwork_after_the_item() {
         let mut s = Snapshot::default();
         let mut np = NowPlaying::default();
@@ -824,5 +856,17 @@ mod tests {
         assert_eq!(Some(50), s.volume_percent());
         s.global_volume = false;
         assert_eq!(Some(20), s.volume_percent());
+    }
+
+    #[test]
+    fn output_volume_keeps_the_combinations() {
+        let mut s = Snapshot::default();
+        let mut v = Volume::default();
+        v.outputs = vec![output("A", "A", Some(0.4)), output("B", "B", Some(0.6))];
+        assert!(s.update_volume(&v).any(Dirty::OUTPUTS));
+        v.outputs[1].volume = Some(0.7);
+        let d = s.update_volume(&v);
+        assert!(d.any(Dirty::VOLUME) && !d.any(Dirty::OUTPUTS));
+        assert_eq!(Some(0.7), s.outputs[1].volume);
     }
 }

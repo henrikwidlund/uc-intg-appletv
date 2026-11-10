@@ -1116,11 +1116,11 @@ fn discover_page() -> Value {
             {
                 "id": "info",
                 "label": { "en": "Discover or connect to Apple TV device" },
-                "field": { "label": { "value": { "en": "Leave blank to use auto-discovery and click _Next_.\n\nThe device must be on the same network as the remote." } } }
+                "field": { "label": { "value": { "en": "Leave blank to use auto-discovery and click _Next_.\n\nAuto-discovery finds devices on the same network as the remote. Enter the IP address for a device on another network." } } }
             },
             {
                 "id": "address",
-                "label": { "en": "IP address (same network only)" },
+                "label": { "en": "IP address (optional)" },
                 "field": { "text": { "value": "" } }
             }
         ]
@@ -1288,8 +1288,9 @@ mod tests {
         impl Handler<SendWsMessage> for Remote {
             type Result = ();
             fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
+                let SendWsMessage::Msg(msg) = msg else { return };
                 if let (Some("driver_setup_change"), Some(data)) =
-                    (msg.0.msg.as_deref(), msg.0.msg_data)
+                    (msg.msg.as_deref(), msg.msg_data)
                     && let Ok(mut events) = self.0.lock()
                 {
                     events.push(data);

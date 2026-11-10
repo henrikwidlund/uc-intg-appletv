@@ -25,6 +25,8 @@ use uc_api::ws::{WsMessage, WsResultMsgData};
 /// Longest wait for a free place in the session queue. The queue is full when the Remote does not
 /// read.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Messages that can wait to be sent to one Remote.
+const MAILBOX_CAPACITY: usize = 1024;
 
 /// Sends messages from the controller to the WebSocket connection.
 ///
@@ -41,7 +43,9 @@ impl Actor for WsSender {
     type Context = actix::Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        ctx.set_mailbox_capacity(64);
+        // A subscribe sends one message per entity: 26 per Apple TV. Changes that do not fit
+        // are lost, because the controller sends only what changed.
+        ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
     }
 }
 
@@ -56,7 +60,22 @@ impl Handler<SendWsMessage> for WsSender {
         // `wait` blocks the mailbox until the message is sent: keeps the order.
         ctx.wait(
             async move {
-                let send = WsConn::send(&id, msg_tracing_out, &msg.0, &mut session);
+                let send = async {
+                    match msg {
+                        SendWsMessage::Msg(m) => {
+                            WsConn::send(&id, msg_tracing_out, &m, &mut session).await
+                        }
+                        SendWsMessage::Text(text) => {
+                            if msg_tracing_out {
+                                debug!("[{id}] <- {text}");
+                            }
+                            session.text(text).await.map_err(|e| {
+                                error!("[{id}] WebSocket send error: {e}");
+                                None
+                            })
+                        }
+                    }
+                };
                 if timeout(SEND_TIMEOUT, send).await.is_err() {
                     // A lost message leaves an old state on the Remote. After a new connection,
                     // the Remote gets the full state again.
@@ -187,7 +206,7 @@ impl WsConn {
                 }
                 self.handle_text_message(&text, sender)
             }
-            AggregatedMessage::Binary(data) => self.handle_binary_message(data).await,
+            AggregatedMessage::Binary(data) => self.handle_binary_message(data),
             AggregatedMessage::Ping(bytes) => {
                 if timeout(SEND_TIMEOUT, session.pong(&bytes)).await.is_err() {
                     info!("[{}] Closing connection: Remote does not read", self.id);
@@ -241,7 +260,7 @@ impl WsConn {
                         Err(e) => Err(e),
                     };
                     match result {
-                        Ok(Some(response)) => sender.do_send(SendWsMessage(response)),
+                        Ok(Some(response)) => sender.do_send(SendWsMessage::Msg(response)),
                         Ok(None) => {}
                         Err(e) => {
                             warn!(
@@ -276,7 +295,7 @@ impl WsConn {
     }
 
     /// Handle a binary protobuf message. Only voice audio is supported.
-    async fn handle_binary_message(&mut self, data: Bytes) -> Result<(), Option<CloseReason>> {
+    fn handle_binary_message(&mut self, data: Bytes) -> Result<(), Option<CloseReason>> {
         let msg = IntegrationMessage::decode(data).map_err(|e| {
             error!("[{}] Invalid binary message: {e:?}", self.id);
             None
@@ -320,7 +339,6 @@ impl WsConn {
                         self.id, begin.session_id
                     );
                 }
-                Ok(())
             }
             ProtoMsg::VoiceData(data) => {
                 if self.voice.session_id != data.session_id {
@@ -331,28 +349,11 @@ impl WsConn {
                 }
                 self.voice.chunks += 1;
                 self.voice.bytes += data.samples.len() as u64;
-                match self
-                    .controller_addr
-                    .send(R2AudioChunkMsg {
-                        session_id: data.session_id,
-                        data: data.samples,
-                    })
-                    .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => {
-                        warn!("[{}] Error processing audio chunk: {e}", self.id);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let msg = format!("Internal error sending audio chunk: {e}");
-                        error!("[{}] {msg}", self.id);
-                        Err(Some(CloseReason {
-                            code: CloseCode::Error,
-                            description: Some(msg),
-                        }))
-                    }
-                }
+                // No reply needed: the read loop does not wait for the controller.
+                self.controller_addr.do_send(R2AudioChunkMsg {
+                    session_id: data.session_id,
+                    data: data.samples,
+                });
             }
             ProtoMsg::VoiceEnd(end) => {
                 let count = if self.voice.session_id == end.session_id {
@@ -363,9 +364,9 @@ impl WsConn {
                 log_voice_end(&self.id, end.session_id, count);
                 self.controller_addr
                     .do_send(R2AudioChunkMsg::end(end.session_id));
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Send a message to the WebSocket session. Returns `Err` if the session is closed.
@@ -408,7 +409,7 @@ async fn close(session: Session, reason: Option<CloseReason>) {
 }
 
 fn send_error_response(id: &str, req_id: u32, error: ServiceError, sender: &Addr<WsSender>) {
-    sender.do_send(SendWsMessage(service_error_to_ws_message(
+    sender.do_send(SendWsMessage::Msg(service_error_to_ws_message(
         id, req_id, error,
     )));
 }

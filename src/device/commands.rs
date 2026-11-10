@@ -77,17 +77,15 @@ pub struct Planner<'a> {
     pub power: Power,
     pub muted: Option<bool>,
     pub screensaver: bool,
-    /// A power-on call was added already.
-    pub powered: bool,
 }
 
 impl Planner<'_> {
     /// Add the calls of an action.
     #[allow(clippy::too_many_lines)]
     pub fn plan(&mut self, action: &Action, out: &mut Vec<Call>) -> Result<(), ServiceError> {
-        if action.needs_power() && self.power == Power::Off && !self.powered {
+        if action.needs_power() && self.power == Power::Off {
             out.push(Call::TurnOn);
-            self.powered = true;
+            self.power = Power::On;
         }
         self.end_seek(action, out);
         let s = self.s;
@@ -182,10 +180,12 @@ impl Planner<'_> {
                 if s.subtitle_languages.is_empty() {
                     return Err(ServiceError::BadRequest("No subtitles".into()));
                 }
-                // Off, then each subtitle, then off again.
+                // Off, then each subtitle, then off again. Shown as off like the select.
+                let off = s.captions_enabled == Some(false) && !s.subtitles_auto;
                 let current = s
                     .subtitle_language
                     .as_ref()
+                    .filter(|_| !off)
                     .and_then(|c| language_index(&s.subtitle_languages, c));
                 match current {
                     Some(i) if i + 1 >= s.subtitle_languages.len() => Call::DisableSubtitles,
@@ -200,6 +200,12 @@ impl Planner<'_> {
             Action::Select(kind, op) => self.select(*kind, op)?,
         };
         check_support(s, &call)?;
+        // Later actions of the same command see the new power state.
+        match call {
+            Call::TurnOn => self.power = Power::On,
+            Call::TurnOff => self.power = Power::Off,
+            _ => {}
+        }
         out.push(call);
         Ok(())
     }
@@ -215,8 +221,20 @@ impl Planner<'_> {
             return;
         }
         let active = self.seek.take();
-        // The end actions send their own call.
-        if matches!(action, Action::FastForwardEnd | Action::RewindEnd) {
+        // The end actions send their own call. Also end the other one if it is active.
+        let own = match action {
+            Action::FastForwardEnd => Some(Seek::FastForward),
+            Action::RewindEnd => Some(Seek::Rewind),
+            _ => None,
+        };
+        if own.is_some() {
+            match active {
+                Some(seek) if Some(seek) != own => out.push(match seek {
+                    Seek::FastForward => Call::EndFastForward,
+                    Seek::Rewind => Call::EndRewind,
+                }),
+                _ => {}
+            }
             return;
         }
         match active {
@@ -417,7 +435,6 @@ mod tests {
             power: s.power,
             muted: s.muted,
             screensaver: false,
-            powered: false,
         };
         let mut out = Vec::new();
         for a in actions {
@@ -442,6 +459,14 @@ mod tests {
             calls
         );
         assert_eq!(vec![Call::TurnOn], plan(&s, &mut None, &[Action::Toggle]));
+        assert_eq!(
+            vec![Call::TurnOn, Call::Press(Key::Up)],
+            plan(&s, &mut None, &[Action::On, Action::Press(Key::Up)])
+        );
+        assert_eq!(
+            vec![Call::TurnOn, Call::TurnOff],
+            plan(&s, &mut None, &[Action::Toggle, Action::Toggle])
+        );
     }
 
     #[test]
@@ -466,6 +491,13 @@ mod tests {
             vec![Call::EndRewind],
             plan(&s, &mut seek, &[Action::RewindEnd])
         );
+        // The wrong end button still ends the active seek.
+        plan(&s, &mut seek, &[Action::FastForwardBegin]);
+        assert_eq!(
+            vec![Call::EndFastForward, Call::EndRewind],
+            plan(&s, &mut seek, &[Action::RewindEnd])
+        );
+        assert_eq!(None, seek);
     }
 
     #[test]
@@ -481,7 +513,6 @@ mod tests {
             power: s.power,
             muted: None,
             screensaver: true,
-            powered: false,
         };
         let mut out = Vec::new();
         p.plan(&Action::PlayPause, &mut out).expect("plan");
@@ -524,7 +555,6 @@ mod tests {
             power: Power::Unknown,
             muted: None,
             screensaver: false,
-            powered: false,
         };
         let mut out = Vec::new();
         assert!(matches!(
@@ -542,7 +572,6 @@ mod tests {
             power: Power::Unknown,
             muted: None,
             screensaver: false,
-            powered: false,
         };
         assert!(
             p.plan(&Action::Shuffle(ShuffleMode::Songs), &mut out)

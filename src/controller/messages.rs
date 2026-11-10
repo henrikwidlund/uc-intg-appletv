@@ -8,6 +8,7 @@ use crate::errors::ServiceError;
 use crate::util::DeserializeMsgData;
 use actix::prelude::{Message, Recipient};
 use bytes::Bytes;
+use bytestring::ByteString;
 use std::sync::Arc;
 use uc_api::intg::ws::{R2Event, R2Request, R2Response};
 use uc_api::ws::WsMessage;
@@ -18,7 +19,17 @@ pub const VOICE_SAMPLE_RATE: u32 = 16_000;
 /// Send a WebSocket message to a Remote. Best effort only.
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct SendWsMessage(pub WsMessage);
+pub enum SendWsMessage {
+    Msg(WsMessage),
+    /// Serialized already. Cheap to clone for more than one Remote.
+    Text(ByteString),
+}
+
+impl From<WsMessage> for SendWsMessage {
+    fn from(msg: WsMessage) -> Self {
+        Self::Msg(msg)
+    }
+}
 
 /// A Remote connected.
 #[derive(Message)]
@@ -76,7 +87,7 @@ pub struct R2EventMsg {
 
 /// Voice audio chunk from a Remote. Empty data ends the audio stream.
 #[derive(Message)]
-#[rtype(result = "Result<(), ServiceError>")]
+#[rtype(result = "()")]
 pub struct R2AudioChunkMsg {
     /// Remote audio session id.
     pub session_id: u32,

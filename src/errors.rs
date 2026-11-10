@@ -80,6 +80,9 @@ impl From<ratv::Error> for ServiceError {
             ratv::Error::VolumeNotAvailable => {
                 Self::ServiceUnavailable("Volume control is not available on this Apple TV".into())
             }
+            ratv::Error::CommandFailed { .. } => {
+                Self::NotSupported("The app did not run the command".into())
+            }
             ratv::Error::Io(io) => io.into(),
             e => Self::ServiceUnavailable(e.to_string()),
         }

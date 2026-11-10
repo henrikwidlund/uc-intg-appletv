@@ -160,16 +160,19 @@ impl Controller {
     }
 
     /// Send a WebSocket message to a Remote. Messages are dropped while the Remote is in standby.
-    fn send_r2_msg(&self, message: WsMessage, ws_id: &str) {
+    fn send_r2_msg(&self, message: impl Into<SendWsMessage>, ws_id: &str) {
         if let Some(session) = self.sessions.get(ws_id) {
+            let message = message.into();
             if session.standby {
-                debug!(
-                    "[{ws_id}] Remote is in standby, not sending message: {:?}",
-                    message.msg
-                );
+                if let SendWsMessage::Msg(m) = &message {
+                    debug!(
+                        "[{ws_id}] Remote is in standby, not sending message: {:?}",
+                        m.msg
+                    );
+                }
                 return;
             }
-            if let Err(e) = session.recipient.try_send(SendWsMessage(message)) {
+            if let Err(e) = session.recipient.try_send(message) {
                 error!("[{ws_id}] Internal message send error: {e}");
             }
         } else {

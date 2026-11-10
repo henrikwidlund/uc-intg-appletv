@@ -39,6 +39,13 @@ const APPS_MARGIN: Duration = Duration::from_secs(30);
 /// Interval for a full reconnect while a protocol is missing.
 const FULL_RECONNECT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Waits before asking again when a request fails. Right after wake the device is not ready
+/// and answers with an error or not at all.
+const NOT_READY_RETRY: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
 /// Longest wait for a running connect before a command runs. The core waits 10 s for the answer.
 const CONNECT_WAIT: Duration = Duration::from_secs(6);
 /// A connect step without answer in this time is started again once.
@@ -67,6 +74,8 @@ const SIRI_WAIT: Duration = Duration::from_secs(15);
 const SCREEN_SETTLE: Duration = Duration::from_millis(1500);
 /// Now playing changes right after the Home Screen shows belong to the switch.
 const HOME_GRACE: Duration = Duration::from_secs(1);
+/// A chapter timer is kept if the new time is this close.
+const CHAPTER_TIMER_MARGIN: Duration = Duration::from_millis(250);
 /// Screen changes in this time after an app launch come from the launch.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
 
@@ -147,6 +156,10 @@ pub struct AppleTvActor {
     artwork_seq: u64,
     /// The Home Screen shows: now playing is cleared since then.
     home_since: Option<Instant>,
+    /// A now playing update came while `home_since` was new. It is read again later.
+    home_dropped: bool,
+    /// When the chapter timer fires.
+    chapter_due: Option<Instant>,
     /// Time of the last app launch through the driver.
     launched_at: Option<Instant>,
     /// Last media control flags from Companion. 0 when no app has media controls.
@@ -206,6 +219,8 @@ impl AppleTvActor {
             siri_lock: Arc::default(),
             artwork_seq: 0,
             home_since: None,
+            home_dropped: false,
+            chapter_due: None,
             launched_at: None,
             media_flags: None,
             shown_file: None,
@@ -258,14 +273,17 @@ impl AppleTvActor {
     }
 
     /// Status updates while a connect runs and there is no connection yet.
+    /// Uses the shown status: it stays `Connecting` between quick retries while the network is
+    /// not ready.
     fn running_connect(&self) -> Option<watch::Receiver<DeviceStatus>> {
-        (self.tv.is_none() && self.status == DeviceStatus::Connecting)
+        (self.tv.is_none() && *self.status_tx.borrow() == DeviceStatus::Connecting)
             .then(|| self.status_tx.subscribe())
     }
 
+    /// Set the status and show it, if the shown status is different.
     fn set_status(&mut self, status: DeviceStatus) {
-        if self.status != status {
-            self.status = status;
+        self.status = status;
+        if *self.status_tx.borrow() != status {
             self.status_tx.send_replace(status);
             self.controller.do_send(DeviceEvent::Status {
                 key: self.key.clone(),
@@ -414,7 +432,9 @@ impl AppleTvActor {
             (false, _) => {
                 Some("Companion: power state, apps, accounts and swipes are not available")
             }
-            (_, false) => Some("MRP: now playing, volume and outputs are not available"),
+            (_, false) => {
+                Some("MRP: volume, outputs, languages, chapters and Up Next are not available")
+            }
         };
         if let Some(missing) = missing {
             warn!("[{}] not connected: {missing}", self.cfg.name);
@@ -426,7 +446,7 @@ impl AppleTvActor {
         let mut dirty = Dirty::CONNECTION;
         self.s.connected = true;
         self.s.mrp = tv.mrp().is_some();
-        self.s.siri = tv.companion().is_some() || self.s.mrp;
+        self.s.siri = siri_available(&tv, self.ctx.siri_mode());
         let own_uid = tv.mrp().and_then(|m| m.device_info().device_uid.clone());
         if self.s.own_output_uid != own_uid {
             self.s.own_output_uid = own_uid;
@@ -465,7 +485,8 @@ impl AppleTvActor {
 
         self.tv = Some(tv);
         self.set_status(DeviceStatus::Connected);
-        self.query_power(ctx);
+        // One request at a time: ratv closes Companion after two silent timeouts in a row.
+        self.query_power(ctx, 0, true);
         // Until the device sends its state, the channels hold empty values. Using them would clear
         // what the Remote shows, so they are used only after the first update or after a wait.
         if self
@@ -490,7 +511,7 @@ impl AppleTvActor {
         });
         self.emit(dirty);
 
-        self.poll(ctx);
+        self.scan_outputs(ctx);
         self.timers.poll = Some(ctx.run_interval(POLL_INTERVAL, Self::poll));
     }
 
@@ -643,7 +664,9 @@ impl AppleTvActor {
         self.connect(ctx);
     }
 
-    fn query_power(&self, ctx: &mut Context<Self>) {
+    /// Ask for the power state. `attempt` counts the tries, see [`NOT_READY_RETRY`]. With
+    /// `then_poll`, the apps and accounts are fetched after it.
+    fn query_power(&self, ctx: &mut Context<Self>, attempt: usize, then_poll: bool) {
         let Some(tv) = self.tv.clone() else { return };
         if tv.companion().is_none() {
             return;
@@ -657,10 +680,32 @@ impl AppleTvActor {
                 }
             }
             .into_actor(self)
-            .map(move |result, act, _| match result {
-                Ok(state) if act.generation == generation => act.set_attention(state),
-                Ok(_) => {}
-                Err(e) => warn!("[{}] power state failed: {e}", act.cfg.name),
+            .map(move |result, act, ctx| {
+                if act.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(state) => act.set_attention(state),
+                    Err(e) => {
+                        if let Some(&delay) = NOT_READY_RETRY.get(attempt) {
+                            debug!(
+                                "[{}] power state failed: {e}, asking again in {}s",
+                                act.cfg.name,
+                                delay.as_secs()
+                            );
+                            ctx.run_later(delay, move |act, ctx| {
+                                if act.generation == generation {
+                                    act.query_power(ctx, attempt + 1, then_poll);
+                                }
+                            });
+                            return;
+                        }
+                        warn!("[{}] power state failed: {e}", act.cfg.name);
+                    }
+                }
+                if then_poll {
+                    act.poll_companion(ctx, 0);
+                }
             }),
         );
     }
@@ -673,7 +718,27 @@ impl AppleTvActor {
     }
 
     fn update_now_playing(&mut self, ctx: &mut Context<Self>) -> Dirty {
-        if self.home_since.is_some_and(|t| t.elapsed() < HOME_GRACE) {
+        if let Some(since) = self.home_since.filter(|t| t.elapsed() < HOME_GRACE) {
+            // Read again when the wait ends, but only if something plays: the update can also
+            // still be the app from before the Home Screen.
+            if !self.home_dropped {
+                self.home_dropped = true;
+                let generation = self.generation;
+                ctx.run_later(
+                    HOME_GRACE.saturating_sub(since.elapsed()),
+                    move |act, ctx| {
+                        act.home_dropped = false;
+                        let playing = act
+                            .np
+                            .as_ref()
+                            .is_some_and(|rx| rx.borrow().state == Some(PlaybackState::Playing));
+                        if act.generation == generation && act.home_since.is_some() && playing {
+                            let dirty = act.update_now_playing(ctx);
+                            act.emit(dirty);
+                        }
+                    },
+                );
+            }
             return Dirty::NONE;
         }
         let Some(rx) = &self.np else {
@@ -690,7 +755,18 @@ impl AppleTvActor {
     }
 
     fn apply_now_playing(&mut self, dirty: Dirty, ctx: &mut Context<Self>) -> Dirty {
-        if dirty.any(Dirty::LANGUAGES) && log_enabled!(Level::Debug) {
+        // A fast forward or rewind ended on the device, for example at the end of the item.
+        if self.seek.is_some()
+            && dirty.any(Dirty::RATE)
+            && self
+                .s
+                .rate
+                .is_some_and(|r| r.abs() < 0.01 || (r - 1.0).abs() < 0.01)
+        {
+            debug!("[{}] fast forward or rewind ended", self.cfg.name);
+            self.seek = None;
+        }
+        if dirty.any(Dirty::LANGUAGES | Dirty::LANGUAGE) && log_enabled!(Level::Debug) {
             self.log_languages();
         }
         if dirty.any(Dirty::METADATA | Dirty::ARTWORK) {
@@ -722,7 +798,7 @@ impl AppleTvActor {
                 && act.s.launched_app.take().is_some()
             {
                 act.launched_at = None;
-                act.emit(Dirty::APPS);
+                act.emit(Dirty::APP);
             }
             if act.generation != generation
                 || act.home_since.is_some()
@@ -814,7 +890,7 @@ impl AppleTvActor {
         if let Some(data) = self.s.artwork_data.clone() {
             debug!("[{}] artwork {id:?} from Companion", self.cfg.name);
             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&data)));
-            self.save_artwork(id, None, data, seq, (item, item_key), ctx);
+            self.save_artwork(&id, None, data, (item, item_key));
             return;
         }
         debug!("[{}] fetching artwork {id:?}", self.cfg.name);
@@ -823,7 +899,7 @@ impl AppleTvActor {
         ctx.spawn(
             async move { tv.artwork(ARTWORK_SIZE, 0).await }
                 .into_actor(self)
-                .map(move |result, act, ctx| {
+                .map(move |result, act, _| {
                     if act.generation != generation || act.artwork_seq != seq {
                         return;
                     }
@@ -832,12 +908,10 @@ impl AppleTvActor {
                             // Without an artwork id, the image data gives a stable file name.
                             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&art.data)));
                             act.save_artwork(
-                                id,
-                                art.mime_type,
+                                &id,
+                                art.mime_type.as_deref(),
                                 art.data,
-                                seq,
                                 (item, item_key),
-                                ctx,
                             );
                         }
                         // Some apps drop the image of the same item. Keep it until the item changes.
@@ -879,35 +953,17 @@ impl AppleTvActor {
         );
     }
 
-    /// Save the image. `item` is the item sequence and the item key at fetch time.
+    /// Keep the image and show it. `item` is the item sequence and the item key at fetch time.
     fn save_artwork(
-        &self,
-        id: String,
-        mime_type: Option<String>,
+        &mut self,
+        id: &str,
+        mime_type: Option<&str>,
         data: Bytes,
-        seq: u64,
         (item, item_key): (u32, u64),
-        ctx: &mut Context<Self>,
     ) {
-        let store = self.ctx.artwork.clone();
-        let key = self.key.clone();
-        ctx.spawn(
-            async move { store.save(&key, &id, mime_type.as_deref(), &data).await }
-                .into_actor(self)
-                .map(move |result, act, _| {
-                    let name: Box<str> = match result {
-                        Ok(name) => name.into(),
-                        Err(e) => {
-                            warn!("[{}] artwork save failed: {e}", act.cfg.name);
-                            return;
-                        }
-                    };
-                    act.item_art.remember(item_key, name.clone());
-                    if act.artwork_seq == seq {
-                        act.show_file(name, item);
-                    }
-                }),
-        );
+        let name = self.ctx.artwork.save(&self.key, id, mime_type, data);
+        self.item_art.remember(item_key, name.clone());
+        self.show_file(name, item);
     }
 
     /// Show a kept artwork file.
@@ -951,75 +1007,119 @@ impl AppleTvActor {
 
     /// Update the chapter select when the next chapter starts.
     fn schedule_chapter(&mut self, ctx: &mut Context<Self>) {
+        let delay = self.next_chapter_delay();
+        // Most updates do not move the next chapter start: keep the timer.
+        if let (Some(delay), Some(due), Some(_)) = (delay, self.chapter_due, &self.timers.chapter) {
+            let new_due = Instant::now() + delay;
+            let diff = new_due.max(due) - new_due.min(due);
+            if diff < CHAPTER_TIMER_MARGIN {
+                return;
+            }
+        }
         if let Some(handle) = self.timers.chapter.take() {
             ctx.cancel_future(handle);
         }
-        let rate = f64::from(self.s.rate.unwrap_or(0.0));
-        if rate <= 0.0 || self.s.chapters.is_empty() {
-            return;
-        }
-        let Some(pos) = self.s.position(now()) else {
-            return;
-        };
-        let Some(next) = self
-            .s
-            .chapters
-            .iter()
-            .filter_map(|c| c.start)
-            .find(|&start| start > pos + 0.5)
-        else {
-            return;
-        };
-        let Some(delay) = chapter_delay(next - pos, rate) else {
-            return;
-        };
+        self.chapter_due = None;
+        let Some(delay) = delay else { return };
+        self.chapter_due = Some(Instant::now() + delay);
         self.timers.chapter = Some(ctx.run_later(delay, |act, ctx| {
             act.timers.chapter = None;
+            act.chapter_due = None;
             act.emit(Dirty::CHAPTER);
             act.schedule_chapter(ctx);
         }));
     }
 
+    /// Time until the next chapter starts, if one starts while playing.
+    fn next_chapter_delay(&self) -> Option<Duration> {
+        let rate = f64::from(self.s.rate.unwrap_or(0.0));
+        if rate <= 0.0 || self.s.chapters.is_empty() {
+            return None;
+        }
+        let pos = self.s.position(now())?;
+        let next = self
+            .s
+            .chapters
+            .iter()
+            .filter_map(|c| c.start)
+            .find(|&start| start > pos + 0.5)?;
+        chapter_delay(next - pos, rate)
+    }
+
     /// Fetch the apps, accounts and AirPlay devices.
     fn poll(&mut self, ctx: &mut Context<Self>) {
-        let Some(tv) = self.tv.clone() else { return };
+        self.poll_companion(ctx, 0);
+        self.scan_outputs(ctx);
+    }
+
+    /// Fetch the apps and accounts. `attempt` counts the tries, see [`NOT_READY_RETRY`].
+    fn poll_companion(&self, ctx: &mut Context<Self>, attempt: usize) {
+        let Some(tv) = self.tv.clone().filter(|tv| tv.companion().is_some()) else {
+            return;
+        };
         let generation = self.generation;
-
-        if tv.companion().is_some() {
-            let fetch_apps = self
-                .apps_fetched
-                .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL);
-            let companion_tv = tv.clone();
-            // One after the other: requests that time out together count as one silent period
-            // only, and ratv closes the connection after two.
-            let fut = async move {
-                let apps = if fetch_apps {
-                    Some(companion_tv.apps().await)
-                } else {
-                    None
-                };
-                (apps, companion_tv.accounts().await)
+        let fetch_apps = self
+            .apps_fetched
+            .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL);
+        // One after the other: ratv closes Companion after two silent timeouts in a row.
+        let fut = async move {
+            let apps = if fetch_apps {
+                Some(tv.apps().await)
+            } else {
+                None
             };
-            ctx.spawn(fut.into_actor(self).map(move |(apps, accounts), act, _| {
-                act.apply_apps(apps, generation);
-                match accounts {
-                    Ok(accounts) if act.generation == generation => {
-                        let accounts = accounts
-                            .into_iter()
-                            .map(|a| AccountInfo {
-                                id: a.id,
-                                name: a.name,
-                            })
-                            .collect();
-                        let dirty = act.s.set_accounts(accounts);
-                        act.emit(dirty);
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!("[{}] account list failed: {e}", act.cfg.name),
+            (apps, tv.accounts().await)
+        };
+        ctx.spawn(fut.into_actor(self).map(move |(apps, accounts), act, ctx| {
+            if act.generation != generation {
+                return;
+            }
+            let apps_error = act.apply_apps(apps);
+            let accounts_error = match accounts {
+                Ok(accounts) => {
+                    let accounts = accounts
+                        .into_iter()
+                        .map(|a| AccountInfo {
+                            id: a.id,
+                            name: a.name,
+                        })
+                        .collect();
+                    let dirty = act.s.set_accounts(accounts);
+                    act.emit(dirty);
+                    None
                 }
-            }));
-        }
+                Err(e) => Some(e),
+            };
+            if apps_error.is_none() && accounts_error.is_none() {
+                return;
+            }
+            if let Some(&delay) = NOT_READY_RETRY.get(attempt) {
+                debug!(
+                    "[{}] app list: {apps_error:?}, account list: {accounts_error:?}, \
+                     asking again in {}s",
+                    act.cfg.name,
+                    delay.as_secs()
+                );
+                ctx.run_later(delay, move |act, ctx| {
+                    if act.generation == generation {
+                        act.poll_companion(ctx, attempt + 1);
+                    }
+                });
+                return;
+            }
+            if let Some(e) = apps_error {
+                warn!("[{}] app list failed: {e}", act.cfg.name);
+            }
+            if let Some(e) = accounts_error {
+                warn!("[{}] account list failed: {e}", act.cfg.name);
+            }
+        }));
+    }
 
+    /// Find the AirPlay devices that can join the group.
+    fn scan_outputs(&self, ctx: &mut Context<Self>) {
+        let Some(tv) = self.tv.as_ref() else { return };
+        let generation = self.generation;
         if tv.mrp().is_some() {
             let own_uid = self.s.own_output_uid.clone();
             ctx.spawn(
@@ -1040,13 +1140,13 @@ impl AppleTvActor {
         }
     }
 
+    /// Store the fetched apps. Returns the error, if the fetch failed.
     fn apply_apps(
         &mut self,
         result: Option<Result<Vec<ratv::companion::App>, ratv::Error>>,
-        generation: u64,
-    ) {
+    ) -> Option<ratv::Error> {
         match result {
-            Some(Ok(apps)) if self.generation == generation => {
+            Some(Ok(apps)) => {
                 self.apps_fetched = Some(Instant::now());
                 let apps = apps
                     .into_iter()
@@ -1060,9 +1160,10 @@ impl AppleTvActor {
                     self.save_cache();
                     self.emit(dirty);
                 }
+                None
             }
-            Some(Err(e)) => warn!("[{}] app list failed: {e}", self.cfg.name),
-            _ => {}
+            Some(Err(e)) => Some(e),
+            None => None,
         }
     }
 
@@ -1111,7 +1212,6 @@ impl AppleTvActor {
             power: self.expected_power.unwrap_or(self.s.power),
             muted: self.expected_mute.or(self.s.muted),
             screensaver: self.attention == Some(AttentionState::Screensaver),
-            powered: false,
         };
         let mut calls = Vec::with_capacity(run.actions.len() * run.repeat as usize);
         for i in 0..run.repeat {
@@ -1140,7 +1240,7 @@ impl AppleTvActor {
         let connecting = self.running_connect();
         if connecting.is_none() {
             let tv = self.tv.as_ref().ok_or(ServiceError::NotConnected)?;
-            if tv.companion().is_none() && tv.mrp().is_none() {
+            if !siri_available(tv, self.ctx.siri_mode()) {
                 return Err(ServiceError::ServiceUnavailable(
                     "Siri needs Companion or MRP".into(),
                 ));
@@ -1219,18 +1319,31 @@ impl AppleTvActor {
             .into_actor(self)
             .then(move |(), act, _| fut(act.tv.clone()).into_actor(act));
         ctx.spawn(start.map(move |result, act, _| {
-            if act
+            // Compare the session, not the id: the Remote can use the same id again.
+            let current = act.siri.as_ref().map(|s| &s.replaced);
+            if current.is_some_and(|r| Arc::ptr_eq(r, &ended)) {
+                act.siri = None;
+            } else if act
                 .siri
                 .as_ref()
                 .is_some_and(|s| s.session_id == session_id)
             {
-                act.siri = None;
+                // The new session with this id sends the end event.
+                return;
             }
             let replaced = ended.load(Ordering::Relaxed);
             let event = siri_event(&act.cfg.name, entity_id, session_id, result, replaced);
             act.controller.do_send(DeviceEvent::Assistant(event));
         }));
         Ok(())
+    }
+}
+
+/// The protocol that `mode` needs for Siri is connected.
+const fn siri_available(tv: &AppleTv, mode: SiriMode) -> bool {
+    match mode {
+        SiriMode::Auto => tv.companion().is_some() || tv.mrp().is_some(),
+        SiriMode::Mrp => tv.mrp().is_some(),
     }
 }
 
@@ -1270,20 +1383,20 @@ fn siri_event(
         }
         Err(e @ ratv::Error::SiriDisabled) => {
             warn!("[{name}] Siri failed: {e}");
-            return AssistantEvent::Error {
+            return siri_unavailable(
                 entity_id,
                 session_id,
-                data: AssistantError {
-                    code: AssistantErrorCode::ServiceUnavailable,
-                    message: "Siri is off on the Apple TV: Settings > General > Siri.".to_string(),
-                },
-            };
+                "Siri is off on the Apple TV: Settings > General > Siri.",
+            );
         }
         // Seen on MRP when Siri is off on the Apple TV.
         Err(e @ ratv::Error::SiriNotRecording) => {
             warn!("[{name}] Siri failed: {e}. Is Siri on in the Apple TV settings?");
-            "Apple TV did not start listening. Check that Siri is on: Settings > General > Siri."
-                .to_string()
+            return siri_unavailable(
+                entity_id,
+                session_id,
+                "Apple TV did not start listening. Check that Siri is on: Settings > General > Siri.",
+            );
         }
         Err(e) => {
             warn!("[{name}] Siri failed: {e}");
@@ -1296,6 +1409,18 @@ fn siri_event(
         data: AssistantError {
             code: AssistantErrorCode::UnexpectedError,
             message,
+        },
+    }
+}
+
+/// Error event for a Siri session that cannot run.
+fn siri_unavailable(entity_id: String, session_id: u32, message: &str) -> AssistantEvent {
+    AssistantEvent::Error {
+        entity_id,
+        session_id,
+        data: AssistantError {
+            code: AssistantErrorCode::ServiceUnavailable,
+            message: message.into(),
         },
     }
 }
@@ -1332,6 +1457,16 @@ impl Actor for AppleTvActor {
     }
 
     fn stopped(&mut self, ctx: &mut Self::Context) {
+        // The session future is dropped with the actor, so end the session here.
+        if let Some(siri) = self.siri.take() {
+            let entity_id = EntityKind::VoiceAssistant.entity_id(&self.key);
+            self.controller
+                .do_send(DeviceEvent::Assistant(siri_unavailable(
+                    entity_id,
+                    siri.session_id,
+                    "The Apple TV was removed or changed.",
+                )));
+        }
         self.close(ctx);
         self.ctx.artwork.remove(&self.key);
     }
@@ -1378,7 +1513,7 @@ impl Handler<CompanionEvent> for AppleTvActor {
             }
             Some(_) => {}
             // Events were lost: ask again.
-            None => self.query_power(ctx),
+            None => self.query_power(ctx, 0, false),
         }
     }
 }
@@ -1439,17 +1574,17 @@ impl Handler<Command> for AppleTvActor {
     type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
 
     fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
+        // The core can send a command before `exit_standby`.
+        if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
+            debug!("[{}] command while disconnected, connecting", self.cfg.name);
+            self.start_connect(ctx);
+        }
         if msg.kind == EntityKind::VoiceAssistant {
             let result = match msg.cmd_id.as_str() {
                 "voice_start" => self.voice_start(msg.params.as_ref(), ctx),
                 _ => Err(ServiceError::NotSupported(msg.cmd_id)),
             };
             return Box::pin(fut::ready(result));
-        }
-        // The core can send a command before `exit_standby`.
-        if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
-            debug!("[{}] command while disconnected, connecting", self.cfg.name);
-            self.start_connect(ctx);
         }
         // A command can come right after the Remote wakes up, while the connect still runs.
         let connecting = self.running_connect();
@@ -1541,7 +1676,7 @@ impl AppleTvActor {
             if let Some(id) = launched {
                 act.s.launched_app = Some(id);
                 act.launched_at = Some(Instant::now());
-                act.emit(Dirty::APPS);
+                act.emit(Dirty::APP);
             }
             result
         })

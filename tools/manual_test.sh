@@ -295,8 +295,10 @@ step "Find the driver on the Remote" \
 step "Setup: discovery" \
 "The Apple TV is on (not sleeping)." \
 "Select 'Apple TV (Rust)' and start the setup. Press Next on the info page.
+On the page 'Restore': leave 'Restore from backup' unticked, keep 'Siri protocol' at Auto. Press Next.
 On the page 'Setup mode': leave the IP address empty. Press Next." \
 "The info page has no input field.
+The page 'Restore' has 'Restore from backup', 'Debug log' and 'Siri protocol'.
 A page 'Please choose your Apple TV' with the Apple TV in a dropdown: name and IP address." \
 "recent_log 'discovering|not found|WARN|ERROR'"
 
@@ -396,7 +398,8 @@ The log needs debug lines (RUST_LOG from the start of the script)." \
 "Cover art is shown and stays. When the program changes (live TV), the new image is shown.
 Telia: change between channels, also back to a channel seen before. Each channel shows its image.
 A channel without an image shows no image, not the image of the last channel.
-The log shows 'artwork url' (the image has a URL) or 'fetching artwork' and then 'artwork file'.
+The log shows 'artwork url' (the image has a URL), or 'from Companion' (the image came with now playing)
+or 'fetching artwork', and then 'artwork file'.
 The file URL stays the same for the same image.
 Telia: a channel seen before with a logo shows the logo again, also when the TV sends none
 (log: 'using the image seen before for this item').
@@ -457,18 +460,17 @@ In the note: does the bar move at all, and does the Python integration allow it?
 # ---------------------------------------------------------------- volume
 
 step "Volume" \
-"Note your audio setup. With HDMI without CEC, the volume features are hidden." \
+"Note your audio setup. With HDMI without CEC, the volume controls stay but return an error." \
 "Press VOLUME UP, VOLUME DOWN and MUTE on the Remote. Move the volume slider of the media player." \
 "With volume control: the volume changes, mute toggles, the slider sets the level.
-Without volume control: the Volume control sensor is off. The volume controls disappear
-(at the latest after the next sleep and wake of the Remote). A command shows
+Without volume control: the Volume control sensor is off. The volume controls stay. A command shows
 'Volume control is not available on this Apple TV'." \
 "recent_log 'volume|WARN|ERROR'"
 
 step "Volume with AirPlay speakers" \
 "Group the Apple TV with an AirPlay speaker on the TV (Control Center > AirPlay)." \
 "Move the volume slider of the media player." \
-"With 'Change the volume of all AirPlay outputs together' on: all outputs change.
+"With 'Change volume on all connected devices' on: all outputs change.
 The volume shown is the average of the outputs."
 
 # ---------------------------------------------------------------- selects and browse
@@ -541,7 +543,24 @@ step "Siri" \
 "Apple TV on the Home Screen. The Siri entity is added to the Remote." \
 "Hold the voice button on the Remote and say 'What is the weather today'. Release." \
 "Siri shows on the TV and answers.
-The Remote shows that the voice command ended (no error)." \
+The Remote shows that the voice command ended (no error).
+The log shows 'mode Auto'." \
+"recent_log 'Siri|voice|WARN|ERROR'"
+
+step "Siri off on the Apple TV" \
+"Turn Siri off on the Apple TV: Settings > General > Siri." \
+"Hold the voice button on the Remote and say something. Release.
+Then turn Siri on again on the Apple TV." \
+"The Remote shows an error right away: 'Siri is off on the Apple TV'. No listening animation stays.
+The log shows 'Siri is off' when you turn it off, and 'Siri failed: Siri is off on the device'." \
+"recent_log 'Siri|voice|WARN|ERROR'"
+
+step "Siri with MRP only" \
+"Run the setup again. Set 'Siri protocol' to 'MRP only' and choose 'Save settings'." \
+"Hold the voice button on the Remote and say 'What is the weather today'. Release.
+Then set 'Siri protocol' back to Auto." \
+"The log shows 'mode MRP only'. Note in the answer if Siri answered on the TV.
+On tvOS 27 this can fail: Siri records but does not answer." \
 "recent_log 'Siri|voice|WARN|ERROR'"
 
 # ---------------------------------------------------------------- connection

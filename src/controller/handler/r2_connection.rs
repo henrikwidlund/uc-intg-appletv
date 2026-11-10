@@ -16,7 +16,7 @@ impl Handler<NewR2Session> for Controller {
         let mut session = R2Session::new(msg.addr);
         // Get the version information of the Remote for the log.
         let request = WsMessage::simple_request(session.new_msg_id(), "get_version");
-        if let Err(e) = session.recipient.try_send(SendWsMessage(request)) {
+        if let Err(e) = session.recipient.try_send(SendWsMessage::Msg(request)) {
             error!("[{}] Error sending get_version: {e}", msg.id);
         }
         info!("[{}] Remote connected", msg.id);

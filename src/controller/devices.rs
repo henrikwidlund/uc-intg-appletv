@@ -4,17 +4,18 @@
 //! Apple TV devices of the controller: entity states, subscriptions and commands.
 
 use crate::config_store::DeviceConfig;
-use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg};
+use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg, SendWsMessage};
 use crate::device::{
     AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop,
 };
-use crate::entities::{self, EntityKind};
+use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err};
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message, ResponseFuture};
+use bytestring::ByteString;
 use log::{debug, info, warn};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use uc_api::EntityType;
 use uc_api::intg::ws::BrowseMediaMsgData;
@@ -26,10 +27,57 @@ const POSITION_UPDATED_AT: &str = "media_position_updated_at";
 
 /// `entity_change` data. Borrows the attributes, so that they are not copied to serialize them.
 #[derive(Serialize)]
-pub(super) struct EntityChangeRef<'a> {
+pub(super) struct EntityChangeRef<'a, A = &'a Map<String, Value>> {
     entity_type: EntityType,
     entity_id: &'a str,
-    attributes: &'a Map<String, Value>,
+    attributes: A,
+}
+
+/// The attributes of `keys`, read from the cache.
+struct Picked<'a> {
+    cache: &'a Map<String, Value>,
+    keys: &'a [String],
+}
+
+impl Serialize for Picked<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.keys.len()))?;
+        for key in self.keys {
+            if let Some(value) = self.cache.get(key) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// `entity_change` event, the same as [`WsMessage::event`] gives.
+#[derive(Serialize)]
+struct EntityChangeEvent<T> {
+    kind: &'static str,
+    msg: &'static str,
+    cat: EventCategory,
+    ts: chrono::DateTime<chrono::Utc>,
+    msg_data: T,
+}
+
+/// Serialize an `entity_change` event once, to send it to each Remote.
+fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
+    let event = EntityChangeEvent {
+        kind: "event",
+        msg: "entity_change",
+        cat: EventCategory::Entity,
+        ts: chrono::Utc::now(),
+        msg_data: data,
+    };
+    match serde_json::to_string(&event) {
+        Ok(text) => Some(text.into()),
+        Err(e) => {
+            warn!("entity_change serialize error: {e}");
+            None
+        }
+    }
 }
 
 /// A voice command failed: forget the voice session.
@@ -208,15 +256,14 @@ impl Controller {
         }
         let voice_session = self.voice_session(&command);
         let controller = ctx.address();
+        // Queued now, so a `voice_start` reaches the device before the audio that follows it.
+        let request = addr.send(Command {
+            kind,
+            cmd_id: command.cmd_id,
+            params: command.params,
+        });
         Box::pin(async move {
-            let result = addr
-                .send(Command {
-                    kind,
-                    cmd_id: command.cmd_id,
-                    params: command.params,
-                })
-                .await
-                .unwrap_or_else(|e| Err(e.into()));
+            let result = request.await.unwrap_or_else(|e| Err(e.into()));
             if let Err(e) = result {
                 if let Some(session_id) = voice_session {
                     controller.do_send(EndVoiceSession(session_id));
@@ -275,12 +322,8 @@ impl Controller {
     }
 
     fn send_entity_change(&self, ws_id: &str, change: &EntityChangeRef<'_>) {
-        match serde_json::to_value(change) {
-            Ok(data) => self.send_r2_msg(
-                WsMessage::event("entity_change", EventCategory::Entity, data),
-                ws_id,
-            ),
-            Err(e) => warn!("entity_change serialize error: {e}"),
+        if let Some(text) = entity_change_text(change) {
+            self.send_r2_msg(SendWsMessage::Text(text), ws_id);
         }
     }
 
@@ -309,46 +352,44 @@ impl Controller {
                 diff(cache, attrs, subscribed)
             } else {
                 let changed = if subscribed {
-                    attrs.clone()
+                    attrs.keys().cloned().collect()
                 } else {
-                    Map::new()
+                    Vec::new()
                 };
                 self.entities.insert(entity_id.clone(), attrs);
                 changed
             };
             if !changed.is_empty() {
-                self.send_changes(kind, &entity_id, changed);
+                self.send_changes(kind, &entity_id, &changed);
             }
         }
     }
 
-    /// Send `entity_change` to the Remotes that subscribed the entity.
-    fn send_changes(&self, kind: EntityKind, entity_id: &str, attributes: Map<String, Value>) {
+    /// Send `entity_change` with the attributes of `keys` to the Remotes that subscribed the
+    /// entity. The message is serialized once.
+    fn send_changes(&self, kind: EntityKind, entity_id: &str, keys: &[String]) {
         let mut targets = self
             .sessions
             .iter()
             .filter(|(_, s)| s.subscribed_entities.contains(entity_id))
-            .map(|(ws_id, _)| &**ws_id);
-        let Some(mut target) = targets.next() else {
+            .map(|(ws_id, _)| &**ws_id)
+            .peekable();
+        let Some(cache) = self.entities.get(entity_id) else {
             return;
         };
-        let mut data = Map::new();
-        data.insert("entity_type".into(), json!(kind.entity_type()));
-        data.insert("entity_id".into(), entity_id.into());
-        data.insert("attributes".into(), Value::Object(attributes));
-        let data = Value::Object(data);
-        // The data is only copied for more than one Remote.
-        for next in targets {
-            self.send_r2_msg(
-                WsMessage::event("entity_change", EventCategory::Entity, data.clone()),
-                target,
-            );
-            target = next;
+        if targets.peek().is_none() {
+            return;
         }
-        self.send_r2_msg(
-            WsMessage::event("entity_change", EventCategory::Entity, data),
-            target,
-        );
+        let Some(text) = entity_change_text(EntityChangeRef {
+            entity_type: kind.entity_type(),
+            entity_id,
+            attributes: Picked { cache, keys },
+        }) else {
+            return;
+        };
+        for target in targets {
+            self.send_r2_msg(SendWsMessage::Text(text.clone()), target);
+        }
     }
 
     /// Driver state: error while one device has invalid credentials.
@@ -371,38 +412,35 @@ impl Controller {
     }
 }
 
-/// Merge new attributes into the cache. Returns the attributes that changed if `collect` is set.
-fn diff(
-    cache: &mut Map<String, Value>,
-    attrs: Map<String, Value>,
-    collect: bool,
-) -> Map<String, Value> {
-    let mut changed = Map::new();
-    let mut updated_at = None;
+/// Merge new attributes into the cache. Returns the names of the attributes that changed if
+/// `collect` is set.
+fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool) -> Vec<String> {
+    let mut changed = Vec::new();
+    let mut updated_at = false;
     let mut new_position = false;
     for (name, value) in attrs {
         if name == POSITION_UPDATED_AT {
-            updated_at = Some(value);
+            updated_at = true;
             continue;
         }
         if cache.get(&name) != Some(&value) {
-            new_position |= name == "media_position" || name == "media_duration";
+            // The Remote counts on from the timestamp while playing, so a resume needs a new one.
+            new_position |= matches!(name.as_str(), "media_position" | "media_duration" | "state");
             if collect {
-                cache.insert(name.clone(), value.clone());
-                changed.insert(name, value);
-            } else {
-                cache.insert(name, value);
+                changed.push(name.clone());
             }
+            cache.insert(name, value);
         }
     }
-    // The timestamp is only sent with a new position.
-    if let Some(ts) = updated_at
-        && new_position
-    {
+    // The timestamp is only sent with a new position or state.
+    if updated_at && new_position {
         if collect {
-            changed.insert(POSITION_UPDATED_AT.into(), ts.clone());
+            changed.push(POSITION_UPDATED_AT.into());
         }
-        cache.insert(POSITION_UPDATED_AT.into(), ts);
+        cache.insert(
+            POSITION_UPDATED_AT.into(),
+            media_player::position_timestamp().into(),
+        );
     }
     changed
 }
@@ -478,20 +516,21 @@ impl Handler<DeviceEvent> for Controller {
 }
 
 impl Handler<R2AudioChunkMsg> for Controller {
-    type Result = Result<(), ServiceError>;
+    type Result = ();
 
-    fn handle(&mut self, msg: R2AudioChunkMsg, _: &mut Self::Context) -> Self::Result {
-        let key = self.voice_sessions.get(&msg.session_id).ok_or_else(|| {
-            ServiceError::NotFound(format!("Unknown voice session: {}", msg.session_id))
-        })?;
-        let device = self.devices.get(key).ok_or_else(|| {
-            ServiceError::NotFound(format!("Unknown voice session: {}", msg.session_id))
-        })?;
+    fn handle(&mut self, msg: R2AudioChunkMsg, _: &mut Self::Context) {
+        let device = self
+            .voice_sessions
+            .get(&msg.session_id)
+            .and_then(|key| self.devices.get(key));
+        let Some(device) = device else {
+            warn!("Audio for unknown voice session {}", msg.session_id);
+            return;
+        };
         device.addr.do_send(AudioChunk {
             session_id: msg.session_id,
             data: msg.data,
         });
-        Ok(())
     }
 }
 
@@ -529,6 +568,7 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")
@@ -542,8 +582,19 @@ mod tests {
             map(json!({ "state": "ON", "media_title": "Song" })),
             true,
         );
-        assert_eq!(map(json!({ "media_title": "Song" })), changed);
+        assert_eq!(vec!["media_title"], changed);
         assert_eq!(Some(&json!("Song")), cache.get("media_title"));
+    }
+
+    fn keys(m: &Map<String, Value>) -> Vec<&str> {
+        let mut k: Vec<&str> = m.keys().map(String::as_str).collect();
+        k.sort_unstable();
+        k
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort_unstable();
+        v
     }
 
     #[test]
@@ -551,19 +602,28 @@ mod tests {
         let mut cache = map(json!({ "media_position": 1 }));
         let changed = diff(
             &mut cache,
-            map(json!({ "media_position": 1, POSITION_UPDATED_AT: "t1" })),
+            map(json!({ "media_position": 1, POSITION_UPDATED_AT: null })),
             true,
         );
-        assert!(changed.is_empty());
+        assert_eq!(Vec::<String>::new(), changed);
         let changed = diff(
             &mut cache,
-            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
+            map(json!({ "media_position": 2, POSITION_UPDATED_AT: null })),
             true,
         );
-        assert_eq!(
-            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
-            changed
+        assert_eq!(vec!["media_position", POSITION_UPDATED_AT], sorted(changed));
+        assert!(cache[POSITION_UPDATED_AT].is_string());
+    }
+
+    #[test]
+    fn position_timestamp_with_new_state() {
+        let mut cache = map(json!({ "state": "PAUSED", "media_position": 130 }));
+        let changed = diff(
+            &mut cache,
+            map(json!({ "state": "PLAYING", "media_position": 130, POSITION_UPDATED_AT: null })),
+            true,
         );
+        assert_eq!(vec![POSITION_UPDATED_AT, "state"], sorted(changed));
     }
 
     #[test]
@@ -571,13 +631,35 @@ mod tests {
         let mut cache = map(json!({ "media_position": 1 }));
         let changed = diff(
             &mut cache,
-            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
+            map(json!({ "media_position": 2, POSITION_UPDATED_AT: null })),
             false,
         );
-        assert!(changed.is_empty());
+        assert_eq!(Vec::<String>::new(), changed);
+        assert_eq!(vec!["media_position", POSITION_UPDATED_AT], keys(&cache));
+        assert!(cache[POSITION_UPDATED_AT].is_string());
+    }
+
+    #[test]
+    fn entity_change_text_has_only_the_keys() {
+        let cache = map(json!({ "state": "ON", "media_title": "Song" }));
+        let keys = ["media_title".to_string()];
+        let text = entity_change_text(EntityChangeRef {
+            entity_type: EntityType::MediaPlayer,
+            entity_id: "media_player.x",
+            attributes: Picked {
+                cache: &cache,
+                keys: &keys,
+            },
+        })
+        .expect("text");
+        let v: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!("event", v["kind"]);
+        assert_eq!("entity_change", v["msg"]);
+        assert_eq!("ENTITY", v["cat"]);
+        assert!(v["ts"].is_string());
         assert_eq!(
-            map(json!({ "media_position": 2, POSITION_UPDATED_AT: "t2" })),
-            cache
+            json!({ "entity_type": "media_player", "entity_id": "media_player.x", "attributes": { "media_title": "Song" } }),
+            v["msg_data"]
         );
     }
 }

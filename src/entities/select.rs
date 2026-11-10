@@ -23,13 +23,24 @@ pub const REPEAT_OPTIONS: [&str; 3] = ["Off", "All", "One"];
 /// Groups that change the attributes of a select.
 pub const fn dirty_groups(kind: SelectKind) -> Dirty {
     match kind {
+        SelectKind::App => Dirty::APPS.or(Dirty::APP),
+        SelectKind::AudioLanguage | SelectKind::Subtitles => Dirty::LANGUAGES.or(Dirty::LANGUAGE),
+        SelectKind::Chapter => Dirty::CHAPTERS.or(Dirty::CHAPTER),
+        SelectKind::PlaybackSpeed => Dirty::RATES.or(Dirty::RATE),
+        _ => list_groups(kind),
+    }
+}
+
+/// Groups that change the options of a select. The others only change the current option.
+const fn list_groups(kind: SelectKind) -> Dirty {
+    match kind {
         SelectKind::App => Dirty::APPS,
         SelectKind::AudioOutput => Dirty::OUTPUTS,
         SelectKind::AudioLanguage | SelectKind::Subtitles => Dirty::LANGUAGES,
         SelectKind::Account => Dirty::ACCOUNTS,
-        SelectKind::Chapter => Dirty::CHAPTERS.or(Dirty::CHAPTER),
+        SelectKind::Chapter => Dirty::CHAPTERS,
         SelectKind::UpNext => Dirty::QUEUE,
-        SelectKind::PlaybackSpeed => Dirty::RATE,
+        SelectKind::PlaybackSpeed => Dirty::RATES,
         SelectKind::Shuffle | SelectKind::Repeat => Dirty::SHUFFLE_REPEAT,
     }
 }
@@ -51,8 +62,8 @@ pub fn attributes(
     if !dirty.any(dirty_groups(kind) | Dirty::CONNECTION) {
         return;
     }
-    // Only the current chapter changed. The list is not built.
-    if kind == SelectKind::Chapter && !dirty.any(Dirty::CHAPTERS | Dirty::CONNECTION) {
+    // Only the current option changed. The list is not built.
+    if !dirty.any(list_groups(kind) | Dirty::CONNECTION) {
         out.insert(
             "current_option".into(),
             current(s, kind, now).unwrap_or_default().into(),
@@ -393,6 +404,23 @@ mod tests {
         attributes(&s, SelectKind::Chapter, Dirty::CHAPTERS, 0.0, &mut out);
         assert_eq!(Some(&json!(["Chapter 1", "Chapter 2"])), out.get("options"));
         assert_eq!(Some(&json!("Chapter 2")), out.get("current_option"));
+    }
+
+    #[test]
+    fn rate_change_sends_only_the_current_option() {
+        let s = Snapshot {
+            supported_rates: vec![1.0, 2.0],
+            rate: Some(2.0),
+            ..Snapshot::default()
+        };
+        let mut out = Map::new();
+        attributes(&s, SelectKind::PlaybackSpeed, Dirty::RATE, 0.0, &mut out);
+        assert_eq!(None, out.get("options"));
+        assert!(out.contains_key("current_option"));
+
+        let mut out = Map::new();
+        attributes(&s, SelectKind::PlaybackSpeed, Dirty::RATES, 0.0, &mut out);
+        assert!(out.contains_key("options"));
     }
 
     #[test]
