@@ -6,6 +6,7 @@
 //! The snapshot copies only the fields that changed, and reports them as [`Dirty`] groups. Only
 //! the attributes of dirty groups are built again.
 
+use bytes::Bytes;
 use ratv::companion::AttentionState;
 use ratv::mrp::{
     AudioFormat, Chapter, Command, LanguageOption, MediaSubType, MediaType, NowPlaying,
@@ -171,6 +172,8 @@ pub struct Snapshot {
     pub artwork_url: Option<String>,
     /// The app gives no artwork URL: the driver fetches the image.
     pub artwork_fetch: bool,
+    /// Image of the item from Companion. Saves the fetch over MRP.
+    pub artwork_data: Option<Bytes>,
     /// Changes when title, artist or album change.
     pub item_seq: u32,
     /// `item_seq` of the item that `artwork_url` belongs to.
@@ -300,23 +303,40 @@ impl Snapshot {
         self.skip_forward_interval = np.skip_forward_interval;
         self.skip_backward_interval = np.skip_backward_interval;
 
+        d | self.update_artwork(np, item_changed)
+    }
+
+    /// Copy the artwork fields of a now playing update.
+    fn update_artwork(&mut self, np: &NowPlaying, item_changed: bool) -> Dirty {
+        // Compare the buffers, not the bytes: ratv keeps the buffer while the image is the same.
+        let data_changed = match (&self.artwork_data, &np.artwork_data) {
+            (Some(a), Some(b)) => a.as_ptr() != b.as_ptr() || a.len() != b.len(),
+            (a, b) => a.is_some() != b.is_some(),
+        };
+        if data_changed {
+            self.artwork_data.clone_from(&np.artwork_data);
+        }
         if self.artwork_id != np.artwork_id {
             self.artwork_id.clone_from(&np.artwork_id);
             if !item_changed && np.artwork_id.is_some() {
                 self.item_started = Some(Instant::now());
             }
             self.set_artwork(np);
-            d |= Dirty::ARTWORK;
+            Dirty::ARTWORK
         } else if self.artwork_fetch && np.artwork_url.is_some() {
             // The URL can arrive after the id.
             self.set_artwork(np);
-            d |= Dirty::ARTWORK;
+            Dirty::ARTWORK
         } else if self.artwork_id.is_none() && item_changed {
             // Some apps send no artwork id, but the image is there. Ask again for each item.
             self.set_artwork(np);
-            d |= Dirty::ARTWORK;
+            Dirty::ARTWORK
+        } else if self.artwork_fetch && data_changed && self.artwork_data.is_some() {
+            // Companion can send the image after the item.
+            Dirty::ARTWORK
+        } else {
+            Dirty::NONE
         }
-        d
     }
 
     /// Use the CDN URL, or mark the image for fetching. The last image stays until the fetch ends.
@@ -622,6 +642,27 @@ mod tests {
         np.title = Some("Other channel".into());
         assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
         assert_ne!(item, s.item_seq);
+    }
+
+    #[test]
+    fn companion_artwork_after_the_item() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.title = Some("Show".into());
+        np.artwork_id = Some("a".into());
+        s.update_now_playing(&np);
+        assert!(s.artwork_fetch);
+
+        let image = Bytes::from_static(b"\xff\xd8\xff");
+        np.artwork_data = Some(image.clone());
+        assert_eq!(Dirty::ARTWORK, s.update_now_playing(&np));
+        // The same buffer again is no change.
+        np.artwork_data = Some(image);
+        assert_eq!(Dirty::NONE, s.update_now_playing(&np));
+        // A lost image keeps the shown one.
+        np.artwork_data = None;
+        assert_eq!(Dirty::NONE, s.update_now_playing(&np));
+        assert!(s.artwork_data.is_none());
     }
 
     #[test]

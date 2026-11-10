@@ -787,7 +787,8 @@ impl AppleTvActor {
         );
     }
 
-    /// Use the artwork URL, or fetch the image and serve it from a file.
+    /// Use the artwork URL, or serve the image from a file. The image comes from Companion, or is
+    /// fetched over MRP.
     ///
     /// The image is also fetched without an artwork id: some apps send none, but the Apple TV
     /// has the image.
@@ -805,11 +806,17 @@ impl AppleTvActor {
             return;
         };
         let id = self.s.artwork_id.clone();
-        debug!("[{}] fetching artwork {id:?}", self.cfg.name);
-        let generation = self.generation;
         let seq = self.artwork_seq;
         let item = self.s.item_seq;
         let item_key = self.s.item_key();
+        if let Some(data) = self.s.artwork_data.clone() {
+            debug!("[{}] artwork {id:?} from Companion", self.cfg.name);
+            let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&data)));
+            self.save_artwork(id, None, data, seq, (item, item_key), ctx);
+            return;
+        }
+        debug!("[{}] fetching artwork {id:?}", self.cfg.name);
+        let generation = self.generation;
         // The Apple TV scales the image.
         ctx.spawn(
             async move { tv.artwork(f64::from(ARTWORK_SIZE), -1.0).await }
@@ -822,7 +829,14 @@ impl AppleTvActor {
                         Ok(Some(art)) => {
                             // Without an artwork id, the image data gives a stable file name.
                             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&art.data)));
-                            act.save_artwork(id, art, seq, (item, item_key), ctx);
+                            act.save_artwork(
+                                id,
+                                art.mime_type,
+                                art.data,
+                                seq,
+                                (item, item_key),
+                                ctx,
+                            );
                         }
                         // Some apps drop the image of the same item. Keep it until the item changes.
                         Ok(None) if act.s.artwork_item == item => {
@@ -867,7 +881,8 @@ impl AppleTvActor {
     fn save_artwork(
         &self,
         id: String,
-        art: ratv::mrp::Artwork,
+        mime_type: Option<String>,
+        data: Bytes,
         seq: u64,
         (item, item_key): (u32, u64),
         ctx: &mut Context<Self>,
@@ -875,25 +890,21 @@ impl AppleTvActor {
         let store = self.ctx.artwork.clone();
         let key = self.key.clone();
         ctx.spawn(
-            async move {
-                store
-                    .save(&key, &id, art.mime_type.as_deref(), &art.data)
-                    .await
-            }
-            .into_actor(self)
-            .map(move |result, act, _| {
-                let name: Box<str> = match result {
-                    Ok(name) => name.into(),
-                    Err(e) => {
-                        warn!("[{}] artwork save failed: {e}", act.cfg.name);
-                        return;
+            async move { store.save(&key, &id, mime_type.as_deref(), &data).await }
+                .into_actor(self)
+                .map(move |result, act, _| {
+                    let name: Box<str> = match result {
+                        Ok(name) => name.into(),
+                        Err(e) => {
+                            warn!("[{}] artwork save failed: {e}", act.cfg.name);
+                            return;
+                        }
+                    };
+                    act.item_art.remember(item_key, name.clone());
+                    if act.artwork_seq == seq {
+                        act.show_file(name, item);
                     }
-                };
-                act.item_art.remember(item_key, name.clone());
-                if act.artwork_seq == seq {
-                    act.show_file(name, item);
-                }
-            }),
+                }),
         );
     }
 
