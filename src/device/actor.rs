@@ -34,8 +34,8 @@ use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent};
 
 /// Interval for the app, account and AirPlay polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
-/// The app list time is taken at the reply, so the next poll comes a bit early.
-const APPS_MARGIN: Duration = Duration::from_secs(30);
+/// The list time is taken at the reply, so the next poll comes a bit early.
+const POLL_MARGIN: Duration = Duration::from_secs(30);
 /// Interval for a full reconnect while a protocol is missing.
 const FULL_RECONNECT_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -116,6 +116,8 @@ struct Timers {
     chapter: Option<SpawnHandle>,
     full_reconnect: Option<SpawnHandle>,
     screen: Option<SpawnHandle>,
+    /// Running AirPlay scan.
+    scan: Option<SpawnHandle>,
 }
 
 pub struct AppleTvActor {
@@ -150,6 +152,7 @@ pub struct AppleTvActor {
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
     timers: Timers,
     apps_fetched: Option<Instant>,
+    outputs_scanned: Option<Instant>,
     /// Last sent current chapter.
     chapter: Option<usize>,
     /// Incremented on each artwork update. Results of older fetches are ignored.
@@ -234,6 +237,7 @@ impl AppleTvActor {
             cmd_lock: Arc::default(),
             timers: Timers::default(),
             apps_fetched: None,
+            outputs_scanned: None,
             chapter: None,
         }
     }
@@ -552,6 +556,7 @@ impl AppleTvActor {
             self.timers.chapter.take(),
             self.timers.full_reconnect.take(),
             self.timers.screen.take(),
+            self.timers.scan.take(),
         ]
         .into_iter()
         .flatten()
@@ -567,9 +572,16 @@ impl AppleTvActor {
 
     fn cancel_timers(&mut self, ctx: &mut Context<Self>) {
         let t = std::mem::take(&mut self.timers);
-        for handle in [t.reconnect, t.poll, t.chapter, t.full_reconnect, t.screen]
-            .into_iter()
-            .flatten()
+        for handle in [
+            t.reconnect,
+            t.poll,
+            t.chapter,
+            t.full_reconnect,
+            t.screen,
+            t.scan,
+        ]
+        .into_iter()
+        .flatten()
         {
             ctx.cancel_future(handle);
         }
@@ -1058,9 +1070,7 @@ impl AppleTvActor {
             return;
         };
         let generation = self.generation;
-        let fetch_apps = self
-            .apps_fetched
-            .is_none_or(|t| t.elapsed() + APPS_MARGIN >= POLL_INTERVAL);
+        let fetch_apps = poll_due(self.apps_fetched);
         // One after the other: ratv closes Companion after two silent timeouts in a row.
         let fut = async move {
             let apps = if fetch_apps {
@@ -1116,26 +1126,35 @@ impl AppleTvActor {
         }));
     }
 
-    /// Find the AirPlay devices that can join the group.
-    fn scan_outputs(&self, ctx: &mut Context<Self>) {
+    /// Find the AirPlay devices that can join the group, if the last scan is too old.
+    fn scan_outputs(&mut self, ctx: &mut Context<Self>) {
         let Some(tv) = self.tv.as_ref() else { return };
+        if self.timers.scan.is_some() || !poll_due(self.outputs_scanned) {
+            return;
+        }
         let generation = self.generation;
         if tv.mrp().is_some() {
             let own_uid = self.s.own_output_uid.clone();
-            ctx.spawn(
-                async move { discovery::scan_airplay_outputs(own_uid.as_deref()).await }
-                    .into_actor(self)
-                    .map(move |result, act, _| match result {
-                        Ok(devices) if act.generation == generation => {
-                            let dirty = act.s.set_airplay_devices(devices);
-                            if !dirty.is_empty() {
-                                act.save_cache();
-                                act.emit(dirty);
+            self.timers.scan = Some(
+                ctx.spawn(
+                    async move { discovery::scan_airplay_outputs(own_uid.as_deref()).await }
+                        .into_actor(self)
+                        .map(move |result, act, _| {
+                            act.timers.scan = None;
+                            match result {
+                                Ok(devices) if act.generation == generation => {
+                                    act.outputs_scanned = Some(Instant::now());
+                                    let dirty = act.s.set_airplay_devices(devices);
+                                    if !dirty.is_empty() {
+                                        act.save_cache();
+                                        act.emit(dirty);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("[{}] AirPlay scan failed: {e}", act.cfg.name),
                             }
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("[{}] AirPlay scan failed: {e}", act.cfg.name),
-                    }),
+                        }),
+                ),
             );
         }
     }
@@ -1431,6 +1450,11 @@ async fn connect_ended(status: Option<watch::Receiver<DeviceStatus>>) {
         let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
         let _ = tokio::time::timeout(CONNECT_WAIT, ended).await;
     }
+}
+
+/// `true` if a list fetched at `last` is old enough to fetch again. `None` means not fetched yet.
+fn poll_due(last: Option<Instant>) -> bool {
+    last.is_none_or(|t| t.elapsed() + POLL_MARGIN >= POLL_INTERVAL)
 }
 
 /// Time until the next chapter, or `None` if it is not a valid duration.
