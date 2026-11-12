@@ -19,7 +19,7 @@ use std::ops::{BitOr, BitOrAssign};
 use std::time::{Duration, Instant};
 
 /// Size of the requested artwork.
-pub const ARTWORK_SIZE: u32 = 250;
+pub const ARTWORK_SIZE: u32 = 480;
 
 /// Groups of changed state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
