@@ -302,7 +302,7 @@ impl Controller {
                 mut found,
                 manual_address,
             } => {
-                let choice = values.get("choice").map(String::as_str).unwrap_or_default();
+                let choice = values.get("choice").map_or_default(String::as_str);
                 let Some(i) = found.iter().position(|f| f.id == choice) else {
                     return Err(InputError::Invalid(
                         Box::new(SetupState::ChooseDevice {
@@ -485,8 +485,8 @@ impl Controller {
         let unknown_device =
             || InputError::Invalid(Box::new(SetupState::ConfigMode), "Unknown device".into());
         let flow = self.setup_flow;
-        let action = values.get("action").map(String::as_str).unwrap_or_default();
-        let key = values.get("choice").map(String::as_str).unwrap_or_default();
+        let action = values.get("action").map_or_default(String::as_str);
+        let key = values.get("choice").map_or_default(String::as_str);
         self.set_debug_log(
             &ws_id,
             parse_bool(values, "debug_log", self.driver_settings.debug_log),
@@ -883,7 +883,7 @@ impl Controller {
             cfg.address = address;
         }
         // The identifiers can all change, for example after a tvOS update. Link to the chosen device.
-        let choice = values.get("device").map(String::as_str).unwrap_or_default();
+        let choice = values.get("device").map_or_default(String::as_str);
         if let Some(f) = found.iter().find(|f| f.id == choice) {
             if !cfg.matches(f.known_ids.iter().map(String::as_str)) {
                 info!("[{}] linked to {} ({:?})", cfg.name, f.name, f.known_ids);
@@ -1029,7 +1029,7 @@ impl Controller {
             json!({ "id": "restore", "label": { "en": "Restore configuration from backup" } }),
             json!({ "id": "settings", "label": { "en": "Save settings" } }),
         ]);
-        let first = devices.first().map(|c| c.key.as_str()).unwrap_or_default();
+        let first = devices.first().map_or_default(|c| c.key.as_str());
         json!({
             "title": { "en": "Configuration mode" },
             "settings": [
@@ -1171,7 +1171,7 @@ fn choose_device_page(found: &[Found]) -> Value {
             {
                 "id": "choice",
                 "label": { "en": "Choose your Apple TV" },
-                "field": { "dropdown": { "value": found.first().map(|f| f.id.as_str()).unwrap_or_default(), "items": items } }
+                "field": { "dropdown": { "value": found.first().map_or_default(|f| f.id.as_str()), "items": items } }
             },
             global_volume_field(true)
         ]
@@ -1193,7 +1193,7 @@ fn pin_page(name: &str) -> Value {
 
 fn configure_page(cfg: &DeviceConfig, found: &[Found]) -> Value {
     let address = if cfg.manual_address {
-        cfg.address.map(|a| a.to_string()).unwrap_or_default()
+        cfg.address.map_or_default(|a| a.to_string())
     } else {
         String::new()
     };

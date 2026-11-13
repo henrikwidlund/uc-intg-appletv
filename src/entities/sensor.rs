@@ -89,12 +89,7 @@ fn value(s: &Snapshot, kind: SensorKind, now: f64) -> Value {
         SensorKind::Episode => episode(s).unwrap_or_default().into(),
         SensorKind::Genre => s.genre.clone().unwrap_or_default().into(),
         SensorKind::ContentRating => s.content_rating.clone().unwrap_or_default().into(),
-        SensorKind::AudioFormat => s
-            .audio_format
-            .as_ref()
-            .map(audio_format)
-            .unwrap_or_default()
-            .into(),
+        SensorKind::AudioFormat => s.audio_format.as_ref().map_or_default(audio_format).into(),
         _ => Value::Null,
     }
 }
