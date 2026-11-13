@@ -2,7 +2,7 @@
 name = "uc-intg-appletv"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100"
 license = "MPL-2.0"
 description = "Apple TV integration for Unfolded Circle Remote Two/3"
 authors = ["Henrik Widlund"]
@@ -16,7 +16,7 @@ mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "b23d40bdad013b7ff672602af45aae9f1825f280", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "8c5fe30610b3c0540c016bdcd1e97478bc649b8c", features = ["opus"] }
 
 # WebSocket server
 actix = "0.13.5"
