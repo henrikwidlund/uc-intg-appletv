@@ -157,6 +157,22 @@ cargo deny check
 `tools/manual_test.sh` runs the tests with a real Apple TV and Remote, one step at a time.
 It saves the results to `manual-test-results-<time>.md`.
 
+`tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,
+connects to it like a Remote and runs the checks that need no person. It uses the pairing in
+`config.json` of an earlier run of the driver. A second connection with its own pairing reads the
+values of the Apple TV to compare them with the driver. Pair it one time with a PIN:
+
+```shell
+cargo build --release
+cargo build --manifest-path tools/remote-sim/Cargo.toml
+tools/remote-sim/target/debug/remote-sim pair 192.168.1.20
+tools/remote-sim/target/debug/remote-sim 192.168.1.20
+```
+
+Start a video with chapters and more than one audio language before the run to also test
+playback and languages. `--only a,b` and `--skip a,b` choose the checks, `--no-power` keeps the
+Apple TV on. The results are saved to `remote-sim-results-<time>.md`.
+
 ratv is a git dependency with a fixed commit. To test local ratv changes, add this to
 `~/.cargo/config.toml` and remove it when you are done:
 

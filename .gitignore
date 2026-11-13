@@ -7,3 +7,6 @@
 /config.json
 /cache_*.json
 /driver.log
+/tools/remote-sim/target
+/remote-sim-credentials
+/remote-sim-results-*.md
