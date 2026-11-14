@@ -67,7 +67,8 @@ jobs:
           provenance: false
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,scope=${{ env.PLATFORM_PAIR }},mode=max
+          # Only pull requests save the cache. A cache saved on a tag can only be used by that tag.
+          cache-to: ${{ github.event_name == 'pull_request' && format('type=gha,scope={0},mode=max', env.PLATFORM_PAIR) || '' }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=${{ github.event_name != 'pull_request' }},name-canonical=true,push=${{ github.event_name != 'pull_request' }}
 
       - name: Export digest
