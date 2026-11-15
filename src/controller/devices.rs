@@ -137,10 +137,10 @@ impl Controller {
         Some(device.cfg)
     }
 
-    /// The configuration of all devices, sorted by name.
+    /// The configuration of all devices, sorted by name and key.
     pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
         let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
         devices
     }
 
@@ -156,21 +156,43 @@ impl Controller {
         Ok(())
     }
 
+    /// All entity definitions, in the order of [`Self::send_order`].
     pub(super) fn available_entities(&self) -> Vec<AvailableIntgEntity> {
-        self.devices
+        let mut list: Vec<AvailableIntgEntity> = self
+            .devices
             .values()
             .flat_map(|d| entities::definitions(&d.cfg))
-            .collect()
+            .collect();
+        list.sort_unstable_by(|a, b| {
+            self.send_order(a.entity_type, &a.entity_id)
+                .cmp(&self.send_order(b.entity_type, &b.entity_id))
+        });
+        list
     }
 
     /// States of the subscribed entities, or of all entities without subscriptions.
+    /// Same order as [`Self::available_entities`].
     pub(super) fn entity_states(&self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
         let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
-        self.entities
+        let mut states: Vec<EntityChangeRef<'_>> = self
+            .entities
             .iter()
             .filter(|(id, _)| subscribed.is_none_or(|s| s.is_empty() || s.contains(*id)))
             .filter_map(|(id, attrs)| entity_change(id, attrs))
-            .collect()
+            .collect();
+        states.sort_unstable_by(|a, b| {
+            self.send_order(a.entity_type, a.entity_id)
+                .cmp(&self.send_order(b.entity_type, b.entity_id))
+        });
+        states
+    }
+
+    /// Sort key for sending entities: media players first, then remotes, then the rest.
+    /// Within each group: device name, device key, entity id.
+    fn send_order<'a>(&'a self, ty: EntityType, id: &'a str) -> (u8, &'a str, &'a str, &'a str) {
+        let key = EntityKind::parse(id).map_or("", |(k, _)| k);
+        let name = self.devices.get(key).map_or("", |d| d.cfg.name.as_str());
+        (send_rank(ty), name, key, id)
     }
 
     pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
@@ -443,6 +465,15 @@ fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool
         );
     }
     changed
+}
+
+/// Send order of an entity type: media player, remote, then the rest.
+const fn send_rank(ty: EntityType) -> u8 {
+    match ty {
+        EntityType::MediaPlayer => 0,
+        EntityType::Remote => 1,
+        _ => 2,
+    }
 }
 
 fn entity_change<'a>(
