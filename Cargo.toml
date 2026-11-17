@@ -16,17 +16,17 @@ mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "f7ac3cbb05d7674170838556ed90f9c927465b5a", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "feb2b5cbe80dcd2a2847cbd960e5bc79624f9cf5", features = ["opus"] }
 
 # WebSocket server
-actix = "0.13.5"
-actix-web = { version = "4.18.2", default-features = false, features = ["macros"] }
-actix-ws = "0.4.0"
+actix = "0.13.6"
+actix-web = { version = "4.20.0", default-features = false, features = ["macros"] }
+actix-ws = "0.4.1"
 bytes = "1.12.1"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", features = ["fs", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-prost = "0.14.4"
+prost = "0.14.6"
 
 # mDNS publishing
 hostname = "0.4.2"
@@ -40,13 +40,13 @@ const_format = "0.2.37"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
-bytestring = "1.5.1"
-uuid = { version = "1.29.1", features = ["v4"] }
+bytestring = "1.6.0"
+uuid = { version = "1.29.3", features = ["v4"] }
 
 # Logging. The `log` feature of tracing forwards ratv log events to env_logger.
 env_logger = "0.11.11"
 log = "0.4.35"
-mdns-sd = { version = "0.21.7", optional = true }
+mdns-sd = { version = "0.22.0", optional = true }
 
 [build-dependencies]
 built = { version = "0.8.1", features = ["cargo-lock"] }
