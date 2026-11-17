@@ -1794,6 +1794,36 @@ impl Handler<Command> for AppleTvActor {
     }
 }
 
+/// State that a command changes, to apply when it succeeds.
+#[derive(Default)]
+struct Expect {
+    account: Option<String>,
+    launched: Option<String>,
+    mute: Option<bool>,
+    power: Option<Power>,
+    begins_seek: bool,
+}
+
+impl Expect {
+    fn from_calls(calls: &[Call]) -> Self {
+        let mut e = Self::default();
+        for call in calls {
+            match call {
+                // The current account is not reported by the Apple TV, so it is set after a switch.
+                Call::SwitchAccount(_, name) => e.account = Some(name.clone()),
+                // The app in front is not reported either.
+                Call::LaunchApp(id) => e.launched = Some(id.clone()),
+                Call::Mute(m) => e.mute = Some(*m),
+                Call::TurnOn => e.power = Some(Power::On),
+                Call::TurnOff => e.power = Some(Power::Off),
+                Call::BeginFastForward | Call::BeginRewind => e.begins_seek = true,
+                _ => {}
+            }
+        }
+        e
+    }
+}
+
 impl AppleTvActor {
     /// Plan and run a command. `guard` is held until the results are applied.
     fn run_command(
@@ -1807,27 +1837,19 @@ impl AppleTvActor {
             (_, Err(e)) => Err(e),
             (Some(tv), Ok(calls)) => Ok((tv, calls)),
         };
-        let mut account = None;
-        let mut launched = None;
-        let mut mute = None;
-        let mut power = None;
-        let mut begins_seek = false;
-        if let Ok((_, calls)) = &prepared {
-            debug!("[{}] {} -> {calls:?}", self.cfg.name, msg.cmd_id);
-            for call in calls {
-                match call {
-                    // The current account is not reported by the Apple TV, so it is set after a switch.
-                    Call::SwitchAccount(_, name) => account = Some(name.clone()),
-                    // The app in front is not reported either.
-                    Call::LaunchApp(id) => launched = Some(id.clone()),
-                    Call::Mute(m) => mute = Some(*m),
-                    Call::TurnOn => power = Some(Power::On),
-                    Call::TurnOff => power = Some(Power::Off),
-                    Call::BeginFastForward | Call::BeginRewind => begins_seek = true,
-                    _ => {}
-                }
+        let Expect {
+            account,
+            launched,
+            mute,
+            power,
+            begins_seek,
+        } = match &prepared {
+            Ok((_, calls)) => {
+                debug!("[{}] {} -> {calls:?}", self.cfg.name, msg.cmd_id);
+                Expect::from_calls(calls)
             }
-        }
+            Err(_) => Expect::default(),
+        };
         let fut = async move {
             let result = match prepared {
                 Ok((tv, calls)) => exec_all(&tv, calls).await.map_err(ServiceError::from),

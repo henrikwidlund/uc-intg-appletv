@@ -32,10 +32,14 @@ impl Driver {
 
     pub async fn start(&mut self) -> Result<(), Fail> {
         self.stop().await;
-        let log = std::fs::OpenOptions::new()
+        // The child process needs a file of the standard library.
+        let log = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.log)?;
+            .open(&self.log)
+            .await?
+            .into_std()
+            .await;
         let child = Command::new(&self.bin)
             .env("UC_CONFIG_HOME", &self.dir)
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")

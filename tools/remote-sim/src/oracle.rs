@@ -67,7 +67,7 @@ fn write_private(file: &Path, text: &str) -> Result<(), Fail> {
 
 impl Oracle {
     pub async fn connect(address: IpAddr, file: &Path) -> Result<Self, Fail> {
-        let text = std::fs::read_to_string(file).map_err(|e| {
+        let text = tokio::fs::read_to_string(file).await.map_err(|e| {
             Fail::new(format!(
                 "no pairing in {} ({e}), run `remote-sim pair <address>` first",
                 file.display()

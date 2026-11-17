@@ -234,7 +234,7 @@ async fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let dir = std::env::temp_dir().join(format!("remote-sim-{stamp}"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         exit(&format!("cannot create {}: {e}", dir.display()));
     }
     let mut driver = Driver::new(&opt.bin, &dir, opt.port);
@@ -266,7 +266,10 @@ async fn main() {
     ctx.report.push(String::new());
     ctx.report.push(summary);
     let file = format!("remote-sim-results-{stamp}.md");
-    if std::fs::write(&file, ctx.report.join("\n") + "\n").is_ok() {
+    if tokio::fs::write(&file, ctx.report.join("\n") + "\n")
+        .await
+        .is_ok()
+    {
         println!("Results: {file}");
     }
     std::process::exit(i32::from(ctx.failed > 0));

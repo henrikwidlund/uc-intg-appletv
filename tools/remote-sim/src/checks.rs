@@ -306,7 +306,8 @@ pub async fn entities(ctx: &mut Ctx) -> Check {
         .filter_map(|e| e["entity_id"].as_str())
         .find(|id| id.starts_with("media_player."))
         .ok_or_else(|| Fail::new("no media player entity"))?;
-    mp.trim_start_matches("media_player.").clone_into(&mut ctx.key);
+    mp.trim_start_matches("media_player.")
+        .clone_into(&mut ctx.key);
     let mut expected: BTreeSet<String> = [ctx.mp(), ctx.remote(), ctx.voice()].into();
     expected.extend(SELECTS.iter().map(|k| ctx.select(k)));
     expected.extend(SENSORS.iter().map(|k| ctx.sensor(k)));
@@ -380,45 +381,9 @@ async fn mismatches(ctx: &Ctx) -> Result<Vec<String>, Fail> {
         out.push(format!("state {state}, Apple TV awake {awake}"));
     }
 
-    if let Some(volume) = oracle.volume() {
-        let expected = match volume.available {
-            Some(true) => "on",
-            Some(false) => "off",
-            None => "",
-        };
-        let sensor = c.text(&ctx.sensor("volume_control"), "value");
-        if !expected.is_empty() && sensor != expected {
-            out.push(format!("volume_control {sensor}, Apple TV {expected}"));
-        }
-        // With more outputs, the driver can show the average of them.
-        if let Some(level) = volume.level.filter(|_| volume.outputs.len() <= 1) {
-            let shown = c.attr(&mp, "volume").and_then(Value::as_f64);
-            let level = f64::from(level) * 100.0;
-            if shown.is_none_or(|v| (v - level).abs() > 1.0) {
-                out.push(format!("volume {shown:?}, Apple TV {level:.0}"));
-            }
-        }
-        if let Some(muted) = volume.muted {
-            let shown = c.attr(&mp, "muted").and_then(Value::as_bool);
-            if shown != Some(muted) {
-                out.push(format!("muted {shown:?}, Apple TV {muted}"));
-            }
-        }
-    }
-
-    if awake && let Some(np) = oracle.now_playing() {
-        let shown = c.text(&mp, "media_title");
-        if let Some(title) = np.title.as_deref().filter(|t| !t.is_empty())
-            && !shown.contains(title)
-        {
-            out.push(format!("media_title {shown:?}, Apple TV {title:?}"));
-        }
-        if let Some(name) = np.app.as_deref().and_then(|b| oracle.app_name(b)) {
-            let source = c.text(&mp, "source");
-            if source != name {
-                out.push(format!("source {source:?}, Apple TV {name:?}"));
-            }
-        }
+    volume_mismatches(ctx, oracle, &mut out);
+    if awake {
+        now_playing_mismatches(ctx, oracle, &mut out);
     }
 
     let source = c.text(&mp, "source");
@@ -454,6 +419,59 @@ async fn mismatches(ctx: &Ctx) -> Result<Vec<String>, Fail> {
         }
     }
     Ok(out)
+}
+
+/// Compare the volume values.
+fn volume_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
+    let c = &ctx.client;
+    let mp = ctx.mp();
+    let Some(volume) = oracle.volume() else {
+        return;
+    };
+    let expected = match volume.available {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "",
+    };
+    let sensor = c.text(&ctx.sensor("volume_control"), "value");
+    if !expected.is_empty() && sensor != expected {
+        out.push(format!("volume_control {sensor}, Apple TV {expected}"));
+    }
+    // With more outputs, the driver can show the average of them.
+    if let Some(level) = volume.level.filter(|_| volume.outputs.len() <= 1) {
+        let shown = c.attr(&mp, "volume").and_then(Value::as_f64);
+        let level = f64::from(level) * 100.0;
+        if shown.is_none_or(|v| (v - level).abs() > 1.0) {
+            out.push(format!("volume {shown:?}, Apple TV {level:.0}"));
+        }
+    }
+    if let Some(muted) = volume.muted {
+        let shown = c.attr(&mp, "muted").and_then(Value::as_bool);
+        if shown != Some(muted) {
+            out.push(format!("muted {shown:?}, Apple TV {muted}"));
+        }
+    }
+}
+
+/// Compare the title and the app that plays.
+fn now_playing_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
+    let c = &ctx.client;
+    let mp = ctx.mp();
+    let Some(np) = oracle.now_playing() else {
+        return;
+    };
+    let shown = c.text(&mp, "media_title");
+    if let Some(title) = np.title.as_deref().filter(|t| !t.is_empty())
+        && !shown.contains(title)
+    {
+        out.push(format!("media_title {shown:?}, Apple TV {title:?}"));
+    }
+    if let Some(name) = np.app.as_deref().and_then(|b| oracle.app_name(b)) {
+        let source = c.text(&mp, "source");
+        if source != name {
+            out.push(format!("source {source:?}, Apple TV {name:?}"));
+        }
+    }
 }
 
 /// Wait until the driver shows the values of the Apple TV.
@@ -1150,7 +1168,8 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(ctx.driver.config_file())?
+        let mode = tokio::fs::metadata(ctx.driver.config_file())
+            .await?
             .permissions()
             .mode()
             & 0o777;
@@ -1165,9 +1184,9 @@ pub async fn config_file(ctx: &mut Ctx) -> Check {
 }
 
 pub async fn broken_config(ctx: &mut Ctx) -> Check {
-    let good = std::fs::read_to_string(ctx.driver.config_file())?;
+    let good = tokio::fs::read_to_string(ctx.driver.config_file()).await?;
     ctx.driver.stop().await;
-    std::fs::write(ctx.driver.config_file(), "[{\"broken\": ")?;
+    tokio::fs::write(ctx.driver.config_file(), "[{\"broken\": ").await?;
     let result = async {
         restart(ctx).await?;
         ctx.client
@@ -1181,9 +1200,9 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
     .await;
     ctx.driver.stop().await;
     for file in bad_files(ctx) {
-        let _ = std::fs::remove_file(file);
+        let _ = tokio::fs::remove_file(file).await;
     }
-    std::fs::write(ctx.driver.config_file(), good)?;
+    tokio::fs::write(ctx.driver.config_file(), good).await?;
     restart(ctx).await?;
     ctx.client.forget_states();
     subscribe_all(ctx).await?;
