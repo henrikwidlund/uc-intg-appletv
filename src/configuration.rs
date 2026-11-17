@@ -4,7 +4,8 @@
 
 //! Driver settings from environment variables and the compiled-in driver metadata.
 
-use crate::APP_VERSION;
+use crate::{APP_VERSION, built_info};
+use serde::de::value::{self, StrDeserializer};
 use std::collections::HashMap;
 use std::env;
 use std::io;
@@ -118,6 +119,18 @@ pub fn get_driver_metadata() -> Result<IntegrationDriverUpdate, io::Error> {
     }
     driver.token = None;
     driver.version = Some(APP_VERSION.to_string());
+    // Set by the release build.
+    if let Some(date) = built_info::RELEASE_DATE {
+        // Parsed by the date type of `uc_api`, so the driver does not name it.
+        let date = serde::Deserialize::deserialize(StrDeserializer::<value::Error>::new(date))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid UC_RELEASE_DATE {date}: {e}"),
+                )
+            })?;
+        driver.release_date = Some(date);
+    }
 
     Ok(driver)
 }
@@ -131,5 +144,9 @@ mod tests {
         let driver = get_driver_metadata().expect("valid driver.json");
         assert_eq!(Some(DEF_DRIVER_ID), driver.driver_id.as_deref());
         assert!(driver.setup_data_schema.is_some());
+        if let Some(date) = built_info::RELEASE_DATE {
+            let set = driver.release_date.map(|d| d.to_string());
+            assert_eq!(Some(date), set.as_deref());
+        }
     }
 }

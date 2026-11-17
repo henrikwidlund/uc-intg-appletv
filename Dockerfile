@@ -12,6 +12,10 @@ COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release --locked
 COPY . .
+# The image has no git data: the release build gives the version and the date. The arguments
+# come after the dependency layer, so a new value does not rebuild the dependencies.
+ARG UC_VERSION
+ARG UC_RELEASE_DATE
 # The copied files can be older than the build output of the step above.
 RUN touch src/main.rs && \
     cargo build --release --locked && \

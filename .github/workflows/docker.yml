@@ -40,6 +40,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set the release date
+        run: echo "UC_RELEASE_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -66,6 +69,10 @@ jobs:
           # The attestation of the merged image is made in the merge job.
           provenance: false
           labels: ${{ steps.meta.outputs.labels }}
+          # The image has no git data. The version comes from the tag.
+          build-args: |
+            UC_VERSION=${{ steps.meta.outputs.version }}
+            UC_RELEASE_DATE=${{ env.UC_RELEASE_DATE }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           # Only pull requests save the cache. A cache saved on a tag can only be used by that tag.
           cache-to: ${{ github.event_name == 'pull_request' && format('type=gha,scope={0},mode=max', env.PLATFORM_PAIR) || '' }}

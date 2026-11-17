@@ -50,6 +50,8 @@ jobs:
           VERSION=$(git describe --match "v[0-9]*" --tags HEAD --always)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "ARTIFACT_NAME=${{ env.ARTIFACT_PREFIX }}-$VERSION-aarch64" >> $GITHUB_ENV
+          # build.rs puts the date in the driver metadata.
+          echo "UC_RELEASE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
       - name: Install Rust
         run: rustup update stable && rustup default stable && rustup target add ${{ env.TARGET }}
@@ -91,7 +93,7 @@ jobs:
           mkdir -p $GITHUB_WORKSPACE/artifacts/bin
           cp target/${{ env.TARGET }}/release/${{ env.APP_NAME }} $GITHUB_WORKSPACE/artifacts/bin/driver
           # The Remote reads the version and date from the packaged driver.json.
-          jq --arg version "${VERSION#v}" --arg date "$(date -u +%Y-%m-%d)" \
+          jq --arg version "${VERSION#v}" --arg date "$UC_RELEASE_DATE" \
             '.version = $version | .release_date = $date' \
             resources/driver.json > $GITHUB_WORKSPACE/artifacts/driver.json
           cp LICENSE $GITHUB_WORKSPACE/artifacts/
@@ -162,6 +164,10 @@ jobs:
         # are built for the host, which is this target on an arm64 Linux runner.
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
+
+      - name: Set the release date
+        shell: bash
+        run: echo "UC_RELEASE_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
 
       - name: Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

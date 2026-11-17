@@ -17,14 +17,19 @@ use std::process::Command;
 fn main() -> Result<()> {
     rerun_if_git_changed();
 
-    // Get git version information
-    let git_version = get_git_version();
-    let git_dirty = is_git_dirty();
+    // A build without git, for example in Docker, gets the version from `UC_VERSION`.
+    let (git_version, git_dirty) = match env::var("UC_VERSION") {
+        Ok(v) if !v.trim().is_empty() => (Some(v.trim().trim_start_matches('v').to_owned()), false),
+        _ => (get_git_version(), is_git_dirty()),
+    };
+    let release_date = env::var("UC_RELEASE_DATE")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
 
     built::write_built_file().expect("Failed to acquire build-time information");
 
     // Write additional git info to built.rs file to supplement what built crate provides
-    write_git_info(git_version, git_dirty);
+    write_git_info(git_version, git_dirty, release_date);
 
     Ok(())
 }
@@ -64,6 +69,8 @@ fn rerun_if_git_changed() {
     // Changed source files, for the dirty flag. Cargo checks all files in a folder.
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=resources");
+    println!("cargo:rerun-if-env-changed=UC_VERSION");
+    println!("cargo:rerun-if-env-changed=UC_RELEASE_DATE");
 
     let Ok(output) = Command::new("git")
         .args(["rev-parse", "--git-dir", "--git-common-dir"])
@@ -113,7 +120,7 @@ fn is_git_dirty() -> bool {
         .is_ok_and(|s| s.code() == Some(1))
 }
 
-fn write_git_info(git_version: Option<String>, git_dirty: bool) {
+fn write_git_info(git_version: Option<String>, git_dirty: bool, release_date: Option<String>) {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("git_built.rs");
     let mut f = File::create(&dest_path).unwrap();
@@ -123,7 +130,7 @@ fn write_git_info(git_version: Option<String>, git_dirty: bool) {
     if let Some(git_version) = git_version {
         writeln!(
             f,
-            "pub const GIT_VERSION: Option<&'static str> = Some(\"{}\");",
+            "pub const GIT_VERSION: Option<&'static str> = Some({:?});",
             git_version
         )
         .unwrap();
@@ -136,4 +143,11 @@ fn write_git_info(git_version: Option<String>, git_dirty: bool) {
     } else {
         writeln!(f, "pub const GIT_DIRTY: Option<bool> = None;").unwrap();
     }
+
+    writeln!(
+        f,
+        "pub const RELEASE_DATE: Option<&'static str> = {:?};",
+        release_date.as_deref().map(str::trim)
+    )
+    .unwrap();
 }
