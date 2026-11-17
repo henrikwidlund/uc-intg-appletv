@@ -373,6 +373,8 @@ impl Controller {
             let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
                 diff(cache, attrs, subscribed)
             } else {
+                let mut attrs = attrs;
+                stamp_first_position(&mut attrs);
                 let changed = if subscribed {
                     attrs.keys().cloned().collect()
                 } else {
@@ -465,6 +467,17 @@ fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool
         );
     }
     changed
+}
+
+/// The first attributes of an entity: a position gets its time, so that the Remote counts on
+/// from the start.
+fn stamp_first_position(attrs: &mut Map<String, Value>) {
+    if attrs.contains_key(POSITION_UPDATED_AT) && attrs.contains_key("media_position") {
+        attrs.insert(
+            POSITION_UPDATED_AT.into(),
+            media_player::position_timestamp().into(),
+        );
+    }
 }
 
 /// Send order of an entity type: media player, remote, then the rest.
@@ -655,6 +668,17 @@ mod tests {
             true,
         );
         assert_eq!(vec![POSITION_UPDATED_AT, "state"], sorted(changed));
+    }
+
+    #[test]
+    fn first_position_gets_timestamp() {
+        let mut attrs = map(json!({ "media_position": 5, POSITION_UPDATED_AT: null }));
+        stamp_first_position(&mut attrs);
+        assert!(attrs[POSITION_UPDATED_AT].is_string());
+
+        let mut attrs = map(json!({ "state": "ON" }));
+        stamp_first_position(&mut attrs);
+        assert!(!attrs.contains_key(POSITION_UPDATED_AT));
     }
 
     #[test]
