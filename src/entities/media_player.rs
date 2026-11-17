@@ -228,7 +228,9 @@ fn position_attributes(s: &Snapshot, off: bool, now: f64, out: &mut Map<String, 
 
 /// Time for `media_position_updated_at`, like `2026-11-04T15:37:27.106292+00:00`.
 pub fn position_timestamp() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.6f+00:00")
+        .to_string()
 }
 
 fn shuffle_repeat_attributes(s: &Snapshot, out: &mut Map<String, Value>) {
@@ -677,7 +679,7 @@ mod tests {
         assert_eq!(32, ts.len(), "{ts}");
         assert!(ts.ends_with("+00:00"), "{ts}");
         assert_eq!(Some('.'), ts.chars().nth(19), "{ts}");
-        assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok(), "{ts}");
+        assert!(ts.parse::<jiff::Timestamp>().is_ok(), "{ts}");
     }
 
     #[test]

@@ -58,7 +58,7 @@ struct EntityChangeEvent<T> {
     kind: &'static str,
     msg: &'static str,
     cat: EventCategory,
-    ts: chrono::DateTime<chrono::Utc>,
+    ts: jiff::Timestamp,
     msg_data: T,
 }
 
@@ -68,7 +68,7 @@ fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
         kind: "event",
         msg: "entity_change",
         cat: EventCategory::Entity,
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         msg_data: data,
     };
     match serde_json::to_string(&event) {

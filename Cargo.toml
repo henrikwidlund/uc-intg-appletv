@@ -39,7 +39,7 @@ rust-fsm = "0.8.0"
 const_format = "0.2.37"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+jiff = { version = "1.0.0", default-features = false, features = ["serde", "std"] }
 bytestring = "1.6.0"
 uuid = { version = "1.29.3", features = ["v4"] }
 

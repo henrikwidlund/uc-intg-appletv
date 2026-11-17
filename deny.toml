@@ -6,6 +6,7 @@ no-default-features = false
 [advisories]
 ignore = [
     #"RUSTSEC-0000-0000",
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; uc_api needs it. Remove when uc_api no longer uses chrono" },
 ]
 
 [licenses]
