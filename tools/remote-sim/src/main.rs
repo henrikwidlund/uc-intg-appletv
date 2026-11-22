@@ -10,8 +10,10 @@
 //!
 //! Usage:
 //! - `remote-sim pair <address>`: pair the second connection one time.
-//! - `remote-sim <address> [--config <path>] [--driver <path>] [--only a,b] [--skip a,b]
-//!   [--no-power] [--port <port>]`
+//! - `remote-sim pair-driver <address>`: pair the driver through its setup flow and save its
+//!   `config.json` as `--config`. An old file is kept as `<config>.old-<unix time>`.
+//! - `remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
+//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>]`
 
 mod checks;
 mod driver;
@@ -27,6 +29,7 @@ use ws::Client;
 
 const USAGE: &str = "Usage:
   remote-sim pair <address> [--credentials <path>]
+  remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--port <port>]
   remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
              [--only a,b] [--skip a,b] [--no-power] [--port <port>]";
 
@@ -69,6 +72,7 @@ pub type Check = Result<String, Fail>;
 
 pub struct Options {
     pub pair: bool,
+    pub pair_driver: bool,
     pub address: Option<IpAddr>,
     /// `config.json` of the driver with the pairing to use.
     pub config: PathBuf,
@@ -162,6 +166,7 @@ fn parse() -> Result<Options, String> {
     let mut args = std::env::args().skip(1).peekable();
     let mut opt = Options {
         pair: false,
+        pair_driver: false,
         address: None,
         config: PathBuf::from("config.json"),
         bin: PathBuf::from("target/release/uc-intg-appletv"),
@@ -171,8 +176,12 @@ fn parse() -> Result<Options, String> {
         no_power: false,
         port: 19190,
     };
-    if args.peek().is_some_and(|a| a == "pair") {
-        opt.pair = true;
+    match args.peek().map(String::as_str) {
+        Some("pair") => opt.pair = true,
+        Some("pair-driver") => opt.pair_driver = true,
+        _ => {}
+    }
+    if opt.pair || opt.pair_driver {
         args.next();
     }
     let list = |v: Option<String>| -> Vec<String> {
@@ -256,6 +265,14 @@ async fn main() {
         failed: 0,
         skipped: 0,
     };
+    if ctx.opt.pair_driver {
+        let result = pair_driver(&mut ctx, stamp).await;
+        ctx.driver.stop().await;
+        if let Err(e) = result {
+            exit(&format!("driver pairing failed: {e}"));
+        }
+        return;
+    }
     run(&mut ctx).await;
     if let Some(oracle) = &ctx.oracle {
         oracle.close().await;
@@ -273,6 +290,56 @@ async fn main() {
         println!("Results: {file}");
     }
     std::process::exit(i32::from(ctx.failed > 0));
+}
+
+/// Pair the driver and save its `config.json` as `--config`.
+async fn pair_driver(ctx: &mut Ctx, stamp: u64) -> Result<(), Fail> {
+    checks::pair_driver(ctx).await?;
+    let source = ctx.driver.config_file();
+    let text = tokio::fs::read_to_string(&source).await?;
+    let target = &ctx.opt.config;
+    // Write the new file first, so a failed write keeps the old pairing in place.
+    let mut tmp = target.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    // A new file gets mode 600; an old file would keep its mode.
+    if let Err(e) = tokio::fs::remove_file(&tmp).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Fail::new(format!("{}: {e}", tmp.display())));
+    }
+    oracle::write_private(&tmp, &text).map_err(|e| {
+        Fail::new(format!(
+            "{}: {e}. The new pairing is in {}",
+            tmp.display(),
+            source.display()
+        ))
+    })?;
+    // Copy the old file away and replace it in one step, so a file is always in place.
+    let kept = |e: std::io::Error, path: &std::path::Path| {
+        Fail::new(format!(
+            "{}: {e}. The new pairing is in {}",
+            path.display(),
+            tmp.display()
+        ))
+    };
+    if tokio::fs::try_exists(target)
+        .await
+        .map_err(|e| kept(e, target))?
+    {
+        let mut old = target.clone().into_os_string();
+        old.push(format!(".old-{stamp}"));
+        let old = PathBuf::from(old);
+        tokio::fs::copy(target, &old)
+            .await
+            .map_err(|e| kept(e, &old))?;
+        println!("Old pairing kept in {}", old.display());
+    }
+    tokio::fs::rename(&tmp, target)
+        .await
+        .map_err(|e| Fail::new(format!("{} -> {}: {e}", tmp.display(), target.display())))?;
+    println!("Saved the driver pairing to {}", target.display());
+    Ok(())
 }
 
 async fn run(ctx: &mut Ctx) {

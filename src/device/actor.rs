@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
-use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent};
+use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent, IntgRemoteCommand};
 
 /// Interval for the app, account and AirPlay polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
@@ -47,8 +47,11 @@ const NOT_READY_RETRY: [Duration; 3] = [
     Duration::from_secs(5),
     Duration::from_secs(10),
 ];
-/// Longest wait for a running connect before a command runs. The core waits 10 s for the answer.
-const CONNECT_WAIT: Duration = Duration::from_secs(6);
+/// A command is dropped when it waited longer than this for the connect or for the command
+/// before it. The user does not expect it any more.
+const COMMAND_MAX_WAIT: Duration = Duration::from_secs(10);
+/// Longest wait for a running connect before a command runs.
+const CONNECT_WAIT: Duration = COMMAND_MAX_WAIT;
 /// A connect step without answer in this time is started again once.
 ///
 /// After wake-up, the Wi-Fi link of the Remote can go down for a short time during the connect.
@@ -154,6 +157,8 @@ pub struct AppleTvActor {
     siri_lock: Arc<tokio::sync::Mutex<()>>,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Counter of `stop_send` commands. A change stops the running and the waiting commands.
+    stop: watch::Sender<u64>,
     timers: Timers,
     apps_fetched: Option<Instant>,
     outputs_scanned: Option<Instant>,
@@ -246,6 +251,7 @@ impl AppleTvActor {
             network_retry_end: None,
             command_timeouts: VecDeque::with_capacity(MAX_COMMAND_TIMEOUTS),
             cmd_lock: Arc::default(),
+            stop: watch::Sender::new(0),
             timers: Timers::default(),
             apps_fetched: None,
             outputs_scanned: None,
@@ -1347,10 +1353,10 @@ impl AppleTvActor {
         }
     }
 
-    /// Turn an entity command into calls.
-    fn plan(&mut self, msg: &Command) -> Result<Vec<Call>, ServiceError> {
+    /// Check the parameters of an entity command. Needs no device state.
+    fn parse(msg: &Command) -> Result<remote::RemoteRun, ServiceError> {
         let params = msg.params.as_ref();
-        let run = match msg.kind {
+        Ok(match msg.kind {
             EntityKind::MediaPlayer => remote::RemoteRun {
                 actions: vec![media_player::command(&msg.cmd_id, params)?],
                 repeat: 1,
@@ -1368,7 +1374,11 @@ impl AppleTvActor {
             EntityKind::Sensor(_) | EntityKind::VoiceAssistant => {
                 return Err(ServiceError::NotSupported(msg.cmd_id.clone()));
             }
-        };
+        })
+    }
+
+    /// Turn checked command parameters into calls, with the current device state.
+    fn plan(&mut self, run: &remote::RemoteRun) -> Result<Vec<Call>, ServiceError> {
         // Kept only if the plan succeeds.
         let mut seek = self.seek;
         let mut planner = Planner {
@@ -1764,33 +1774,76 @@ impl Handler<Command> for AppleTvActor {
     type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
 
     fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
+        // `stop_send` and invalid parameters need no connection.
+        if msg.kind == EntityKind::Remote && msg.cmd_id == IntgRemoteCommand::StopSend.as_ref() {
+            self.stop.send_modify(|n| *n = n.wrapping_add(1));
+            debug!("[{}] stop_send: commands stopped", self.cfg.name);
+            return Box::pin(fut::ready(Ok(())));
+        }
+        let run = if msg.kind == EntityKind::VoiceAssistant {
+            None
+        } else {
+            match Self::parse(&msg) {
+                Ok(run) => Some(run),
+                Err(e) => return Box::pin(fut::ready(Err(e))),
+            }
+        };
         // The core can send a command before `exit_standby`.
         if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
             debug!("[{}] command while disconnected, connecting", self.cfg.name);
             self.start_connect(ctx);
         }
-        if msg.kind == EntityKind::VoiceAssistant {
+        let Some(run) = run else {
             let result = match msg.cmd_id.as_str() {
                 "voice_start" => self.voice_start(msg.params.as_ref(), ctx),
                 _ => Err(ServiceError::NotSupported(msg.cmd_id)),
             };
             return Box::pin(fut::ready(result));
-        }
+        };
         // A command can come right after the Remote wakes up, while the connect still runs.
         let connecting = self.running_connect();
         if self.tv.is_none() && connecting.is_none() {
             return Box::pin(fut::ready(Err(ServiceError::NotConnected)));
         }
+        // The Remote core waits at most 10 s for the answer, so the command runs in the
+        // background. Later errors are only logged.
+        // `stop_send` stops only long remote runs, so a single press is never lost.
+        let epoch = (msg.kind == EntityKind::Remote && run.is_long()).then(|| *self.stop.borrow());
+        let queued = Instant::now();
         // Plan after the command before has ended, so toggles see its result.
         let lock = self.cmd_lock.clone();
-        Box::pin(
-            async move {
-                connect_ended(connecting).await;
-                lock.lock_owned().await
+        let fut = async move {
+            connect_ended(connecting).await;
+            lock.lock_owned().await
+        }
+        .into_actor(self)
+        .then(move |guard, act, _| {
+            let skip = if epoch.is_some_and(|e| *act.stop.borrow() != e) {
+                Some("stopped by stop_send")
+            } else if queued.elapsed() > COMMAND_MAX_WAIT {
+                Some("waited too long")
+            } else {
+                None
+            };
+            if let Some(reason) = skip {
+                info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
+                return fut::ready(()).boxed_local();
             }
-            .into_actor(self)
-            .then(move |guard, act, _| act.run_command(&msg, guard)),
-        )
+            act.run_command(&msg, &run, guard, epoch).boxed_local()
+        });
+        ctx.spawn(fut);
+        Box::pin(fut::ready(Ok(())))
+    }
+}
+
+/// Resolves when a `stop_send` came after `epoch`. Without `epoch` it never resolves.
+async fn stopped(mut rx: watch::Receiver<u64>, epoch: Option<u64>) {
+    let Some(epoch) = epoch else {
+        return std::future::pending().await;
+    };
+    if rx.wait_for(|n| *n != epoch).await.is_err() {
+        // The actor is gone, and its futures with it.
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1825,18 +1878,24 @@ impl Expect {
 }
 
 impl AppleTvActor {
-    /// Plan and run a command. `guard` is held until the results are applied.
+    /// Plan and run a command. `guard` is held until the results are applied. A `stop_send`
+    /// after `epoch` stops the run; without `epoch` the run cannot be stopped.
     fn run_command(
         &mut self,
         msg: &Command,
+        run: &remote::RemoteRun,
         guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> impl ActorFuture<Self, Output = Result<(), ServiceError>> + use<> {
+        epoch: Option<u64>,
+    ) -> impl ActorFuture<Self, Output = ()> + use<> {
         let generation = self.generation;
-        let prepared = match (self.tv.clone(), self.plan(msg)) {
-            (None, _) => Err(ServiceError::NotConnected),
-            (_, Err(e)) => Err(e),
-            (Some(tv), Ok(calls)) => Ok((tv, calls)),
-        };
+        let stop = self.stop.subscribe();
+        // Plan only when connected: the plan changes the seek state.
+        let prepared = self
+            .tv
+            .clone()
+            .map_or(Err(ServiceError::NotConnected), |tv| {
+                self.plan(run).map(|calls| (tv, calls))
+            });
         let Expect {
             account,
             launched,
@@ -1852,17 +1911,37 @@ impl AppleTvActor {
         };
         let fut = async move {
             let result = match prepared {
-                Ok((tv, calls)) => exec_all(&tv, calls).await.map_err(ServiceError::from),
+                // Dropping the run releases held keys.
+                Ok((tv, calls)) => tokio::select! {
+                    r = exec_all(&tv, calls) => r.map_err(ServiceError::from).map(|()| true),
+                    () = stopped(stop, epoch) => Ok(false),
+                },
                 Err(e) => Err(e),
             };
             (result, guard)
         };
         let cmd_id = msg.cmd_id.clone();
         fut.into_actor(self).map(move |(result, _guard), act, ctx| {
+            let result = match result {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    info!("[{}] {cmd_id} stopped by stop_send", act.cfg.name);
+                    // The device state after a partial run is not known.
+                    Err(ServiceError::ServiceUnavailable("stopped".into()))
+                }
+                Err(e) => {
+                    match &e {
+                        // The device refused it in its current state. The user cannot fix it
+                        // on the Remote.
+                        ServiceError::NotSupported(_) | ServiceError::BadRequest(_) => {
+                            info!("[{}] {cmd_id} not run: {e}", act.cfg.name);
+                        }
+                        _ => warn!("[{}] {cmd_id} failed: {e}", act.cfg.name),
+                    }
+                    Err(e)
+                }
+            };
             let ok = result.is_ok();
-            if let Err(e) = &result {
-                warn!("[{}] {cmd_id} failed: {e}", act.cfg.name);
-            }
             if act.generation == generation && matches!(result, Err(ServiceError::Timeout)) {
                 act.command_timed_out(ctx);
             }
@@ -1879,7 +1958,7 @@ impl AppleTvActor {
                 }
             }
             if !ok {
-                return result;
+                return;
             }
             if let Some(name) = account {
                 act.s.current_account = Some(name);
@@ -1890,7 +1969,6 @@ impl AppleTvActor {
                 act.launched_at = Some(Instant::now());
                 act.emit(Dirty::APP);
             }
-            result
         })
     }
 }
@@ -1947,6 +2025,53 @@ fn network_not_ready(e: &ratv::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::SensorKind;
+
+    fn command(kind: EntityKind, cmd_id: &str, params: Value) -> Command {
+        Command {
+            kind,
+            cmd_id: cmd_id.into(),
+            params: params.as_object().cloned(),
+        }
+    }
+
+    #[test]
+    fn parse_checks_parameters_without_state() {
+        let run = AppleTvActor::parse(&command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP", "repeat": 3 }),
+        ))
+        .expect("valid");
+        assert_eq!(3, run.repeat);
+        assert!(matches!(
+            AppleTvActor::parse(&command(
+                EntityKind::Remote,
+                "send_cmd",
+                serde_json::json!({ "command": "NOT_A_COMMAND" }),
+            )),
+            Err(ServiceError::BadRequest(_))
+        ));
+        assert!(matches!(
+            AppleTvActor::parse(&command(
+                EntityKind::Sensor(SensorKind::App),
+                "x",
+                Value::Null
+            )),
+            Err(ServiceError::NotSupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopped_waits_for_a_new_stop() {
+        let tx = watch::Sender::new(0u64);
+        let wait =
+            |epoch| tokio::time::timeout(Duration::from_millis(50), stopped(tx.subscribe(), epoch));
+        assert!(wait(Some(0)).await.is_err(), "no stop yet");
+        tx.send_modify(|n| *n += 1);
+        assert!(wait(Some(0)).await.is_ok(), "stop after the epoch");
+        assert!(wait(None).await.is_err(), "a short run cannot be stopped");
+    }
 
     #[test]
     fn merge_endpoints_keeps_missing_service() {

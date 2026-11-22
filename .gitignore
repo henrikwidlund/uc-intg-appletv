@@ -5,6 +5,7 @@
 /.config-backup-*/
 /config.json.before-link-test
 /config.json
+/config.json.old-*
 /cache_*.json
 /driver.log
 /tools/remote-sim/target

@@ -200,10 +200,11 @@ impl Planner<'_> {
             Action::Select(kind, op) => self.select(*kind, op)?,
         };
         check_support(s, &call)?;
-        // Later actions of the same command see the new power state.
+        // Later actions of the same command see the new power and mute state.
         match call {
             Call::TurnOn => self.power = Power::On,
             Call::TurnOff => self.power = Power::Off,
+            Call::Mute(m) => self.muted = Some(m),
             _ => {}
         }
         out.push(call);
@@ -466,6 +467,18 @@ mod tests {
         assert_eq!(
             vec![Call::TurnOn, Call::TurnOff],
             plan(&s, &mut None, &[Action::Toggle, Action::Toggle])
+        );
+    }
+
+    #[test]
+    fn mute_toggle_sees_earlier_toggle() {
+        let s = Snapshot {
+            muted: Some(false),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            vec![Call::Mute(true), Call::Mute(false)],
+            plan(&s, &mut None, &[Action::MuteToggle, Action::MuteToggle])
         );
     }
 

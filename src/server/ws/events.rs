@@ -7,7 +7,7 @@ use crate::controller::{Controller, R2EventMsg};
 use crate::errors::ServiceError;
 use crate::server::ws::WsConn;
 use actix::Addr;
-use log::{error, info, warn};
+use log::{info, warn};
 use std::str::FromStr;
 use std::sync::Arc;
 use uc_api::intg::ws::R2Event;
@@ -28,13 +28,11 @@ impl WsConn {
         info!("[{session_id}] Got event: {msg}");
 
         if let Ok(event_msg) = R2Event::from_str(msg) {
-            if let Err(e) = controller_addr.try_send(R2EventMsg {
+            // `do_send`: an event must not be lost when the mailbox is full.
+            controller_addr.do_send(R2EventMsg {
                 ws_id: session_id.clone(),
                 event: event_msg,
-            }) {
-                // Do not return an error: it would be sent back to the client.
-                error!("[{session_id}] Controller mailbox error: {e}");
-            }
+            });
         } else {
             warn!("[{session_id}] Unknown event: {msg}");
         }

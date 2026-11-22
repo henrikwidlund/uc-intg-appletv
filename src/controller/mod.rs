@@ -42,7 +42,6 @@ state_machine! {
     },
     Running => {
         SetupDriverRequest => SetupFlow [SetupFlowTimer],
-        R2Request => Running,
         AbortSetup => RequireSetup,
     },
     SetupFlow => {
@@ -71,8 +70,14 @@ struct R2Session {
     ws_id: u32,
     standby: bool,
     subscribed_entities: HashSet<String>,
-    /// Flag if the session is in a reconfiguration setup flow.
-    reconfiguring: Option<bool>,
+    /// Subscribed to all entities: `subscribe_events` without entity ids.
+    subscribe_all: bool,
+    /// The Remote read the entity states. Before that, `subscribe_events` sends nothing,
+    /// because the Remote reads all states anyway.
+    states_read: bool,
+    /// Entities whose current state the Remote may not have: changed after the states were read
+    /// while not subscribed, or left out of the answer. They are sent when subscribed.
+    stale: HashSet<String>,
 }
 
 impl R2Session {
@@ -82,8 +87,20 @@ impl R2Session {
             ws_id: 0,
             standby: false,
             subscribed_entities: HashSet::default(),
-            reconfiguring: None,
+            subscribe_all: false,
+            states_read: false,
+            stale: HashSet::default(),
         }
+    }
+
+    /// The Remote gets events of this entity.
+    fn wants(&self, entity_id: &str) -> bool {
+        self.subscribe_all || self.subscribed_entities.contains(entity_id)
+    }
+
+    /// Changes of this entity must be kept for a later subscription.
+    fn tracks(&self, entity_id: &str) -> bool {
+        self.states_read && !self.wants(entity_id)
     }
 
     const fn new_msg_id(&mut self) -> u32 {
@@ -96,7 +113,8 @@ impl R2Session {
 pub struct Controller {
     /// Connected Remotes.
     sessions: HashMap<Arc<str>, R2Session>,
-    /// Driver state reported to the Remote. Apple TV availability is shown with the entity states.
+    /// Driver state reported to the Remote: error while one device has invalid credentials.
+    /// Apple TV availability is shown with the entity states.
     device_state: DeviceState,
     drv_metadata: IntegrationDriverUpdate,
     /// State machine for the driver state: setup flow or running.
@@ -234,6 +252,9 @@ impl Controller {
     }
 }
 
+/// Mailbox size of the controller. The actix default is 16.
+const CONTROLLER_MAILBOX_CAPACITY: usize = 1024;
+
 fn device_state_event(state: DeviceState) -> WsMessage {
     WsMessage::event(
         "device_state",
@@ -257,6 +278,8 @@ impl Actor for Controller {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        // Remote events and device events must not be dropped in a burst.
+        ctx.set_mailbox_capacity(CONTROLLER_MAILBOX_CAPACITY);
         let devices = self.store.load_devices();
         info!("{} configured Apple TV devices", devices.len());
         if !devices.is_empty() {

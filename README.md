@@ -94,7 +94,7 @@ cargo run --release
 | `UC_INTEGRATION_INTERFACE` | `0.0.0.0`           | Network interface to listen on.                                        |
 | `UC_INTEGRATION_HTTP_PORT` | `9090`              | WebSocket and artwork port.                                            |
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                  |
-| `UC_SETUP_TIMEOUT`         | `300`               | Setup timeout in seconds. `0` disables it.                             |
+| `UC_SETUP_TIMEOUT`         | `3600`              | Setup timeout in seconds. `0` disables it.                             |
 | `UC_CLIENT_NAME`           | host name           | Name shown on the Apple TV for the pairing.                            |
 | `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. Can contain PINs.        |
 | `RUST_LOG`                 | `info`              | Log level, for example `info,uc_intg_appletv=debug`.                   |
@@ -158,13 +158,16 @@ cargo deny check
 It saves the results to `manual-test-results-<time>.md`.
 
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,
-connects to it like a Remote and runs the checks that need no person. It uses the pairing in
-`config.json` of an earlier run of the driver. A second connection with its own pairing reads the
-values of the Apple TV to compare them with the driver. Pair it one time with a PIN:
+connects to it like a Remote and runs the checks that need no person. It uses the driver pairing
+in `config.json`. `pair-driver` makes this file: it runs the setup of the driver and asks for the
+PIN. An old file is kept as `config.json.old-<time>`. A second connection with its own pairing
+reads the values of the Apple TV to compare them with the driver. `pair` pairs it. Each pairing
+command adds a paired device on the Apple TV.
 
 ```shell
 cargo build --release
 cargo build --manifest-path tools/remote-sim/Cargo.toml
+tools/remote-sim/target/debug/remote-sim pair-driver 192.168.1.20
 tools/remote-sim/target/debug/remote-sim pair 192.168.1.20
 tools/remote-sim/target/debug/remote-sim 192.168.1.20
 ```

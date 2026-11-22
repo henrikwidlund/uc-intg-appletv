@@ -55,7 +55,7 @@ pub async fn pair(address: IpAddr, file: &Path) -> Result<(), Fail> {
 }
 
 /// Write a file that only the owner can read.
-fn write_private(file: &Path, text: &str) -> Result<(), Fail> {
+pub fn write_private(file: &Path, text: &str) -> Result<(), Fail> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);

@@ -97,7 +97,6 @@ fn publish_mdns(api_port: u16, drv_metadata: IntegrationDriverUpdate) {
                 .and_then(|d| d.name)
                 .unwrap_or_default()
         ),
-        // Without it, `/` is used and the Remote cannot connect.
         "ws_path=/".into(),
         format!("pwd={}", drv_metadata.pwd_protected.unwrap_or_default()),
         format!("ver={APP_VERSION}"),

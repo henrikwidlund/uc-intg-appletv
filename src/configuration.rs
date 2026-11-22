@@ -15,8 +15,9 @@ use uc_api::intg::IntegrationDriverUpdate;
 
 /// Environment variable for the driver setup flow timeout in seconds. `0` disables the timeout.
 pub const ENV_SETUP_TIMEOUT: &str = "UC_SETUP_TIMEOUT";
-/// Default driver setup flow timeout in seconds.
-pub const DEF_SETUP_TIMEOUT_SEC: u64 = 300;
+/// Default driver setup flow timeout in seconds. The Remote aborts a setup itself, so this is
+/// only a fallback.
+pub const DEF_SETUP_TIMEOUT_SEC: u64 = 3600;
 /// Environment variable for the configuration directory. The Remote sets it.
 const ENV_CONFIG_HOME: &str = "UC_CONFIG_HOME";
 /// Environment variable for the network interface to listen on.

@@ -43,8 +43,9 @@ impl Actor for WsSender {
     type Context = actix::Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        // A subscribe sends one message per entity: 26 per Apple TV. Changes that do not fit
-        // are lost, because the controller sends only what changed.
+        // Device events can come in bursts, for example at a connect: up to 26 messages per
+        // Apple TV. Changes that do not fit are lost, because the controller sends only what
+        // changed.
         ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
     }
 }
@@ -103,7 +104,7 @@ impl WsConn {
         use actix_web::rt::time;
         use futures::StreamExt;
 
-        // Only header-based authentication is used, so the authentication message is sent right away.
+        // The driver does not check the auth token, so the authentication message is sent right away.
         let _ = session
             .text(r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#)
             .await;

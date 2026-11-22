@@ -173,11 +173,13 @@ impl Controller {
     /// States of the subscribed entities, or of all entities without subscriptions.
     /// Same order as [`Self::available_entities`].
     pub(super) fn entity_states(&self, ws_id: &str) -> Vec<EntityChangeRef<'_>> {
-        let subscribed = self.sessions.get(ws_id).map(|s| &s.subscribed_entities);
+        let session = self.sessions.get(ws_id);
         let mut states: Vec<EntityChangeRef<'_>> = self
             .entities
             .iter()
-            .filter(|(id, _)| subscribed.is_none_or(|s| s.is_empty() || s.contains(*id)))
+            .filter(|(id, _)| {
+                session.is_none_or(|s| s.subscribed_entities.is_empty() || s.wants(id))
+            })
             .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect();
         states.sort_unstable_by(|a, b| {
@@ -185,6 +187,24 @@ impl Controller {
                 .cmp(&self.send_order(b.entity_type, b.entity_id))
         });
         states
+    }
+
+    /// The Remote reads the entity states now. Entities left out of the answer are marked
+    /// stale, so they are sent when subscribed.
+    pub(super) fn mark_states_read(&mut self, ws_id: &str) {
+        let Some(session) = self.sessions.get_mut(ws_id) else {
+            return;
+        };
+        session.states_read = true;
+        if session.subscribe_all || session.subscribed_entities.is_empty() {
+            session.stale.clear();
+            return;
+        }
+        for id in self.entities.keys() {
+            if !session.subscribed_entities.contains(id) && !session.stale.contains(id) {
+                session.stale.insert(id.clone());
+            }
+        }
     }
 
     /// Sort key for sending entities: media players first, then remotes, then the rest.
@@ -195,42 +215,76 @@ impl Controller {
         (send_rank(ty), name, key, id)
     }
 
+    /// Subscribe entities. No ids means all entities.
+    ///
+    /// Sends only the entities that changed after the Remote read the states. The Remote reads
+    /// the states itself, and one event per entity can fill the mailbox of the Remote core.
     pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        let mut new = Vec::new();
-        for id in entity_ids {
-            if session.subscribed_entities.insert(id.clone()) {
-                new.push(id);
+        let all = entity_ids.is_empty();
+        let stale: Vec<String> = if all {
+            session.subscribe_all = true;
+            session.stale.drain().collect()
+        } else {
+            let mut stale = Vec::new();
+            for id in entity_ids {
+                if let Some(changed) = session.stale.take(&id) {
+                    stale.push(changed);
+                }
+                session.subscribed_entities.insert(id);
             }
-        }
-        // Send the current states, and connect the devices.
-        for id in &new {
+            stale
+        };
+        for id in &stale {
             if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
                 self.send_entity_change(ws_id, &change);
             }
-            if let Some((key, _)) = EntityKind::parse(id)
-                && let Some(device) = self.devices.get(key)
+        }
+        // Connect each device once.
+        let Some(session) = self.sessions.get(ws_id) else {
+            return;
+        };
+        for (key, device) in &self.devices {
+            if all
+                || session
+                    .subscribed_entities
+                    .iter()
+                    .any(|id| is_of_device(id, key))
             {
                 device.addr.do_send(Connect);
             }
         }
     }
 
+    /// Unsubscribe entities. No ids means all entities.
     pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: &[String]) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        for id in entity_ids {
-            session.subscribed_entities.remove(id);
+        if entity_ids.is_empty() {
+            session.subscribe_all = false;
+            session.subscribed_entities.clear();
+        } else {
+            if session.subscribe_all {
+                // "All" becomes the list of all configured entities, so single ids can be
+                // removed. Also entities without a state yet.
+                session.subscribe_all = false;
+                for key in self.devices.keys() {
+                    session
+                        .subscribed_entities
+                        .extend(EntityKind::all().map(|kind| kind.entity_id(key)));
+                }
+            }
+            for id in entity_ids {
+                session.subscribed_entities.remove(id);
+            }
         }
         // Disconnect devices without subscribed entities.
         for (key, device) in &self.devices {
             let used = self.sessions.values().any(|s| {
-                s.subscribed_entities
-                    .iter()
-                    .any(|id| EntityKind::parse(id).is_some_and(|(k, _)| k == &**key))
+                s.subscribe_all || s.subscribed_entities.iter().any(|id| is_of_device(id, key))
             });
             if !used {
                 debug!(
@@ -366,11 +420,14 @@ impl Controller {
         for (kind, attrs) in updates {
             entity_id.clear();
             kind.write_entity_id(key, &mut entity_id);
-            let subscribed = self
-                .sessions
-                .values()
-                .any(|s| s.subscribed_entities.contains(&entity_id));
-            let changed = if let Some(cache) = self.entities.get_mut(&entity_id) {
+            let (mut subscribed, mut tracked) = (false, false);
+            for s in self.sessions.values() {
+                let wants = s.wants(&entity_id);
+                subscribed |= wants;
+                tracked |= s.states_read && !wants;
+            }
+            // The attribute names are only needed to send them.
+            let (any, changed) = if let Some(cache) = self.entities.get_mut(&entity_id) {
                 diff(cache, attrs, subscribed)
             } else {
                 let mut attrs = attrs;
@@ -380,10 +437,21 @@ impl Controller {
                 } else {
                     Vec::new()
                 };
+                let any = !attrs.is_empty();
                 self.entities.insert(entity_id.clone(), attrs);
-                changed
+                (any, changed)
             };
-            if !changed.is_empty() {
+            if !any {
+                continue;
+            }
+            if tracked {
+                for session in self.sessions.values_mut() {
+                    if session.tracks(&entity_id) && !session.stale.contains(&entity_id) {
+                        session.stale.insert(entity_id.clone());
+                    }
+                }
+            }
+            if subscribed {
                 self.send_changes(kind, &entity_id, &changed);
             }
         }
@@ -395,7 +463,7 @@ impl Controller {
         let mut targets = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.subscribed_entities.contains(entity_id))
+            .filter(|(_, s)| s.wants(entity_id))
             .map(|(ws_id, _)| &**ws_id)
             .peekable();
         let Some(cache) = self.entities.get(entity_id) else {
@@ -436,9 +504,14 @@ impl Controller {
     }
 }
 
-/// Merge new attributes into the cache. Returns the names of the attributes that changed if
-/// `collect` is set.
-fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool) -> Vec<String> {
+/// Merge new attributes into the cache. Returns whether anything changed, and the names of the
+/// attributes that changed if `collect` is set.
+fn diff(
+    cache: &mut Map<String, Value>,
+    attrs: Map<String, Value>,
+    collect: bool,
+) -> (bool, Vec<String>) {
+    let mut any = false;
     let mut changed = Vec::new();
     let mut updated_at = false;
     let mut new_position = false;
@@ -450,6 +523,7 @@ fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool
         if cache.get(&name) != Some(&value) {
             // The Remote counts on from the timestamp while playing, so a resume needs a new one.
             new_position |= matches!(name.as_str(), "media_position" | "media_duration" | "state");
+            any = true;
             if collect {
                 changed.push(name.clone());
             }
@@ -466,7 +540,7 @@ fn diff(cache: &mut Map<String, Value>, attrs: Map<String, Value>, collect: bool
             media_player::position_timestamp().into(),
         );
     }
-    changed
+    (any, changed)
 }
 
 /// The first attributes of an entity: a position gets its time, so that the Remote counts on
@@ -478,6 +552,11 @@ fn stamp_first_position(attrs: &mut Map<String, Value>) {
             media_player::position_timestamp().into(),
         );
     }
+}
+
+/// The entity belongs to the device with this key.
+fn is_of_device(entity_id: &str, key: &str) -> bool {
+    EntityKind::parse(entity_id).is_some_and(|(k, _)| k == key)
 }
 
 /// Send order of an entity type: media player, remote, then the rest.
@@ -621,7 +700,7 @@ mod tests {
     #[test]
     fn diff_keeps_only_changes() {
         let mut cache = map(json!({ "state": "ON", "media_position": 1 }));
-        let changed = diff(
+        let (_, changed) = diff(
             &mut cache,
             map(json!({ "state": "ON", "media_title": "Song" })),
             true,
@@ -644,13 +723,14 @@ mod tests {
     #[test]
     fn position_timestamp_only_with_new_position() {
         let mut cache = map(json!({ "media_position": 1 }));
-        let changed = diff(
+        let (any, changed) = diff(
             &mut cache,
             map(json!({ "media_position": 1, POSITION_UPDATED_AT: null })),
             true,
         );
+        assert!(!any, "only a timestamp is no change");
         assert_eq!(Vec::<String>::new(), changed);
-        let changed = diff(
+        let (_, changed) = diff(
             &mut cache,
             map(json!({ "media_position": 2, POSITION_UPDATED_AT: null })),
             true,
@@ -662,7 +742,7 @@ mod tests {
     #[test]
     fn position_timestamp_with_new_state() {
         let mut cache = map(json!({ "state": "PAUSED", "media_position": 130 }));
-        let changed = diff(
+        let (_, changed) = diff(
             &mut cache,
             map(json!({ "state": "PLAYING", "media_position": 130, POSITION_UPDATED_AT: null })),
             true,
@@ -684,11 +764,12 @@ mod tests {
     #[test]
     fn diff_without_collect_updates_cache_only() {
         let mut cache = map(json!({ "media_position": 1 }));
-        let changed = diff(
+        let (any, changed) = diff(
             &mut cache,
             map(json!({ "media_position": 2, POSITION_UPDATED_AT: null })),
             false,
         );
+        assert!(any, "a change without names");
         assert_eq!(Vec::<String>::new(), changed);
         assert_eq!(vec!["media_position", POSITION_UPDATED_AT], keys(&cache));
         assert!(cache[POSITION_UPDATED_AT].is_string());

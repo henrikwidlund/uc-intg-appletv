@@ -149,6 +149,17 @@ pub struct RemoteRun {
     pub delay: Duration,
 }
 
+impl RemoteRun {
+    /// A run that takes time: more than one command, a repeat or a held key. The delay is only
+    /// used between commands, so it alone does not make a run long.
+    /// `stop_send` stops only such runs.
+    pub fn is_long(&self) -> bool {
+        self.actions.len() > 1
+            || self.repeat > 1
+            || self.actions.iter().any(|a| matches!(a, Action::Hold(..)))
+    }
+}
+
 /// Map a remote entity command.
 pub fn command(
     cmd_id: &str,
@@ -201,6 +212,7 @@ pub fn command(
                 delay: delay(params),
             })
         }
+        // The device actor handles it before the parameters are checked.
         IntgRemoteCommand::StopSend => Err(ServiceError::NotSupported(cmd_id.into())),
     }
 }
@@ -257,6 +269,27 @@ mod tests {
         assert_eq!(vec![Action::Press(Key::Up)], run.actions);
         assert_eq!(3, run.repeat);
         assert_eq!(Duration::from_millis(100), run.delay);
+    }
+
+    #[test]
+    fn long_runs() {
+        let run = |v: Value| command("send_cmd", Some(&params(v))).expect("ok");
+        assert!(!run(json!({ "command": "HOME" })).is_long());
+        assert!(run(json!({ "command": "HOME", "repeat": 2 })).is_long());
+        assert!(!run(json!({ "command": "HOME", "delay": 100 })).is_long());
+        assert!(run(json!({ "command": "HOME", "hold": 1000 })).is_long());
+        let p = params(json!({ "sequence": ["HOME", "BACK"] }));
+        assert!(
+            command("send_cmd_sequence", Some(&p))
+                .expect("ok")
+                .is_long()
+        );
+        let p = params(json!({ "sequence": ["HOME"] }));
+        assert!(
+            !command("send_cmd_sequence", Some(&p))
+                .expect("ok")
+                .is_long()
+        );
     }
 
     #[test]

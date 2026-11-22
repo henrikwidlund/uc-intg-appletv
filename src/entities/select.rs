@@ -138,10 +138,15 @@ pub fn current(s: &Snapshot, kind: SelectKind, now: f64) -> Option<Cow<'_, str>>
         SelectKind::Chapter => nth_unique(chapter_names(s), s.current_chapter(now)?),
         // Up Next has no current item.
         SelectKind::UpNext => None,
-        SelectKind::PlaybackSpeed => s
-            .rate
-            .filter(|r| *r > 0.0)
-            .map(|r| Cow::Owned(rate_name(r))),
+        // Some apps play at 1x but do not list it as a supported rate.
+        // The name of the matching option, so it is always in the list.
+        SelectKind::PlaybackSpeed => {
+            let r = s.rate.filter(|r| *r > 0.0)?;
+            s.supported_rates
+                .iter()
+                .find(|x| (*x - r).abs() < 0.01)
+                .map(|x| Cow::Owned(rate_name(*x)))
+        }
         SelectKind::Shuffle => Some(Cow::Borrowed(match s.shuffle? {
             ShuffleMode::Songs => SHUFFLE_OPTIONS[1],
             ShuffleMode::Albums => SHUFFLE_OPTIONS[2],
@@ -421,6 +426,28 @@ mod tests {
         let mut out = Map::new();
         attributes(&s, SelectKind::PlaybackSpeed, Dirty::RATES, 0.0, &mut out);
         assert!(out.contains_key("options"));
+    }
+
+    #[test]
+    fn rate_not_in_options_is_no_current_option() {
+        let s = Snapshot {
+            rate: Some(1.0),
+            ..Snapshot::default()
+        };
+        let mut out = Map::new();
+        attributes(&s, SelectKind::PlaybackSpeed, Dirty::RATES, 0.0, &mut out);
+        assert_eq!(Some(&json!([])), out.get("options"));
+        assert_eq!(Some(&json!("")), out.get("current_option"));
+
+        // A live rate near a supported rate gets the name of that option.
+        let s = Snapshot {
+            rate: Some(1.006),
+            supported_rates: vec![1.0, 2.0],
+            ..Snapshot::default()
+        };
+        let mut out = Map::new();
+        attributes(&s, SelectKind::PlaybackSpeed, Dirty::RATES, 0.0, &mut out);
+        assert_eq!(Some(&json!("1x")), out.get("current_option"));
     }
 
     #[test]

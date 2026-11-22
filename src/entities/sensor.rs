@@ -25,7 +25,8 @@ const fn is_binary(kind: SensorKind) -> bool {
     matches!(kind, SensorKind::IsLive | SensorKind::VolumeControl)
 }
 
-/// Select whose current option is the value of the sensor.
+/// Select whose current option is the value of the sensor. Its groups also trigger the sensor.
+/// Playback speed falls back to the live rate, see [`value`].
 const fn mirror(kind: SensorKind) -> Option<SelectKind> {
     match kind {
         SensorKind::App => Some(SelectKind::App),
@@ -70,6 +71,19 @@ pub fn attributes(
 }
 
 fn value(s: &Snapshot, kind: SensorKind, now: f64) -> Value {
+    // The option name of the select, or the live rate when the app does not list it.
+    if kind == SensorKind::PlaybackSpeed {
+        return select::current(s, SelectKind::PlaybackSpeed, now)
+            .map_or_else(
+                || {
+                    s.rate
+                        .filter(|r| *r > 0.0)
+                        .map_or_else(String::new, select::rate_name)
+                },
+                Cow::into_owned,
+            )
+            .into();
+    }
     if let Some(select) = mirror(kind) {
         return select::current(s, select, now)
             .unwrap_or_default()
@@ -146,6 +160,22 @@ fn audio_format(f: &AudioFormat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_speed_without_rate_options() {
+        let s = Snapshot {
+            rate: Some(1.0),
+            ..Snapshot::default()
+        };
+        assert_eq!(Value::from("1x"), value(&s, SensorKind::PlaybackSpeed, 0.0));
+        // Same name as the select option for a rate close to it.
+        let s = Snapshot {
+            rate: Some(1.006),
+            supported_rates: vec![1.0, 2.0],
+            ..Snapshot::default()
+        };
+        assert_eq!(Value::from("1x"), value(&s, SensorKind::PlaybackSpeed, 0.0));
+    }
 
     #[test]
     fn live_without_duration() {

@@ -89,4 +89,25 @@ impl Driver {
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    /// Current size of the log in bytes: a mark for [`Self::log_since`].
+    pub fn log_len(&self) -> usize {
+        std::fs::metadata(&self.log).map_or(0, |m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+    }
+
+    /// The log text after `mark`.
+    pub fn log_since(&self, mark: usize) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut text = String::new();
+        if let Ok(mut file) = std::fs::File::open(&self.log)
+            && file.seek(SeekFrom::Start(mark as u64)).is_ok()
+        {
+            // A cut UTF-8 character at the mark is replaced, not an error.
+            let mut bytes = Vec::new();
+            if file.read_to_end(&mut bytes).is_ok() {
+                text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+        }
+        text
+    }
 }

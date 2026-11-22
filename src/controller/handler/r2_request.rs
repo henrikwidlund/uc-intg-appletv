@@ -5,7 +5,7 @@
 //! Handler for [`R2RequestMsg`].
 
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-use crate::controller::{Controller, R2RequestMsg, operation_mode};
+use crate::controller::{Controller, R2RequestMsg};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
@@ -13,8 +13,8 @@ use actix::{Handler, ResponseFuture};
 use log::debug;
 use serde_json::Value;
 use strum::EnumMessage;
+use uc_api::intg::IntegrationVersion;
 use uc_api::intg::ws::{AvailableEntitiesMsgData, DriverVersionMsgData, R2Request};
-use uc_api::intg::{IntegrationVersion, SubscribeEvents};
 use uc_api::ws::WsMessage;
 
 /// Integration-API version from the `uc_api` dependency.
@@ -49,7 +49,7 @@ impl Handler<R2RequestMsg> for Controller {
             )));
         };
 
-        // Requests that are allowed in setup flow and running mode.
+        // Driver and setup requests.
         match msg.request {
             R2Request::GetDriverVersion => {
                 return_fut_ok!(Some(WsMessage::response(
@@ -102,16 +102,8 @@ impl Handler<R2RequestMsg> for Controller {
             _ => {}
         }
 
-        // The other requests need the running mode.
-        if self
-            .sm_consume(&msg.ws_id, &operation_mode::Input::R2Request, ctx)
-            .is_err()
-        {
-            return_fut_err!(ServiceError::ServiceUnavailable(
-                "Request cannot be handled: setup required".into()
-            ));
-        }
-
+        // Entity requests work in every state, also during a setup flow: the configured devices
+        // keep running. Without devices the lists are empty and commands get 404.
         match msg.request {
             R2Request::GetAvailableEntities => {
                 let msg_data = AvailableEntitiesMsgData {
@@ -121,21 +113,22 @@ impl Handler<R2RequestMsg> for Controller {
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, msg_data)));
             }
             R2Request::GetEntityStates => {
+                self.mark_states_read(&msg.ws_id);
                 let states = self.entity_states(&msg.ws_id);
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, states)));
             }
             R2Request::SubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<SubscribeEvents>() {
-                    Ok(subscribe) => self.subscribe(&ws_id, subscribe.entity_ids),
+                match entity_ids(msg.msg_data) {
+                    Ok(ids) => self.subscribe(&ws_id, ids),
                     Err(e) => return_fut_err!(e.into()),
                 }
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
             }
             R2Request::UnsubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
-                match msg.deserialize::<SubscribeEvents>() {
-                    Ok(subscribe) => self.unsubscribe(&ws_id, &subscribe.entity_ids),
+                match entity_ids(msg.msg_data) {
+                    Ok(ids) => self.unsubscribe(&ws_id, &ids),
                     Err(e) => return_fut_err!(e.into()),
                 }
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
@@ -157,5 +150,49 @@ impl Handler<R2RequestMsg> for Controller {
                 )))
             }
         }
+    }
+}
+
+/// `msg_data` of `subscribe_events` and `unsubscribe_events`.
+#[derive(serde::Deserialize, Default)]
+struct EntityIds {
+    entity_ids: Option<Vec<String>>,
+}
+
+/// Entity ids of a (un)subscribe request. No `msg_data` or no ids means all entities.
+fn entity_ids(msg_data: Option<Value>) -> Result<Vec<String>, serde_json::Error> {
+    Ok(msg_data
+        .filter(|v| !v.is_null())
+        .map(serde_json::from_value::<EntityIds>)
+        .transpose()?
+        .unwrap_or_default()
+        .entity_ids
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn entity_ids_missing_means_all() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(none, entity_ids(None).expect("ok"));
+        assert_eq!(none, entity_ids(Some(Value::Null)).expect("ok"));
+        assert_eq!(none, entity_ids(Some(json!({}))).expect("ok"));
+        assert_eq!(
+            none,
+            entity_ids(Some(json!({ "entity_ids": null }))).expect("ok")
+        );
+        assert_eq!(
+            none,
+            entity_ids(Some(json!({ "entity_ids": [] }))).expect("ok")
+        );
+        assert_eq!(
+            vec!["a".to_string()],
+            entity_ids(Some(json!({ "entity_ids": ["a"] }))).expect("ok")
+        );
+        assert!(entity_ids(Some(json!({ "entity_ids": "a" }))).is_err());
     }
 }

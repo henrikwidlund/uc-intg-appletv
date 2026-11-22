@@ -120,9 +120,6 @@ impl Handler<SetupDriverMsg> for Controller {
             ));
         }
         let reconfigure = msg.data.reconfigure == Some(true);
-        if let Some(session) = self.sessions.get_mut(msg.ws_id.as_str()) {
-            session.reconfiguring = msg.data.reconfigure;
-        }
         self.end_setup_flow();
         self.setup_owner = Some(msg.ws_id.as_str().into());
         let flow = self.setup_flow;
@@ -241,10 +238,6 @@ impl Controller {
             .is_err()
         {
             return;
-        }
-        // A reconfiguration that was aborted keeps the configured devices.
-        if let Some(session) = self.sessions.get_mut(ws_id) {
-            session.reconfiguring = None;
         }
         if !self.devices.is_empty() {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
@@ -504,10 +497,10 @@ impl Controller {
             "remove" => {
                 let cfg = self.remove_device(key).ok_or_else(unknown_device)?;
                 info!("[{ws_id}] removed {}", cfg.name);
+                let other = |id: &String| EntityKind::parse(id).is_none_or(|(k, _)| k != key);
                 for session in self.sessions.values_mut() {
-                    session
-                        .subscribed_entities
-                        .retain(|id| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
+                    session.subscribed_entities.retain(other);
+                    session.stale.retain(other);
                 }
                 if let Err(e) = self.save_devices() {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
@@ -639,8 +632,12 @@ impl Controller {
             self.remove_device(key);
         }
         self.entities.clear();
+        // Like a new connection: the Remote reads the states again.
         for session in self.sessions.values_mut() {
+            session.subscribe_all = false;
+            session.states_read = false;
             session.subscribed_entities.clear();
+            session.stale.clear();
         }
         self.save_devices()
     }
@@ -656,8 +653,12 @@ impl Controller {
             self.remove_device(key);
         }
         self.entities.clear();
+        // Like a new connection: the Remote reads the states again.
         for session in self.sessions.values_mut() {
+            session.subscribe_all = false;
+            session.states_read = false;
             session.subscribed_entities.clear();
+            session.stale.clear();
         }
         for cfg in devices {
             self.add_device(cfg, ctx);
@@ -974,9 +975,6 @@ impl Controller {
         };
         if self.sm_consume(ws_id, &input, ctx).is_err() {
             return;
-        }
-        if let Some(session) = self.sessions.get_mut(ws_id) {
-            session.reconfiguring = None;
         }
         // Configured devices keep working after a failed setup.
         if error.is_some() && !self.devices.is_empty() {

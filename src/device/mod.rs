@@ -90,7 +90,7 @@ pub enum DeviceEvent {
 #[rtype(result = "()")]
 pub struct Connect;
 
-/// Disconnect, and stay disconnected.
+/// Disconnect, and stay disconnected until the next `Connect` or command.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct Disconnect;
@@ -105,7 +105,7 @@ pub struct Stop;
 #[rtype(result = "()")]
 pub struct UpdateConfig(pub DeviceConfig);
 
-/// Entity command.
+/// Entity command. Answered after the parameters are checked; the command runs later.
 #[derive(Debug, Message)]
 #[rtype(result = "Result<(), ServiceError>")]
 pub struct Command {

@@ -172,6 +172,19 @@ fn closed_lines(ctx: &Ctx) -> usize {
     ctx.driver.log_text().matches("connection closed").count()
 }
 
+/// Wait until the driver log has `pattern` after `mark` (from `Driver::log_len`).
+async fn wait_log(ctx: &mut Ctx, mark: usize, pattern: &str, secs: u64) -> Result<(), Fail> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !ctx.driver.log_since(mark).contains(pattern) {
+        ensure!(
+            Instant::now() < deadline,
+            "no log line with '{pattern}' in {secs} s"
+        );
+        ctx.client.listen_ms(100).await?;
+    }
+    Ok(())
+}
+
 fn connects(ctx: &Ctx) -> usize {
     ctx.driver.log_text().matches("connected in").count()
 }
@@ -255,11 +268,69 @@ pub async fn setup_input(ctx: &mut Ctx) -> Check {
     Ok("bad address refused, setup aborted".into())
 }
 
+/// Pair the driver with the Apple TV at `--address` through the setup flow. The PIN is read
+/// from the terminal.
+pub async fn pair_driver(ctx: &mut Ctx) -> Check {
+    let page = start_setup(ctx, false).await?;
+    ensure!(
+        field_ids(&page).contains(&"restore_from_backup".to_owned()),
+        "first page: {page}"
+    );
+    ctx.client
+        .answer(json!({ "restore_from_backup": "false" }))
+        .await?;
+    let page = ctx.client.next_page(10).await?;
+    ensure!(
+        field_ids(&page).contains(&"address".to_owned()),
+        "discover page: {page}"
+    );
+    let address = ctx.opt.address.map(|a| a.to_string()).unwrap_or_default();
+    ctx.client.answer(json!({ "address": address })).await?;
+    let mut page = ctx.client.next_page(30).await?;
+    if field_ids(&page).contains(&"choice".to_owned()) {
+        let choice = field_value(&page, "choice")
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| Fail::new(format!("no device to choose: {page}")))?;
+        ctx.client.answer(json!({ "choice": choice })).await?;
+        page = ctx.client.next_page(30).await?;
+    }
+    ensure!(
+        field_ids(&page).contains(&"pin".to_owned()),
+        "PIN page: {page}"
+    );
+    println!("Type the PIN shown on the Apple TV and press Enter:");
+    let pin = read_pin(ctx).await?;
+    ctx.client.answer(json!({ "pin": pin })).await?;
+    ctx.client.setup_done(30).await?;
+    Ok("driver paired".into())
+}
+
+/// Read the PIN from the terminal. The WebSocket is read meanwhile, so the pings of the driver
+/// get an answer and the driver keeps the connection.
+async fn read_pin(ctx: &mut Ctx) -> Result<String, Fail> {
+    let mut line = String::new();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let read = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line);
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            result = &mut read => {
+                result?;
+                break;
+            }
+            result = ctx.client.listen_ms(500) => result?,
+        }
+    }
+    let pin = line.trim();
+    ensure!(!pin.is_empty(), "no PIN");
+    Ok(pin.to_owned())
+}
+
 /// The driver config with the pairing, as backup text.
 fn backup_text(ctx: &Ctx) -> Result<String, Fail> {
     let text = std::fs::read_to_string(&ctx.opt.config).map_err(|e| {
         Fail::new(format!(
-            "{}: {e}. Pair the driver one time with the manual test, then use its config.json",
+            "{}: {e}. Pair the driver one time with `remote-sim pair-driver <address>`",
             ctx.opt.config.display()
         ))
     })?;
@@ -586,8 +657,11 @@ pub async fn remote_wake(ctx: &mut Ctx) -> Check {
         first != "UNAVAILABLE",
         "first state after a new connect: {first}"
     );
-    subscribe_all(ctx).await?;
-    Ok(format!("state {first} after {took} ms"))
+    // No entity ids: all entities. The later checks need the events.
+    ctx.client.request_ok("subscribe_events", json!({})).await?;
+    Ok(format!(
+        "state {first} after {took} ms, subscribed without ids"
+    ))
 }
 
 /// Wait until the second connection reports the power state.
@@ -658,7 +732,7 @@ pub async fn remote_commands(ctx: &mut Ctx) -> Check {
     for command in ["CURSOR_DOWN", "CURSOR_UP", "CURSOR_RIGHT", "CURSOR_LEFT"] {
         press(ctx, command).await?;
     }
-    // Repeat and delay.
+    // Repeat and delay. The answer comes before the run ends.
     let start = Instant::now();
     ctx.client
         .command_ok(
@@ -669,7 +743,27 @@ pub async fn remote_commands(ctx: &mut Ctx) -> Check {
         )
         .await?;
     let repeat = start.elapsed().as_millis();
-    ensure!(repeat >= 400, "repeat 3 with delay 200 took {repeat} ms");
+    ensure!(
+        repeat < 400,
+        "repeat 3 with delay 200 answered after {repeat} ms"
+    );
+    // A long run stops at `stop_send`.
+    // Not "not sent: stopped by stop_send": that is a waiting command, not the running one.
+    let stopped = "send_cmd stopped by stop_send";
+    let mark = ctx.driver.log_len();
+    ctx.client
+        .command_ok(
+            "remote",
+            &remote,
+            "send_cmd",
+            json!({ "command": "CURSOR_LEFT", "repeat": 20, "delay": 500 }),
+        )
+        .await?;
+    ctx.client.listen_ms(1500).await?;
+    ctx.client
+        .command_ok("remote", &remote, "stop_send", json!({}))
+        .await?;
+    wait_log(ctx, mark, stopped, 3).await?;
     ctx.client
         .command_ok(
             "remote",
@@ -699,7 +793,7 @@ pub async fn remote_commands(ctx: &mut Ctx) -> Check {
     ensure!(code == 400, "unknown command: code {code}");
     press(ctx, "HOME").await?;
     Ok(format!(
-        "repeat 3 took {repeat} ms, unknown command gives 400"
+        "repeat 3 answered after {repeat} ms, stop_send stops a run, unknown command gives 400"
     ))
 }
 
@@ -763,6 +857,9 @@ pub async fn app_select(ctx: &mut Ctx) -> Check {
     ctx.client
         .wait_text(&select, "current_option", 2, &target)
         .await?;
+    // The app list is device state: the command answers at once and the refusal is logged.
+    let refused = "select_option not run";
+    let mark = ctx.driver.log_len();
     let code = command_code(
         ctx,
         "select",
@@ -771,10 +868,11 @@ pub async fn app_select(ctx: &mut Ctx) -> Check {
         json!({ "option": "Not an app" }),
     )
     .await?;
-    ensure!(code != 200, "an unknown app was accepted");
+    ensure!(code == 200, "unknown app: code {code}");
+    wait_log(ctx, mark, refused, 10).await?;
     press(ctx, "HOME").await?;
     Ok(format!(
-        "{target} shown after {took} ms, unknown app: code {code}"
+        "{target} shown after {took} ms, unknown app refused in the log"
     ))
 }
 
@@ -783,20 +881,11 @@ pub async fn volume(ctx: &mut Ctx) -> Check {
     let mp = ctx.mp();
     let control = ctx.client.text(&ctx.sensor("volume_control"), "value");
     if control == "off" {
-        let (response, _) = ctx
-            .client
-            .command("media_player", &mp, "volume_up", json!({}))
-            .await?;
-        ensure!(
-            response["code"] == 503,
-            "volume_up without volume control: {response}"
-        );
-        let text = response["msg_data"].to_string();
-        ensure!(
-            text.contains("not available"),
-            "volume_up error text: {text}"
-        );
-        return Ok("no volume control: volume_up gives 503".into());
+        // Volume keys go to the Apple TV, which drops them without volume control (CEC or a
+        // receiver). There is nothing to check.
+        return Err(Fail::skip(
+            "no volume control on the Apple TV (CEC or receiver needed)",
+        ));
     }
     let before = ctx
         .client
@@ -1025,10 +1114,14 @@ pub async fn artwork(ctx: &mut Ctx) -> Check {
 
 pub async fn abort_setup(ctx: &mut Ctx) -> Check {
     start_setup(ctx, true).await?;
+    // The configured devices keep working during a setup flow.
+    press(ctx, "HOME").await?;
     abort(ctx).await?;
     let state = wait_available(ctx, 10).await?;
     press(ctx, "HOME").await?;
-    Ok(format!("state {state}, commands work after the abort"))
+    Ok(format!(
+        "state {state}, commands work during the setup and after the abort"
+    ))
 }
 
 fn read_config(ctx: &Ctx) -> Result<Value, Fail> {

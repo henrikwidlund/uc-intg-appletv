@@ -7,7 +7,7 @@ use crate::controller::{Controller, R2ResponseMsg};
 use crate::errors::ServiceError;
 use crate::server::ws::WsConn;
 use actix::Addr;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use std::str::FromStr;
 use std::sync::Arc;
 use uc_api::intg::ws::R2Response;
@@ -28,12 +28,10 @@ impl WsConn {
         debug!("[{session_id}] Got response: {msg}");
 
         if let Ok(resp_msg) = R2Response::from_str(msg) {
-            if let Err(e) = controller_addr.try_send(R2ResponseMsg {
+            controller_addr.do_send(R2ResponseMsg {
                 ws_id: session_id.clone(),
                 msg: resp_msg,
-            }) {
-                error!("[{session_id}] Controller mailbox error: {e}");
-            }
+            });
         } else {
             warn!("[{session_id}] Unknown response: {msg}");
         }
