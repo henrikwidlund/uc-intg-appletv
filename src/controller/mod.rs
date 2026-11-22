@@ -147,6 +147,11 @@ pub struct Controller {
     setup_owner: Option<Arc<str>>,
     /// Id of the setup flow. Changes on each start and end, so that old setup tasks are ignored.
     setup_flow: u32,
+    /// A first setup or a reset: when an Apple TV is paired, a matching configured device keeps
+    /// its key, id and name, and all other devices are removed. Nothing is removed if no Apple TV
+    /// is paired. Discovery also shows configured devices. A restore replaces all devices on its
+    /// own.
+    setup_replace: bool,
     store: ConfigStore,
     driver_settings: DriverSettings,
     device_ctx: Arc<DeviceContext>,
@@ -188,6 +193,7 @@ impl Controller {
             setup: None,
             setup_owner: None,
             setup_flow: 0,
+            setup_replace: false,
             store,
             driver_settings,
             device_ctx,

@@ -483,14 +483,14 @@ fn write_file(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const CREDS: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1:\
         b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2:\
         4141:4242";
 
-    fn device() -> DeviceConfig {
+    pub(crate) fn device() -> DeviceConfig {
         DeviceConfig {
             id: "AA:BB:CC:DD:EE:FF".into(),
             key: device_key("AA:BB:CC:DD:EE:FF"),

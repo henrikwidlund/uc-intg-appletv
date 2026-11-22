@@ -21,6 +21,7 @@ use ratv::{Endpoints, PairOptions, PinPrompt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use uc_api::intg::{DriverSetupChange, IntegrationSetup, SetupDriver};
 use uc_api::model::intg::{IntegrationSetupError, IntegrationSetupState, SetupChangeEventType};
@@ -135,11 +136,8 @@ impl Handler<SetupDriverMsg> for Controller {
                 act.request_input(&ws_id, page, ctx);
             });
         } else {
-            // A first setup starts with a clean configuration.
-            if let Err(e) = self.reset_devices() {
-                self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
-                return Err(e);
-            }
+            // A first setup replaces the configuration when it ends with a paired Apple TV.
+            self.setup_replace = true;
             ctx.run_later(ACK_DELAY, move |act, ctx| {
                 if act.is_setup_flow(flow, &ws_id) {
                     act.setup = Some(SetupState::RestoreChoice);
@@ -250,6 +248,7 @@ impl Controller {
     fn end_setup_flow(&mut self) {
         self.setup = None;
         self.setup_owner = None;
+        self.setup_replace = false;
         self.setup_flow = self.setup_flow.wrapping_add(1);
     }
 
@@ -427,7 +426,8 @@ impl Controller {
         self.request_input(ws_id, discover_page(), ctx);
     }
 
-    /// Scan for Apple TVs and show the ones that are not configured.
+    /// Scan for Apple TVs and show the ones that are not configured. A first setup or a reset
+    /// shows all.
     fn discover(&self, ws_id: String, address: Option<IpAddr>, ctx: &mut Context<Self>) {
         info!("[{ws_id}] discovering Apple TV devices, address: {address:?}");
         let flow = self.setup_flow;
@@ -449,14 +449,16 @@ impl Controller {
                     let found: Vec<Found> = devices
                         .iter()
                         .filter(|d| {
-                            !act.devices
-                                .values()
-                                .any(|c| c.cfg.matches(discovery::device_ids(d)))
+                            act.setup_replace
+                                || !act
+                                    .devices
+                                    .values()
+                                    .any(|c| c.cfg.matches(discovery::device_ids(d)))
                         })
                         .filter_map(Found::new)
                         .collect();
                     if found.is_empty() {
-                        info!("[{ws_id}] no new Apple TV found");
+                        info!("[{ws_id}] no Apple TV found to add");
                         act.finish_setup(&ws_id, Some(IntegrationSetupError::NotFound), ctx);
                         return;
                     }
@@ -496,13 +498,8 @@ impl Controller {
                 });
             }
             "remove" => {
-                let cfg = self.remove_device(key).ok_or_else(unknown_device)?;
+                let cfg = self.forget_device(key).ok_or_else(unknown_device)?;
                 info!("[{ws_id}] removed {}", cfg.name);
-                let other = |id: &String| EntityKind::parse(id).is_none_or(|(k, _)| k != key);
-                for session in self.sessions.values_mut() {
-                    session.subscribed_entities.retain(other);
-                    session.stale.retain(other);
-                }
                 if let Err(e) = self.save_devices() {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
                     return Err(InputError::Failed(IntegrationSetupError::Other));
@@ -556,11 +553,9 @@ impl Controller {
                 });
             }
             "reset" => {
-                if let Err(e) = self.reset_devices() {
-                    warn!("[{ws_id}] saving the configuration failed: {e}");
-                    return Err(InputError::Failed(IntegrationSetupError::Other));
-                }
-                info!("[{ws_id}] configuration reset");
+                // The devices are replaced when the setup ends with a paired Apple TV.
+                self.setup_replace = true;
+                info!("[{ws_id}] devices are replaced when an Apple TV is paired");
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.request_discover(&ws_id, ctx);
@@ -623,24 +618,28 @@ impl Controller {
         }
     }
 
-    /// Remove all devices and their entities.
-    fn reset_devices(&mut self) -> Result<(), ServiceError> {
-        if self.devices.is_empty() {
-            return Ok(());
-        }
-        let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
-        for key in &keys {
-            self.remove_device(key);
-        }
-        self.entities.clear();
-        // Like a new connection: the Remote reads the states again.
+    /// Remove a device, and remove its entities from the sessions. The configuration is not saved.
+    fn forget_device(&mut self, key: &str) -> Option<DeviceConfig> {
+        let cfg = self.remove_device(key)?;
+        let other = |id: &String| EntityKind::parse(id).is_none_or(|(k, _)| k != key);
         for session in self.sessions.values_mut() {
-            session.subscribe_all = false;
-            session.states_read = false;
-            session.subscribed_entities.clear();
-            session.stale.clear();
+            session.subscribed_entities.retain(other);
+            session.stale.retain(other);
         }
-        self.save_devices()
+        Some(cfg)
+    }
+
+    /// Remove all devices except `keep`. The configuration is not saved.
+    fn forget_other_devices(&mut self, keep: &str) {
+        let keys: Vec<Arc<str>> = self
+            .devices
+            .keys()
+            .filter(|k| k.as_ref() != keep)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.forget_device(key);
+        }
     }
 
     /// Replace all devices with the devices of a backup.
@@ -829,15 +828,23 @@ impl Controller {
                         }
                     };
                     info!("[{ws_id}] paired with {}", found.name);
-                    let existing = replace
-                        .as_deref()
-                        .and_then(|k| act.devices.get(k))
-                        .map(|d| d.cfg.clone());
+                    let existing = match replace.as_deref() {
+                        Some(k) => act.devices.get(k).map(|d| &d.cfg),
+                        // A first setup or a reset keeps the key, id and name of a matching
+                        // configured device.
+                        None if act.setup_replace => {
+                            matching_config(act.devices.values().map(|d| &d.cfg), &found)
+                        }
+                        None => None,
+                    }
+                    .cloned();
                     let cfg = match existing {
                         Some(mut cfg) => {
                             cfg.credentials = credentials;
                             cfg.known_ids = found.known_ids;
                             cfg.address = found.address;
+                            cfg.manual_address = manual_address;
+                            cfg.global_volume = global_volume;
                             cfg
                         }
                         None => DeviceConfig {
@@ -851,6 +858,9 @@ impl Controller {
                             global_volume,
                         },
                     };
+                    if act.setup_replace {
+                        act.forget_other_devices(&cfg.key);
+                    }
                     if let Some(device) = act.devices.get_mut(cfg.key.as_str()) {
                         device.cfg = cfg.clone();
                         device.addr.do_send(UpdateConfig(cfg));
@@ -1225,6 +1235,26 @@ fn configure_page(cfg: &DeviceConfig, found: &[Found]) -> Value {
     })
 }
 
+/// The configuration that belongs to `found`. A match of the pairing id comes first, then the
+/// match with the smallest key.
+fn matching_config<'a>(
+    configs: impl Iterator<Item = &'a DeviceConfig>,
+    found: &Found,
+) -> Option<&'a DeviceConfig> {
+    let mut first = None;
+    for cfg in configs {
+        if cfg.id == found.id {
+            return Some(cfg);
+        }
+        if first.is_none_or(|f: &DeviceConfig| cfg.key < f.key)
+            && cfg.matches(found.known_ids.iter().map(String::as_str))
+        {
+            first = Some(cfg);
+        }
+    }
+    first
+}
+
 fn parse_address(value: Option<&str>) -> Result<Option<IpAddr>, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(None),
@@ -1265,14 +1295,48 @@ mod tests {
         assert!(parse_address(Some("tv.local")).is_err());
     }
 
+    #[test]
+    fn matching_config_prefers_the_pairing_id() {
+        let exact = crate::config_store::tests::device();
+        let mut linked = exact.clone();
+        linked.id = "11:22:33:44:55:66".into();
+        linked.key = device_key(&linked.id);
+        let mut other = exact.clone();
+        other.id = "99:99:99:99:99:99".into();
+        other.known_ids = vec!["OTHER".into()];
+        let found = Found {
+            id: exact.id.clone(),
+            name: "Living Room".into(),
+            model: String::new(),
+            address: None,
+            endpoints: Endpoints::default(),
+            known_ids: vec![exact.id.clone(), "UUID-1".into()],
+        };
+        let configs = [linked.clone(), other.clone(), exact.clone()];
+        assert_eq!(Some(&exact), matching_config(configs.iter(), &found));
+        let configs = [other.clone(), linked.clone()];
+        assert_eq!(Some(&linked), matching_config(configs.iter(), &found));
+        let mut linked2 = linked.clone();
+        linked2.id = "00:11:22:33:44:55".into();
+        linked2.key = device_key(&linked2.id);
+        let configs = [linked.clone(), linked2.clone()];
+        assert_eq!(Some(&linked2), matching_config(configs.iter(), &found));
+        let configs = [linked2.clone(), linked];
+        assert_eq!(Some(&linked2), matching_config(configs.iter(), &found));
+        assert_eq!(None, matching_config(std::iter::once(&other), &found));
+    }
+
     mod flow {
-        use crate::config_store::DriverSettings;
+        use crate::config_store::tests::device;
+        use crate::config_store::{ConfigStore, DriverSettings};
         use crate::configuration::{HeartbeatSettings, Settings};
+        use crate::controller::handler::AbortDriverSetup;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::{Controller, NewR2Session, R2SessionDisconnect, SendWsMessage};
         use crate::server::ArtworkStore;
         use actix::{Actor, Addr, Context, Handler};
         use serde_json::{Value, json};
+        use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
@@ -1297,9 +1361,12 @@ mod tests {
             }
         }
 
+        fn test_dir(name: &str) -> PathBuf {
+            std::env::temp_dir().join(format!("uc-intg-appletv-{name}-{}", std::process::id()))
+        }
+
         fn controller(name: &str) -> Addr<Controller> {
-            let dir =
-                std::env::temp_dir().join(format!("uc-intg-appletv-{name}-{}", std::process::id()));
+            let dir = test_dir(name);
             let settings = Settings {
                 interface: "127.0.0.1".into(),
                 http_port: 0,
@@ -1428,6 +1495,96 @@ mod tests {
                 .await
                 .expect("send")
                 .expect("setup started");
+        }
+
+        fn config_len(name: &str) -> usize {
+            ConfigStore::new(test_dir(name)).load_devices().len()
+        }
+
+        #[actix::test]
+        async fn first_setup_and_reset_keep_the_devices_until_a_device_is_paired() {
+            let name = "keep-devices";
+            let dir = test_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let cfg = device();
+            ConfigStore::new(&dir)
+                .save_devices(std::slice::from_ref(&cfg))
+                .expect("save");
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+
+            // A first setup that is aborted keeps the device.
+            let data = serde_json::from_value(json!({ "setup_data": {} })).expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(json!("WAIT_USER_ACTION"), last(&events)["state"]);
+            assert_eq!(1, config_len(name));
+            controller
+                .send(AbortDriverSetup {
+                    ws_id: "a".into(),
+                    timeout: false,
+                })
+                .await
+                .expect("send");
+            assert_eq!(1, config_len(name));
+
+            // A reset keeps the device until a device is paired.
+            let data = serde_json::from_value(json!({ "reconfigure": true, "setup_data": {} }))
+                .expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            controller
+                .send(values("a", &[("action", "reset"), ("choice", &cfg.key)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                json!("address"),
+                last(&events)["require_user_action"]["input"]["settings"][1]["id"]
+            );
+            assert_eq!(1, config_len(name));
+            controller
+                .send(AbortDriverSetup {
+                    ws_id: "a".into(),
+                    timeout: false,
+                })
+                .await
+                .expect("send");
+            assert_eq!(1, config_len(name));
+
+            // The device is still configured.
+            let data = serde_json::from_value(json!({ "reconfigure": true, "setup_data": {} }))
+                .expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                json!(cfg.key),
+                last(&events)["require_user_action"]["input"]["settings"][0]["field"]["dropdown"]["value"]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[actix::test]
