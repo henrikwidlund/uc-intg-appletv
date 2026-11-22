@@ -4,6 +4,7 @@
 
 //! Handler for [`R2RequestMsg`].
 
+use crate::controller::devices::Trigger;
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
 use crate::controller::{Controller, R2RequestMsg};
 use crate::errors::ServiceError;
@@ -31,11 +32,16 @@ impl Handler<R2RequestMsg> for Controller {
     #[allow(clippy::too_many_lines)]
     fn handle(&mut self, msg: R2RequestMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("R2RequestMsg: {:?}", msg.request);
-        // A Remote that sends a request is not in standby.
+        // A Remote that sends a request is awake: not in standby and not after `disconnect`.
         let Some(session) = self.sessions.get_mut(&msg.ws_id) else {
             return_fut_err!(ServiceError::NotFound("No session found".into()));
         };
+        let woke = !session.awake();
         session.standby = false;
+        session.devices_off = false;
+        if woke {
+            self.update_connections(Trigger::Wake);
+        }
 
         let req_id = msg.req_id;
         // Answered with an event, so it has no response message.

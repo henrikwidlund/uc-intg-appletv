@@ -64,11 +64,15 @@ state_machine! {
 }
 
 /// One connected Remote.
+#[allow(clippy::struct_excessive_bools)]
 struct R2Session {
     recipient: Recipient<SendWsMessage>,
     /// Id of the last request message from the driver to the Remote.
     ws_id: u32,
     standby: bool,
+    /// The Remote sent the `disconnect` event and wants no device connections until `connect`,
+    /// `exit_standby` or its next request.
+    devices_off: bool,
     subscribed_entities: HashSet<String>,
     /// Subscribed to all entities: `subscribe_events` without entity ids.
     subscribe_all: bool,
@@ -86,11 +90,27 @@ impl R2Session {
             recipient,
             ws_id: 0,
             standby: false,
+            devices_off: false,
             subscribed_entities: HashSet::default(),
             subscribe_all: false,
             states_read: false,
             stale: HashSet::default(),
         }
+    }
+
+    /// The Remote is awake and wants device connections.
+    const fn awake(&self) -> bool {
+        !self.standby && !self.devices_off
+    }
+
+    /// The Remote subscribed to an entity of the device with `key`. No subscription means no
+    /// connection, also when `get_entity_states` returns all entities.
+    fn uses(&self, key: &str) -> bool {
+        self.subscribe_all
+            || self
+                .subscribed_entities
+                .iter()
+                .any(|id| devices::is_of_device(id, key))
     }
 
     /// The Remote gets events of this entity.
@@ -288,5 +308,48 @@ impl Actor for Controller {
         for cfg in devices {
             self.add_device(cfg, ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{R2Session, SendWsMessage};
+    use actix::{Actor, Context, Handler};
+
+    struct Sink;
+
+    impl Actor for Sink {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<SendWsMessage> for Sink {
+        type Result = ();
+        fn handle(&mut self, _: SendWsMessage, _: &mut Context<Self>) {}
+    }
+
+    #[actix::test]
+    async fn session_awake_and_uses() {
+        let mut s = R2Session::new(Sink.start().recipient());
+        assert!(s.awake());
+        assert!(!s.uses("abc"), "no subscription connects nothing");
+
+        s.subscribed_entities.insert("media_player.abc".into());
+        assert!(s.uses("abc"));
+        assert!(!s.uses("ab"), "key must match the whole key part");
+
+        s.subscribed_entities.clear();
+        s.subscribed_entities
+            .insert("select.abc.playback_speed".into());
+        assert!(s.uses("abc"));
+
+        s.subscribed_entities.clear();
+        s.subscribe_all = true;
+        assert!(s.uses("xyz"));
+
+        s.standby = true;
+        assert!(!s.awake());
+        s.standby = false;
+        s.devices_off = true;
+        assert!(!s.awake());
     }
 }

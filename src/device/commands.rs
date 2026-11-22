@@ -383,7 +383,7 @@ pub async fn exec(tv: &AppleTv, call: Call) -> Result<(), ratv::Error> {
         Call::ControlCenter => tv.control_center().await,
         Call::Volume(level, others) => {
             tv.set_volume(level).await?;
-            if let Some(mrp) = tv.mrp() {
+            if let Some(mrp) = tv.mrp().filter(|m| m.is_connected()) {
                 for uid in &others {
                     mrp.set_output_volume(uid, level).await?;
                 }

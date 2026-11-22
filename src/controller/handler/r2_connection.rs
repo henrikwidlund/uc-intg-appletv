@@ -4,6 +4,7 @@
 
 //! Handlers for Remote connection messages.
 
+use crate::controller::devices::Trigger;
 use crate::controller::{Controller, NewR2Session, R2Session, R2SessionDisconnect, SendWsMessage};
 use actix::{Context, Handler};
 use log::{error, info};
@@ -35,5 +36,6 @@ impl Handler<R2SessionDisconnect> for Controller {
             self.abort_setup(&msg.id, false, ctx);
         }
         self.sessions.remove(&msg.id);
+        self.update_connections(Trigger::Sleep);
     }
 }

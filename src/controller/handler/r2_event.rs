@@ -4,6 +4,7 @@
 
 //! Handler for [`R2EventMsg`].
 
+use crate::controller::devices::Trigger;
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, R2EventMsg};
 use actix::{AsyncContext, Handler};
@@ -19,32 +20,28 @@ impl Handler<R2EventMsg> for Controller {
             return;
         };
 
+        // Connections stay while another awake Remote uses the device.
         match msg.event {
+            // A Remote that asks for connections is awake.
             R2Event::Connect => {
-                self.connect_devices();
+                session.devices_off = false;
+                session.standby = false;
+                self.update_connections(Trigger::Wake);
                 // The Remote might be out of sync.
                 self.send_device_state(&msg.ws_id);
             }
             R2Event::Disconnect => {
-                // Keep the connections while another Remote is still awake.
-                if self
-                    .sessions
-                    .iter()
-                    .all(|(id, s)| *id == msg.ws_id || s.standby)
-                {
-                    self.disconnect_devices();
-                }
+                session.devices_off = true;
+                self.update_connections(Trigger::Sleep);
             }
             R2Event::EnterStandby => {
                 session.standby = true;
-                // Keep the connections while another Remote is still awake.
-                if self.sessions.values().all(|s| s.standby) {
-                    self.disconnect_devices();
-                }
+                self.update_connections(Trigger::Sleep);
             }
             R2Event::ExitStandby => {
                 session.standby = false;
-                self.connect_devices();
+                session.devices_off = false;
+                self.update_connections(Trigger::Wake);
                 self.send_device_state(&msg.ws_id);
             }
             R2Event::AbortDriverSetup => {

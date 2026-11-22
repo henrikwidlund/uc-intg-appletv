@@ -36,8 +36,9 @@ use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent, IntgRemot
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// The list time is taken at the reply, so the next poll comes a bit early.
 const POLL_MARGIN: Duration = Duration::from_secs(30);
-/// Interval to connect a missing protocol. The device can change the port of a service when it
-/// restarts, so each try scans first.
+/// Interval to connect a missing protocol. Each try uses the known endpoints first. The device can
+/// change the port of a service when it restarts, so a refused connect or a missing endpoint scans
+/// for the new one.
 const MISSING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Waits before asking again when a request fails. Right after wake the device is not ready
@@ -120,7 +121,7 @@ struct Timers {
     chapter: Option<SpawnHandle>,
     /// Interval to connect a missing protocol.
     missing: Option<SpawnHandle>,
-    /// Waits for the end of the connection.
+    /// Waits until one of the open protocols closes.
     closed: Option<SpawnHandle>,
     screen: Option<SpawnHandle>,
     /// Running AirPlay scan.
@@ -349,37 +350,12 @@ impl AppleTvActor {
         self.set_status(DeviceStatus::Connecting);
         self.attempt += 1;
         let attempt = self.attempt;
-        let mut cfg = self.cfg.clone();
+        let cfg = self.cfg.clone();
         let version = self.cfg_version;
         let options = self.client_options();
-
         let known = self.endpoints;
         let start = Instant::now();
-
-        let fut = async move {
-            if let Some(ep) = known {
-                match AppleTv::connect(&ep, &cfg.credentials, &options).await {
-                    Ok(tv) => return (None, Ok((tv, ep, "last address"))),
-                    // A scan fails the same way.
-                    Err(e) if e.is_auth() || network_not_ready(&e) => {
-                        return (None, Err(Some(e)));
-                    }
-                    Err(e) => debug!("[{}] last endpoints failed, scanning: {e}", cfg.name),
-                }
-            }
-            let device = match discovery::find(&cfg).await {
-                Ok(Some(d)) => d,
-                Ok(None) => return (None, Err(None)),
-                Err(e) => return (None, Err(Some(e))),
-            };
-            let changed = discovery::update_config(&mut cfg, &device);
-            let ep = Endpoints::from(&device);
-            let result = AppleTv::connect(&ep, &cfg.credentials, &options).await;
-            (
-                changed.then_some(cfg),
-                result.map(|tv| (tv, ep, "scan")).map_err(Some),
-            )
-        };
+        let fut = connect_device(known, cfg, options);
         ctx.spawn(fut.into_actor(self).map(move |(cfg, result), act, ctx| {
             // What discovery found is valid also for an old attempt.
             if let Some(cfg) = cfg
@@ -415,7 +391,7 @@ impl AppleTvActor {
                         let _ = tv.close().await;
                     });
                 }
-                Err(Some(e)) if e.is_auth() => {
+                Err(ConnectError::Failed(e)) if e.is_auth() => {
                     act.endpoints = None;
                     warn!(
                         "[{}] pairing is not valid anymore, pair again: {e}",
@@ -424,13 +400,21 @@ impl AppleTvActor {
                     act.lost_connection(ctx);
                     act.set_status(DeviceStatus::AuthError);
                 }
-                Err(Some(e)) if network_not_ready(&e) && act.network_retry(ctx) => {
+                Err(ConnectError::Failed(e)) if network_not_ready(&e) && act.network_retry(ctx) => {
                     debug!("[{}] network not ready: {e}", act.cfg.name);
                 }
                 Err(e) => {
                     match e {
-                        Some(e) => warn!("[{}] connect failed: {e}", act.cfg.name),
-                        None => info!("[{}] not found on the network", act.cfg.name),
+                        ConnectError::Failed(e) => {
+                            warn!("[{}] connect failed: {e}", act.cfg.name);
+                        }
+                        ConnectError::NotFound { auth_failed } => {
+                            info!("[{}] not found on the network", act.cfg.name);
+                            // The device at the last endpoints may be another one.
+                            if auth_failed {
+                                act.endpoints = None;
+                            }
+                        }
                     }
                     act.lost_connection(ctx);
                     act.schedule_reconnect(ctx);
@@ -453,29 +437,20 @@ impl AppleTvActor {
         self.network_retry_end = None;
         self.command_timeouts.clear();
 
+        let mut dirty = Dirty::CONNECTION;
         let mut any_missing = false;
         for protocol in missing(&tv) {
             any_missing = true;
-            let lost = match protocol {
-                Protocol::Companion => {
-                    "Companion: power state, apps, accounts and swipes are not available"
-                }
-                Protocol::Mrp => {
-                    "MRP: volume, outputs, languages, chapters and Up Next are not available"
-                }
-                _ => "",
-            };
-            warn!("[{}] not connected: {lost}", self.cfg.name);
-        }
-        if any_missing {
-            // `closed()` fires only for connected protocols, so the missing ones are tried again here.
-            self.timers.missing =
-                Some(ctx.run_interval(MISSING_RETRY_INTERVAL, Self::retry_missing));
+            warn!(
+                "[{}] not connected: {}",
+                self.cfg.name,
+                lost_features(protocol)
+            );
+            dirty |= self.clear_protocol_state(protocol);
         }
 
-        let mut dirty = Dirty::CONNECTION;
         self.s.connected = true;
-        self.s.mrp = tv.mrp().is_some();
+        self.s.mrp = tv.is_open(Protocol::Mrp);
         self.s.siri = siri_available(&tv, self.ctx.siri_mode());
         let own_uid = tv.mrp().and_then(|m| m.device_info().device_uid.clone());
         if self.s.own_output_uid != own_uid {
@@ -487,7 +462,8 @@ impl AppleTvActor {
             ctx.add_message_stream(changes(rx.clone(), WatchChanged::NowPlaying(generation)));
             self.np = Some(rx);
         }
-        if let Some(rx) = tv.volume() {
+        // `volume()` also returns the channel of a closed MRP client.
+        if let Some(rx) = tv.volume().filter(|_| tv.is_open(Protocol::Mrp)) {
             ctx.add_message_stream(changes(rx.clone(), WatchChanged::Volume(generation)));
             self.volume = Some(rx);
         }
@@ -499,33 +475,17 @@ impl AppleTvActor {
             ctx.add_message_stream(events);
         }
 
-        let closed = tv.clone();
-        let handle = ctx.spawn(async move { closed.closed().await }.into_actor(self).map(
-            move |reason, act, ctx| {
-                if act.generation == generation {
-                    act.timers.closed = None;
-                    match reason {
-                        Some(e) => warn!("[{}] connection closed: {e}", act.cfg.name),
-                        None => info!("[{}] connection closed", act.cfg.name),
-                    }
-                    act.lost_connection(ctx);
-                    act.schedule_reconnect(ctx);
-                }
-            },
-        ));
-        self.timers.closed = Some(handle);
-
         self.tv = Some(tv);
+        self.watch_closed(ctx);
         self.set_status(DeviceStatus::Connected);
         // One request at a time: ratv closes Companion after two silent timeouts in a row.
         self.query_power(ctx, 0, true);
         // Until the device sends its state, the channels hold empty values. Using them would clear
-        // what the Remote shows, so they are used only after the first update or after a wait.
-        if self
-            .np
-            .as_ref()
-            .is_some_and(|rx| rx.has_changed().unwrap_or(false))
-        {
+        // what the Remote shows, so they are used only when they have data, after the first
+        // update or after a wait. The first value can already have data without a change mark.
+        if self.np.as_ref().is_some_and(|rx| {
+            rx.has_changed().unwrap_or(false) || *rx.borrow() != NowPlaying::default()
+        }) {
             dirty |= self.update_now_playing(ctx);
         }
         if self
@@ -545,10 +505,123 @@ impl AppleTvActor {
 
         self.scan_outputs(ctx);
         self.timers.poll = Some(ctx.run_interval(POLL_INTERVAL, Self::poll));
-        // Try at once: after a restart of the device, a scan finds the new port in about 2 s.
+        // `watch_closed` sees only the open protocols, so the missing ones are tried again here.
         if any_missing {
-            self.retry_missing(ctx);
+            self.start_missing(ctx);
         }
+    }
+
+    /// Wait until one of the open protocols closes. When the other protocol is still open, it
+    /// stays in use and the closed one is connected again.
+    fn watch_closed(&mut self, ctx: &mut Context<Self>) {
+        let Some(tv) = &self.tv else { return };
+        // `AppleTv::closed` returns at once after one protocol closed, so wait on the open ones.
+        let companion = tv.companion().filter(|c| c.is_connected()).cloned();
+        let mrp = tv.mrp().filter(|m| m.is_connected()).cloned();
+        let generation = self.generation;
+        let fut = async move {
+            // Both closed before this check: the callback sees no open protocol and reconnects.
+            if companion.is_none() && mrp.is_none() {
+                return (Protocol::Companion, None);
+            }
+            let companion = async {
+                match &companion {
+                    Some(c) => c.closed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let mrp = async {
+                match &mrp {
+                    Some(m) => m.closed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                reason = companion => (Protocol::Companion, reason),
+                reason = mrp => (Protocol::Mrp, reason),
+            }
+        };
+        let handle = ctx.spawn(
+            fut.into_actor(self)
+                .map(move |(protocol, reason), act, ctx| {
+                    if act.generation != generation {
+                        return;
+                    }
+                    act.timers.closed = None;
+                    let open = act.tv.as_ref().is_some_and(|tv| {
+                        tv.is_open(Protocol::Companion) || tv.is_open(Protocol::Mrp)
+                    });
+                    match (&reason, open) {
+                        (Some(e), true) => warn!(
+                            "[{}] {protocol:?} closed: {e}. {}",
+                            act.cfg.name,
+                            lost_features(protocol)
+                        ),
+                        (None, true) => warn!(
+                            "[{}] {protocol:?} closed. {}",
+                            act.cfg.name,
+                            lost_features(protocol)
+                        ),
+                        (Some(e), false) => warn!("[{}] connection closed: {e}", act.cfg.name),
+                        (None, false) => info!("[{}] connection closed", act.cfg.name),
+                    }
+                    if open {
+                        act.protocol_lost(protocol, ctx);
+                    } else {
+                        act.lost_connection(ctx);
+                        act.schedule_reconnect(ctx);
+                    }
+                }),
+        );
+        self.timers.closed = Some(handle);
+    }
+
+    /// One protocol closed and the other is still open. Show what is gone and connect it again.
+    fn protocol_lost(&mut self, protocol: Protocol, ctx: &mut Context<Self>) {
+        let Some(tv) = &self.tv else { return };
+        let mut dirty = Dirty::NONE;
+        let siri = siri_available(tv, self.ctx.siri_mode());
+        if self.s.siri != siri {
+            self.s.siri = siri;
+            dirty |= Dirty::CONNECTION;
+        }
+        dirty |= self.clear_protocol_state(protocol);
+        self.emit(dirty);
+        self.watch_closed(ctx);
+        self.start_missing(ctx);
+    }
+
+    /// Clear the state that comes from `protocol`, which is not connected.
+    fn clear_protocol_state(&mut self, protocol: Protocol) -> Dirty {
+        match protocol {
+            Protocol::Mrp => {
+                self.s.mrp = false;
+                self.expected_mute = None;
+                // A running fast forward or rewind would block the retry of MRP.
+                self.seek = None;
+                // The volume channel ends with MRP. Now playing goes on with Companion data.
+                self.volume = None;
+                self.s.update_volume(&Volume::default())
+            }
+            Protocol::Companion => {
+                self.attention = None;
+                self.media_flags = None;
+                self.expected_power = None;
+                self.s.set_power(Power::Unknown)
+            }
+            _ => Dirty::NONE,
+        }
+    }
+
+    /// Try the missing protocols now and then at each [`MISSING_RETRY_INTERVAL`].
+    /// Now, because after a restart of the device the connect is refused and a scan finds the new
+    /// port in about 2 s.
+    fn start_missing(&mut self, ctx: &mut Context<Self>) {
+        if self.timers.missing.is_none() {
+            self.timers.missing =
+                Some(ctx.run_interval(MISSING_RETRY_INTERVAL, Self::retry_missing));
+        }
+        self.retry_missing(ctx);
     }
 
     /// Drop the connection and mark the entities unavailable.
@@ -699,7 +772,8 @@ impl AppleTvActor {
         }
     }
 
-    /// Scan and connect the missing protocols. The open protocols stay connected.
+    /// Connect the missing protocols: first at the known endpoints, then after a scan if the
+    /// device refused the connect or an endpoint is not known. The open protocols stay connected.
     /// Skipped while Siri or a fast forward or rewind is active: a new handle restarts the tasks
     /// of the connection, and a new MRP connection does not know about a running fast forward.
     fn retry_missing(&mut self, ctx: &mut Context<Self>) {
@@ -723,6 +797,15 @@ impl AppleTvActor {
         let ep = self.endpoints.unwrap_or_default();
         let options = self.client_options();
         let fut = async move {
+            if has_missing_endpoints(&tv, ep) {
+                match tv.connect_missing(&ep, &cfg.credentials, &options).await {
+                    // The service may listen on another port now.
+                    Err(e) if e.is_refused() => {
+                        debug!("[{}] missing protocols refused, scanning: {e}", cfg.name);
+                    }
+                    result => return (None, ep, result),
+                }
+            }
             let found = match discovery::find(&cfg).await {
                 Ok(found) => found,
                 Err(e) => {
@@ -832,7 +915,7 @@ impl AppleTvActor {
     /// `then_poll`, the apps and accounts are fetched after it.
     fn query_power(&self, ctx: &mut Context<Self>, attempt: usize, then_poll: bool) {
         let Some(tv) = self.tv.clone() else { return };
-        if tv.companion().is_none() {
+        if !tv.is_open(Protocol::Companion) {
             return;
         }
         let generation = self.generation;
@@ -1218,7 +1301,7 @@ impl AppleTvActor {
 
     /// Fetch the apps and accounts. `attempt` counts the tries, see [`NOT_READY_RETRY`].
     fn poll_companion(&self, ctx: &mut Context<Self>, attempt: usize) {
-        let Some(tv) = self.tv.clone().filter(|tv| tv.companion().is_some()) else {
+        let Some(tv) = self.tv.clone().filter(|tv| tv.is_open(Protocol::Companion)) else {
             return;
         };
         let generation = self.generation;
@@ -1285,7 +1368,7 @@ impl AppleTvActor {
             return;
         }
         let generation = self.generation;
-        if tv.mrp().is_some() {
+        if tv.is_open(Protocol::Mrp) {
             let own_uid = self.s.own_output_uid.clone();
             self.timers.scan = Some(
                 ctx.spawn(
@@ -1514,6 +1597,71 @@ impl AppleTvActor {
     }
 }
 
+/// Why a connect failed.
+enum ConnectError {
+    /// The scan did not find the device. `auth_failed`: the last endpoints gave an auth error.
+    NotFound {
+        auth_failed: bool,
+    },
+    Failed(ratv::Error),
+}
+
+/// Connect result with the address source for the log.
+type ConnectResult = Result<(AppleTv, Endpoints, &'static str), ConnectError>;
+
+/// Connect at the last endpoints, else find the device and connect there. Also returns the
+/// configuration if discovery changed it.
+async fn connect_device(
+    known: Option<Endpoints>,
+    mut cfg: DeviceConfig,
+    options: ClientOptions,
+) -> (Option<DeviceConfig>, ConnectResult) {
+    // An auth error at the last address can come from another device that has this
+    // address now. Then the scan below finds the device by its ids.
+    let mut auth_failed_at = None;
+    if let Some(ep) = known {
+        match AppleTv::connect(&ep, &cfg.credentials, &options).await {
+            Ok(tv) => return (None, Ok((tv, ep, "last address"))),
+            Err(e) if e.is_auth() => {
+                debug!("[{}] last endpoints failed, scanning: {e}", cfg.name);
+                auth_failed_at = Some((ep, e));
+            }
+            // A scan fails the same way.
+            Err(e) if network_not_ready(&e) => return (None, Err(ConnectError::Failed(e))),
+            Err(e) => debug!("[{}] last endpoints failed, scanning: {e}", cfg.name),
+        }
+    }
+    let device = match discovery::find(&cfg).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            let auth_failed = auth_failed_at.is_some();
+            return (None, Err(ConnectError::NotFound { auth_failed }));
+        }
+        Err(e) => return (None, Err(ConnectError::Failed(e))),
+    };
+    let changed = discovery::update_config(&mut cfg, &device);
+    let ep = Endpoints::from(&device);
+    if let Some((old, e)) = auth_failed_at {
+        // Same address: the device itself refused the pairing. A second connect fails the same way.
+        if ip(ep) == ip(old) {
+            return (changed.then_some(cfg), Err(ConnectError::Failed(e)));
+        }
+        if let Some(old) = ip(old) {
+            info!(
+                "[{}] another device is at {old}, using the new address",
+                cfg.name
+            );
+        }
+    }
+    let result = AppleTv::connect(&ep, &cfg.credentials, &options).await;
+    (
+        changed.then_some(cfg),
+        result
+            .map(|tv| (tv, ep, "scan"))
+            .map_err(ConnectError::Failed),
+    )
+}
+
 /// Protocols of `tv` that are not open.
 fn missing(tv: &AppleTv) -> impl Iterator<Item = Protocol> + '_ {
     [Protocol::Companion, Protocol::Mrp]
@@ -1521,10 +1669,23 @@ fn missing(tv: &AppleTv) -> impl Iterator<Item = Protocol> + '_ {
         .filter(|&p| !tv.is_open(p))
 }
 
+/// IP address of the endpoints.
+fn ip(ep: Endpoints) -> Option<IpAddr> {
+    ep.companion.or(ep.airplay).map(|a| a.ip())
+}
+
+/// `ep` has an endpoint for each protocol that `tv` is missing. `true` when none is missing.
+fn has_missing_endpoints(tv: &AppleTv, ep: Endpoints) -> bool {
+    missing(tv).all(|p| match p {
+        Protocol::Companion => ep.companion.is_some(),
+        Protocol::Mrp => ep.airplay.is_some(),
+        _ => true,
+    })
+}
+
 /// Endpoints from a scan. While the device starts, it can list only some services. A service
 /// that the scan did not find keeps its old endpoint if the IP address is the same.
 fn merge_endpoints(old: Endpoints, found: Endpoints) -> Endpoints {
-    let ip = |e: Endpoints| e.companion.or(e.airplay).map(|a| a.ip());
     if ip(found) != ip(old) {
         return found;
     }
@@ -1535,10 +1696,21 @@ fn merge_endpoints(old: Endpoints, found: Endpoints) -> Endpoints {
 }
 
 /// The protocol that `mode` needs for Siri is connected.
-const fn siri_available(tv: &AppleTv, mode: SiriMode) -> bool {
+fn siri_available(tv: &AppleTv, mode: SiriMode) -> bool {
     match mode {
-        SiriMode::Auto => tv.companion().is_some() || tv.mrp().is_some(),
-        SiriMode::Mrp => tv.mrp().is_some(),
+        SiriMode::Auto => tv.is_open(Protocol::Companion) || tv.is_open(Protocol::Mrp),
+        SiriMode::Mrp => tv.is_open(Protocol::Mrp),
+    }
+}
+
+/// What is not available without `protocol`.
+const fn lost_features(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Companion => {
+            "Companion: power state, apps, accounts and swipes are not available"
+        }
+        Protocol::Mrp => "MRP: volume, outputs, languages, chapters and Up Next are not available",
+        _ => "",
     }
 }
 
@@ -1692,7 +1864,14 @@ impl Handler<CompanionEvent> for AppleTvActor {
     type Result = ();
 
     fn handle(&mut self, msg: CompanionEvent, ctx: &mut Self::Context) {
-        if msg.generation != self.generation {
+        // An event can wait in the mailbox while Companion closes. It must not undo the reset in
+        // `protocol_lost`.
+        if msg.generation != self.generation
+            || !self
+                .tv
+                .as_ref()
+                .is_some_and(|tv| tv.is_open(Protocol::Companion))
+        {
             return;
         }
         match msg.event {
@@ -1735,7 +1914,11 @@ impl Handler<Disconnect> for AppleTvActor {
         // Asked for, for example at standby: the entities keep their state. Only a lost
         // connection makes them unavailable.
         self.close(ctx);
-        self.set_status(DeviceStatus::Disconnected);
+        // A pairing error stays until the next connect request or a change of pairing, address
+        // or device ids.
+        if self.status != DeviceStatus::AuthError {
+            self.set_status(DeviceStatus::Disconnected);
+        }
     }
 }
 
@@ -1766,6 +1949,9 @@ impl Handler<UpdateConfig> for AppleTvActor {
             self.lost_connection(ctx);
             self.attempts = 0;
             self.connect(ctx);
+        } else if reconnect && self.status == DeviceStatus::AuthError {
+            // The new configuration may work. The next connect request tries it.
+            self.set_status(DeviceStatus::Disconnected);
         }
     }
 }
@@ -2071,6 +2257,22 @@ mod tests {
         tx.send_modify(|n| *n += 1);
         assert!(wait(Some(0)).await.is_ok(), "stop after the epoch");
         assert!(wait(None).await.is_err(), "a short run cannot be stopped");
+    }
+
+    #[test]
+    fn ip_prefers_companion() {
+        let addr = |s: &str| Some(s.parse::<SocketAddr>().unwrap());
+        let ep = Endpoints {
+            companion: addr("10.0.0.2:49153"),
+            airplay: addr("10.0.0.3:7000"),
+        };
+        assert_eq!(ip(ep), Some("10.0.0.2".parse().unwrap()));
+        let ep = Endpoints {
+            companion: None,
+            ..ep
+        };
+        assert_eq!(ip(ep), Some("10.0.0.3".parse().unwrap()));
+        assert_eq!(ip(Endpoints::default()), None);
     }
 
     #[test]

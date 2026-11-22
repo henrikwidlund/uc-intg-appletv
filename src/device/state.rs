@@ -133,7 +133,8 @@ pub struct Snapshot {
     pub connected: bool,
     /// MRP is connected: needed for volume and the full now playing.
     pub mrp: bool,
-    /// Siri can be used with the connected protocols and the Siri mode. Set at connect.
+    /// Siri can be used with the connected protocols and the Siri mode. Set at connect and when a
+    /// protocol closes.
     pub siri: bool,
     pub power: Power,
     pub name: String,

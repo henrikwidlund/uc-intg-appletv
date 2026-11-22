@@ -7,6 +7,7 @@
 use crate::config_store::{
     DeviceConfig, DriverSettings, SiriMode, backup_json, device_key, parse_backup,
 };
+use crate::controller::devices::Trigger;
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
 use crate::device::{UpdateConfig, discovery};
@@ -241,7 +242,7 @@ impl Controller {
         }
         if !self.devices.is_empty() {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
-            self.connect_devices();
+            self.update_connections(Trigger::Change);
         }
     }
 
@@ -981,7 +982,7 @@ impl Controller {
             let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         if matches!(self.machine.state(), operation_mode::State::Running) {
-            self.connect_devices();
+            self.update_connections(Trigger::Change);
         }
         let state = if error.is_none() {
             IntegrationSetupState::Ok

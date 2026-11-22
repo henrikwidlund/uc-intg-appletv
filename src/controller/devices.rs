@@ -90,6 +90,31 @@ pub(super) struct Device {
     pub cfg: DeviceConfig,
     pub addr: Addr<AppleTvActor>,
     pub status: DeviceStatus,
+    /// An awake Remote uses the device. Set by [`Controller::update_connections`].
+    pub wanted: bool,
+}
+
+/// What made [`Controller::update_connections`] run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trigger {
+    /// A Remote woke up: connect each used device, also when it was used before. This also
+    /// tries a device with a pairing error again.
+    Wake,
+    /// A Remote went to sleep or left: disconnect each device that is not used.
+    Sleep,
+    /// Subscriptions or the setup changed: send only where the need changed. A connect that a
+    /// command started for a device that is not used is not stopped.
+    Change,
+}
+
+/// The message to send to a device: `Some(true)` for Connect, `Some(false)` for Disconnect.
+const fn connection_message(want: bool, was_wanted: bool, trigger: Trigger) -> Option<bool> {
+    let changed = want != was_wanted;
+    match (want, trigger) {
+        (true, Trigger::Wake) | (false, Trigger::Sleep) => Some(want),
+        _ if changed => Some(want),
+        _ => None,
+    }
 }
 
 impl Controller {
@@ -113,6 +138,7 @@ impl Controller {
                 cfg,
                 addr,
                 status: DeviceStatus::Disconnected,
+                wanted: false,
             },
         );
     }
@@ -242,20 +268,7 @@ impl Controller {
                 self.send_entity_change(ws_id, &change);
             }
         }
-        // Connect each device once.
-        let Some(session) = self.sessions.get(ws_id) else {
-            return;
-        };
-        for (key, device) in &self.devices {
-            if all
-                || session
-                    .subscribed_entities
-                    .iter()
-                    .any(|id| is_of_device(id, key))
-            {
-                device.addr.do_send(Connect);
-            }
-        }
+        self.update_connections(Trigger::Change);
     }
 
     /// Unsubscribe entities. No ids means all entities.
@@ -281,30 +294,33 @@ impl Controller {
                 session.subscribed_entities.remove(id);
             }
         }
-        // Disconnect devices without subscribed entities.
-        for (key, device) in &self.devices {
-            let used = self.sessions.values().any(|s| {
-                s.subscribe_all || s.subscribed_entities.iter().any(|id| is_of_device(id, key))
-            });
-            if !used {
-                debug!(
-                    "[{}] no subscribed entities, disconnecting",
-                    device.cfg.name
-                );
-                device.addr.do_send(Disconnect);
+        self.update_connections(Trigger::Change);
+    }
+
+    /// Store in [`Device::wanted`] which devices an awake Remote subscribed to, and send Connect
+    /// or Disconnect as `trigger` says, see [`connection_message`].
+    /// Call it after each change that can change which devices an awake Remote uses.
+    pub(super) fn update_connections(&mut self, trigger: Trigger) {
+        for (key, device) in &mut self.devices {
+            let want = self.sessions.values().any(|s| s.awake() && s.uses(key));
+            let message = connection_message(want, device.wanted, trigger);
+            device.wanted = want;
+            match message {
+                Some(true) => device.addr.do_send(Connect),
+                Some(false) => {
+                    if matches!(
+                        device.status,
+                        DeviceStatus::Connecting | DeviceStatus::Connected
+                    ) {
+                        debug!(
+                            "[{}] not used by an awake Remote, disconnecting",
+                            device.cfg.name
+                        );
+                    }
+                    device.addr.do_send(Disconnect);
+                }
+                None => {}
             }
-        }
-    }
-
-    pub(super) fn connect_devices(&self) {
-        for device in self.devices.values() {
-            device.addr.do_send(Connect);
-        }
-    }
-
-    pub(super) fn disconnect_devices(&self) {
-        for device in self.devices.values() {
-            device.addr.do_send(Disconnect);
         }
     }
 
@@ -323,6 +339,16 @@ impl Controller {
             Ok(v) => v,
             Err(e) => return_fut_err!(e),
         };
+        // The Remote subscribes the entities it uses. The command still runs: the device
+        // connects for it.
+        if let Some((key, _)) = EntityKind::parse(&command.entity_id)
+            && !self.sessions.values().any(|s| s.uses(key))
+        {
+            warn!(
+                "command for {}, but no Remote subscribed an entity of this device",
+                command.entity_id
+            );
+        }
         let (addr, kind) = addr;
         if kind.entity_type() != command.entity_type {
             return_fut_err!(ServiceError::BadRequest(format!(
@@ -555,7 +581,7 @@ fn stamp_first_position(attrs: &mut Map<String, Value>) {
 }
 
 /// The entity belongs to the device with this key.
-fn is_of_device(entity_id: &str, key: &str) -> bool {
+pub(super) fn is_of_device(entity_id: &str, key: &str) -> bool {
     EntityKind::parse(entity_id).is_some_and(|(k, _)| k == key)
 }
 
@@ -695,6 +721,36 @@ mod tests {
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn connection_message_rules() {
+        use Trigger::{Change, Sleep, Wake};
+        // (want, was_wanted, trigger, message)
+        let cases = [
+            (true, false, Change, Some(true)),
+            (false, true, Change, Some(false)),
+            // No change: a connect started by a command is not stopped.
+            (false, false, Change, None),
+            (true, true, Change, None),
+            // Wake connects again, for example after a pairing error.
+            (true, true, Wake, Some(true)),
+            (true, false, Wake, Some(true)),
+            (false, false, Wake, None),
+            (false, true, Wake, Some(false)),
+            // Sleep disconnects also a device that a command connected.
+            (false, false, Sleep, Some(false)),
+            (false, true, Sleep, Some(false)),
+            (true, true, Sleep, None),
+            (true, false, Sleep, Some(true)),
+        ];
+        for (want, was, trigger, expected) in cases {
+            assert_eq!(
+                connection_message(want, was, trigger),
+                expected,
+                "{want} {was} {trigger:?}"
+            );
+        }
     }
 
     #[test]
