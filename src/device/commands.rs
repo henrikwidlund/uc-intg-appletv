@@ -351,12 +351,59 @@ fn next_language<'a>(
     options.get(next)
 }
 
-/// Run the calls in order. Stops at the first error.
-pub async fn exec_all(tv: &AppleTv, calls: Vec<Call>) -> Result<(), ratv::Error> {
-    for call in calls {
-        exec(tv, call).await?;
+impl Call {
+    /// The call sends one message to the device, so after [`ratv::Error::Closed`] nothing of it
+    /// was sent. Presses, holds and calls that try another way after an error send more.
+    pub const fn one_message(&self) -> bool {
+        match self {
+            Self::Seek(_)
+            | Self::Mute(_)
+            | Self::Repeat(_)
+            | Self::Shuffle(_)
+            | Self::LaunchApp(_)
+            | Self::SetOutputs(_)
+            | Self::PlayQueueItem(_)
+            | Self::EnableLanguage(_)
+            | Self::DisableSubtitles
+            | Self::Like
+            | Self::Dislike
+            | Self::SwitchAccount(..)
+            | Self::PlaybackRate(_) => true,
+            Self::Volume(_, others) => others.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+/// Error of a run of calls.
+#[derive(Debug)]
+pub struct RunError {
+    pub error: ratv::Error,
+    /// Nothing of the run was sent, so it can be sent again.
+    pub unsent: bool,
+}
+
+/// Run the calls in order. Stops at the first error. On error, `unsent` is `true` only if
+/// the first call failed and sent nothing (see [`not_sent`]).
+pub async fn exec_all(tv: &AppleTv, calls: Vec<Call>) -> Result<(), RunError> {
+    for (i, call) in calls.into_iter().enumerate() {
+        let one_message = call.one_message();
+        if let Err(error) = exec(tv, call).await {
+            let unsent = i == 0 && not_sent(&error, one_message);
+            return Err(RunError { error, unsent });
+        }
     }
     Ok(())
+}
+
+/// Nothing of a call was sent: it had no connection, or the connection was closed before its
+/// only message was sent.
+const fn not_sent(e: &ratv::Error, one_message: bool) -> bool {
+    match e {
+        ratv::Error::NotConnected(_) => true,
+        ratv::Error::Closed => one_message,
+        _ => false,
+    }
 }
 
 /// Run one call.
@@ -442,6 +489,37 @@ mod tests {
             p.plan(a, &mut out).expect("plan");
         }
         out
+    }
+
+    #[test]
+    fn only_surely_unsent_runs_are_sent_again() {
+        let closed = ratv::Error::Closed;
+        assert!(not_sent(&ratv::Error::NotConnected("MRP"), false));
+        assert!(not_sent(&closed, true));
+        assert!(
+            !not_sent(&closed, false),
+            "a press can have sent its key down"
+        );
+        for e in [
+            ratv::Error::Disconnected,
+            ratv::Error::SendTimeout("x"),
+            ratv::Error::QueueFull,
+            ratv::Error::NoAnswer("x"),
+        ] {
+            assert!(!not_sent(&e, true), "{e}");
+        }
+        assert!(Call::LaunchApp("app".into()).one_message());
+        assert!(Call::Volume(0.5, Vec::new()).one_message());
+        assert!(!Call::Volume(0.5, vec!["uid".into()]).one_message());
+        for call in [
+            Call::Press(Key::Select),
+            Call::TurnOn,
+            Call::PlayPause,
+            Call::Next,
+            Call::NextChapter,
+        ] {
+            assert!(!call.one_message(), "{call:?}");
+        }
     }
 
     #[test]

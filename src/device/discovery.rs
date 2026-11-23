@@ -5,7 +5,7 @@
 
 use crate::config_store::DeviceConfig;
 use log::{debug, info};
-use ratv::discovery::{Device, MDNS_PORT, ScanOptions, ServiceKind, scan, scan_until};
+use ratv::discovery::{Address, Device, MDNS_PORT, ScanOptions, ServiceKind, scan, scan_until};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -60,14 +60,39 @@ pub async fn scan_apple_tvs(address: Option<IpAddr>) -> Result<Vec<Device>, ratv
 
     let mut unicast = options.clone();
     unicast.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
-    let mut devices = scan(&unicast).await?;
+    let mut devices = scan_address(&unicast, ip).await?;
     if devices.is_empty() {
         info!("no answer from {ip}, scanning the network");
-        devices = scan_until(&options, |d| d.addresses.contains(&ip) && has_endpoints(d)).await?;
-        devices.retain(|d| d.addresses.contains(&ip));
+        let has_ip = |d: &Device| d.addresses.iter().any(|a| a.ip == ip);
+        devices = scan_until(&options, |d| has_ip(d) && has_endpoints(d)).await?;
+        devices.retain(has_ip);
     }
     devices.retain(is_apple_tv);
     Ok(devices)
+}
+
+/// Returns `true` for errors that come while the network of the Remote starts, for example after wake-up.
+pub fn network_not_ready(e: &ratv::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e,
+        ratv::Error::Io(io) if matches!(
+            io.kind(),
+            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::NetworkDown
+        )
+    )
+}
+
+/// Ask one address. An error that is not [`network_not_ready`] gives an empty list, so the
+/// caller scans the network. The scan socket cannot send to some addresses, for example IPv6.
+async fn scan_address(options: &ScanOptions, ip: IpAddr) -> Result<Vec<Device>, ratv::Error> {
+    match scan(options).await {
+        Err(e) if !network_not_ready(&e) => {
+            debug!("scan of {ip} failed: {e}");
+            Ok(Vec::new())
+        }
+        r => r,
+    }
 }
 
 /// Find a configured Apple TV.
@@ -79,7 +104,7 @@ pub async fn find(cfg: &DeviceConfig) -> Result<Option<Device>, ratv::Error> {
         let mut options = ScanOptions::default();
         options.timeout = UNICAST_TIMEOUT;
         options.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
-        if let Some(device) = scan(&options)
+        if let Some(device) = scan_address(&options, ip)
             .await?
             .into_iter()
             .find(|d| cfg.matches(device_ids(d)))
@@ -132,9 +157,9 @@ pub fn update_config(cfg: &mut DeviceConfig, device: &Device) -> bool {
 }
 
 /// The address to store, if the device does not have the stored one anymore.
-fn new_address(stored: Option<IpAddr>, found: &[IpAddr]) -> Option<IpAddr> {
-    let first = found.first().copied()?;
-    (!stored.is_some_and(|a| found.contains(&a))).then_some(first)
+fn new_address(stored: Option<IpAddr>, found: &[Address]) -> Option<IpAddr> {
+    let first = found.first()?.ip;
+    (!stored.is_some_and(|a| found.iter().any(|f| f.ip == a))).then_some(first)
 }
 
 /// Add the ids that are not known yet and return them. Known ids are kept: a scan may not see
@@ -184,6 +209,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn network_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(network_not_ready(
+            &Error::from(ErrorKind::NetworkUnreachable).into()
+        ));
+        assert!(network_not_ready(
+            &Error::from(ErrorKind::HostUnreachable).into()
+        ));
+        assert!(!network_not_ready(
+            &Error::from(ErrorKind::ConnectionRefused).into()
+        ));
+        assert!(!network_not_ready(&ratv::Error::Timeout));
+    }
+
+    #[test]
     fn merge_keeps_known_ids() {
         let mut known = vec!["a".to_string(), "b".to_string()];
         assert_eq!(0, merge_ids(&mut known, ["b"].into_iter()).count());
@@ -199,10 +239,11 @@ mod tests {
         let a: IpAddr = "192.0.2.6".parse().expect("ip");
         let b: IpAddr = "192.0.2.7".parse().expect("ip");
         let v6: IpAddr = "fe80::1".parse().expect("ip");
-        assert_eq!(None, new_address(Some(a), &[b, a]));
+        let found = |ips: &[IpAddr]| ips.iter().map(|&ip| Address::from(ip)).collect::<Vec<_>>();
+        assert_eq!(None, new_address(Some(a), &found(&[b, a])));
         assert_eq!(None, new_address(Some(a), &[]));
-        assert_eq!(Some(b), new_address(Some(a), &[b, v6]));
-        assert_eq!(Some(b), new_address(None, &[b]));
+        assert_eq!(Some(b), new_address(Some(a), &found(&[b, v6])));
+        assert_eq!(Some(b), new_address(None, &found(&[b])));
     }
 
     #[test]

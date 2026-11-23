@@ -51,6 +51,12 @@ impl DeviceContext {
     }
 }
 
+/// The pairing does not work with the device at this address: the device rejected the
+/// credentials, or another device has the address. Pair again or find the device again.
+pub const fn pairing_not_valid(e: &ratv::Error) -> bool {
+    e.is_auth() || e.is_other_device()
+}
+
 /// Current time in MRP time, for playback positions.
 pub fn now() -> f64 {
     ratv::mrp::cocoa_time(std::time::SystemTime::now())

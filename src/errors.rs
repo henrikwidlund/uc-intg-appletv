@@ -87,8 +87,11 @@ impl From<ratv::Error> for ServiceError {
     fn from(e: ratv::Error) -> Self {
         match e {
             ratv::Error::NotConnected(p) => Self::ServiceUnavailable(format!("{p} not connected")),
-            ratv::Error::Disconnected => Self::NotConnected,
-            ratv::Error::Timeout | ratv::Error::NoAnswer(_) => Self::Timeout,
+            ratv::Error::Disconnected | ratv::Error::Closed => Self::NotConnected,
+            // `SendTimeout`: the device does not read, so it is counted like no answer.
+            ratv::Error::Timeout | ratv::Error::NoAnswer(_) | ratv::Error::SendTimeout(_) => {
+                Self::Timeout
+            }
             ratv::Error::InvalidArgument(a) => Self::BadRequest(a.into()),
             ratv::Error::NoTextField | ratv::Error::NoChapter => Self::BadRequest(e.to_string()),
             // Refusals, or no volume control on the device. Mapped to `NotSupported`, which is
@@ -120,6 +123,19 @@ mod tests {
 
     fn io(kind: ErrorKind) -> ratv::Error {
         ratv::Error::Io(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn closed_and_send_timeout() {
+        for e in [ratv::Error::Closed, ratv::Error::Disconnected] {
+            assert_eq!(ServiceError::NotConnected, e.into());
+        }
+        for e in [
+            ratv::Error::SendTimeout("press"),
+            ratv::Error::NoAnswer("x"),
+        ] {
+            assert_eq!(ServiceError::Timeout, e.into());
+        }
     }
 
     #[test]

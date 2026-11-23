@@ -32,7 +32,7 @@ async fn endpoints(address: IpAddr) -> Result<Endpoints, Fail> {
     let devices = scan(&options).await?;
     let device = devices
         .iter()
-        .find(|d| d.addresses.contains(&address))
+        .find(|d| d.addresses.iter().any(|a| a.ip == address))
         .ok_or_else(|| Fail::new(format!("no Apple TV answers at {address}")))?;
     Ok(Endpoints::from(device))
 }
@@ -98,18 +98,18 @@ impl Oracle {
         Ok(companion.power_state().await?)
     }
 
-    pub fn now_playing(&self) -> Option<NowPlaying> {
-        self.tv.now_playing().map(|rx| rx.borrow().clone())
+    pub fn now_playing(&self) -> NowPlaying {
+        self.tv.now_playing().borrow().clone()
     }
 
     /// Playback state, without a copy of now playing.
     pub fn playback_state(&self) -> Option<PlaybackState> {
-        self.tv.now_playing().and_then(|rx| rx.borrow().state)
+        self.tv.now_playing().borrow().state
     }
 
     /// Playback rate, without a copy of now playing.
     pub fn rate(&self) -> Option<f32> {
-        self.tv.now_playing().and_then(|rx| rx.borrow().rate)
+        self.tv.now_playing().borrow().rate
     }
 
     /// True if now playing has an item: item metadata, an artwork id, an artwork URL or image
@@ -120,7 +120,7 @@ impl Oracle {
         if !self.tv.is_open(Protocol::Mrp) {
             return None;
         }
-        let rx = self.tv.now_playing()?;
+        let rx = self.tv.now_playing();
         let np = rx.borrow();
         let text = |v: &Option<String>| v.as_deref().is_some_and(|t| !t.is_empty());
         let item = [
@@ -146,7 +146,7 @@ impl Oracle {
         if !self.tv.is_open(Protocol::Mrp) {
             return None;
         }
-        let rx = self.tv.now_playing()?;
+        let rx = self.tv.now_playing();
         let np = rx.borrow();
         Some((np.audio_languages.len(), np.subtitle_languages.len()))
     }
@@ -154,14 +154,12 @@ impl Oracle {
     /// True if the Apple TV sets the live flag. This is only the device flag, not the rule of
     /// the `is_live` sensor of the driver.
     pub fn is_live(&self) -> bool {
-        self.tv
-            .now_playing()
-            .is_some_and(|rx| rx.borrow().is_live == Some(true))
+        self.tv.now_playing().borrow().is_live == Some(true)
     }
 
     /// Name of the app that plays, without a copy of now playing.
     pub fn playing_app(&self) -> Option<&str> {
-        let rx = self.tv.now_playing()?;
+        let rx = self.tv.now_playing();
         let np = rx.borrow();
         self.app_name(np.app.as_deref()?)
     }

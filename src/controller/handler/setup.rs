@@ -10,7 +10,7 @@ use crate::config_store::{
 use crate::controller::devices::{Trigger, sort_configs};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, SendWsMessage, operation_mode, response_text};
-use crate::device::{DeviceCache, SiriModeChanged, discovery};
+use crate::device::{DeviceCache, SiriModeChanged, discovery, pairing_not_valid};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -69,7 +69,7 @@ impl Found {
             id: device.identifier()?.to_string(),
             name: device.name().to_string(),
             model: device.model().unwrap_or_default().to_string(),
-            address: device.addresses.first().copied(),
+            address: device.addresses.first().map(|a| a.ip),
             endpoints: Endpoints::from(device),
             known_ids: discovery::device_ids(device).map(str::to_string).collect(),
         })
@@ -830,7 +830,9 @@ impl Controller {
                         found.id.clone_from(&cfg.id);
                         found.name.clone_from(&cfg.name);
                         if cfg.manual_address
-                            && cfg.address.is_some_and(|a| device.addresses.contains(&a))
+                            && cfg
+                                .address
+                                .is_some_and(|a| device.addresses.iter().any(|f| f.ip == a))
                         {
                             found.address = cfg.address;
                         }
@@ -1405,10 +1407,12 @@ fn parse_bool(values: &HashMap<String, String>, key: &str, default: bool) -> boo
 
 fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
     match e {
-        e if e.is_auth() => IntegrationSetupError::AuthorizationError,
+        e if pairing_not_valid(e) => IntegrationSetupError::AuthorizationError,
         ratv::Error::PairingStep { source, .. } => setup_error(source),
         ratv::Error::Hap(_) => IntegrationSetupError::AuthorizationError,
-        ratv::Error::Timeout | ratv::Error::NoAnswer(_) => IntegrationSetupError::Timeout,
+        ratv::Error::Timeout | ratv::Error::NoAnswer(_) | ratv::Error::SendTimeout(_) => {
+            IntegrationSetupError::Timeout
+        }
         ratv::Error::Io(_) | ratv::Error::NoEndpoints => IntegrationSetupError::ConnectionRefused,
         _ => IntegrationSetupError::Other,
     }
@@ -1417,6 +1421,17 @@ fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_error_timeouts() {
+        for e in [
+            ratv::Error::Timeout,
+            ratv::Error::NoAnswer("x"),
+            ratv::Error::SendTimeout("x"),
+        ] {
+            assert_eq!(IntegrationSetupError::Timeout, setup_error(&e), "{e}");
+        }
+    }
 
     #[test]
     fn addresses() {

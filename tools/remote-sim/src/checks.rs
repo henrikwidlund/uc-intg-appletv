@@ -528,9 +528,7 @@ fn volume_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
 fn now_playing_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
     let c = &ctx.client;
     let mp = ctx.mp();
-    let Some(np) = oracle.now_playing() else {
-        return;
-    };
+    let np = oracle.now_playing();
     let shown = c.text(&mp, "media_title");
     if let Some(title) = np.title.as_deref().filter(|t| !t.is_empty())
         && !shown.contains(title)

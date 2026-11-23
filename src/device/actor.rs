@@ -5,17 +5,19 @@
 
 use crate::config_store::{DeviceConfig, SiriMode, fnv1a};
 use crate::device::commands::{Call, Planner, Seek, exec_all};
+use crate::device::discovery::network_not_ready;
 use crate::device::state::{
     ARTWORK_SIZE, AccountInfo, AppInfo, Dirty, ItemArtwork, Power, Snapshot,
 };
 use crate::device::{
     AudioChunk, Browse, Command, Connect, DeviceContext, DeviceEvent, DeviceStatus, Disconnect,
-    SiriModeChanged, Stop, UpdateConfig, browse, discovery, now,
+    SiriModeChanged, Stop, UpdateConfig, browse, discovery, now, pairing_not_valid,
 };
 use crate::entities::{self, EntityKind, media_player, remote, select};
 use crate::errors::ServiceError;
 use actix::prelude::*;
 use bytes::Bytes;
+use futures::future::Either;
 use futures::{Stream, StreamExt};
 use log::{Level, debug, info, log_enabled, warn};
 use ratv::companion::{AttentionState, Event};
@@ -51,6 +53,9 @@ const NOT_READY_RETRY: [Duration; 3] = [
 /// A command is dropped when it waited longer than this for the connect or for the command
 /// before it. The user does not expect it any more.
 const COMMAND_MAX_WAIT: Duration = Duration::from_secs(10);
+/// Wait before a command that was not sent is sent again, so that the actor has seen the closed
+/// connection first.
+const SEND_AGAIN_DELAY: Duration = Duration::from_millis(200);
 /// Longest wait for a running connect before a command runs. Also limits the wait for the MRP
 /// join.
 const CONNECT_WAIT: Duration = COMMAND_MAX_WAIT;
@@ -518,7 +523,7 @@ impl AppleTvActor {
                         let _ = tv.close().await;
                     });
                 }
-                Err(ConnectError::Failed(e)) if e.is_auth() => {
+                Err(ConnectError::Failed(e)) if pairing_not_valid(&e) => {
                     act.endpoints = None;
                     warn!(
                         "[{}] pairing is not valid anymore, pair again: {e}",
@@ -535,10 +540,10 @@ impl AppleTvActor {
                         ConnectError::Failed(e) => {
                             warn!("[{}] connect failed: {e}", act.cfg.name);
                         }
-                        ConnectError::NotFound { auth_failed } => {
+                        ConnectError::NotFound { pairing_failed } => {
                             info!("[{}] not found on the network", act.cfg.name);
                             // The device at the last endpoints may be another one.
-                            if auth_failed {
+                            if pairing_failed {
                                 act.endpoints = None;
                             }
                         }
@@ -615,14 +620,13 @@ impl AppleTvActor {
             }
         }
 
-        if let Some(rx) = tv.now_playing() {
-            let h = spawn_stream(
-                ctx,
-                changes(rx.clone(), WatchChanged::NowPlaying(generation)),
-            );
-            replace_handle(ctx, &mut self.timers.now_playing, h);
-            self.np = Some(rx);
-        }
+        let rx = tv.now_playing();
+        let h = spawn_stream(
+            ctx,
+            changes(rx.clone(), WatchChanged::NowPlaying(generation)),
+        );
+        replace_handle(ctx, &mut self.timers.now_playing, h);
+        self.np = Some(rx);
         // `volume()` also returns the channel of a closed MRP client.
         if let Some(rx) = tv.volume().filter(|_| tv.is_open(Protocol::Mrp)) {
             let h = spawn_stream(ctx, changes(rx.clone(), WatchChanged::Volume(generation)));
@@ -1064,7 +1068,7 @@ impl AppleTvActor {
                     match result {
                         Err(e) if network_not_ready(&e) => act.missing_network_retry(ctx),
                         // Retries cannot fix the pairing. The next connect tries again.
-                        Err(e) if e.is_auth() => act.stop_missing(&e, joined, ctx),
+                        Err(e) if pairing_not_valid(&e) => act.stop_missing(&e, joined, ctx),
                         Err(e) => {
                             act.missing_network_end = None;
                             // `mrp_join_failed` has logged it.
@@ -1132,7 +1136,7 @@ impl AppleTvActor {
         });
     }
 
-    /// Stop connecting the missing protocols after an auth error. Retries cannot fix the
+    /// Stop connecting the missing protocols after a pairing error. Retries cannot fix the
     /// pairing. The next connect tries again. With `joined`, `mrp_join_failed` has logged it.
     fn stop_missing(&mut self, e: &ratv::Error, joined: bool, ctx: &mut Context<Self>) {
         self.missing_network_end = None;
@@ -2009,9 +2013,9 @@ impl AppleTvActor {
 
 /// Why a connect failed.
 enum ConnectError {
-    /// The scan did not find the device. `auth_failed`: the last endpoints gave an auth error.
+    /// The scan did not find the device. `pairing_failed`: the last endpoints gave a pairing error.
     NotFound {
-        auth_failed: bool,
+        pairing_failed: bool,
     },
     Failed(ratv::Error),
 }
@@ -2035,9 +2039,9 @@ async fn connect_device(
     mut cfg: DeviceConfig,
     options: ClientOptions,
 ) -> (Option<DeviceConfig>, ConnectResult) {
-    // An auth error at the last address can come from another device that has this
+    // A pairing error at the last address can come from another device that has this
     // address now. Then the scan below finds the device by its ids.
-    let mut auth_failed_at = None;
+    let mut pairing_failed_at = None;
     if let Some(ep) = known {
         match connect_endpoints(ep, &cfg.credentials, &options).await {
             Ok((tv, join_mrp)) => {
@@ -2045,9 +2049,9 @@ async fn connect_device(
                 let join = join_mrp.then_some(ep);
                 return (None, Ok(Connected { tv, ep, via, join }));
             }
-            Err(e) if e.is_auth() => {
+            Err(e) if pairing_not_valid(&e) => {
                 debug!("[{}] last endpoints failed, scanning: {e}", cfg.name);
-                auth_failed_at = Some((ep, e));
+                pairing_failed_at = Some((ep, e));
             }
             // A scan fails the same way.
             Err(e) if network_not_ready(&e) => return (None, Err(ConnectError::Failed(e))),
@@ -2057,14 +2061,14 @@ async fn connect_device(
     let device = match discovery::find(&cfg).await {
         Ok(Some(d)) => d,
         Ok(None) => {
-            let auth_failed = auth_failed_at.is_some();
-            return (None, Err(ConnectError::NotFound { auth_failed }));
+            let pairing_failed = pairing_failed_at.is_some();
+            return (None, Err(ConnectError::NotFound { pairing_failed }));
         }
         Err(e) => return (None, Err(ConnectError::Failed(e))),
     };
     let changed = discovery::update_config(&mut cfg, &device);
     let ep = Endpoints::from(&device);
-    if let Some((old, e)) = auth_failed_at {
+    if let Some((old, e)) = pairing_failed_at {
         // Same address: the device itself refused the pairing. A second connect fails the same way.
         if ip(ep) == ip(old) {
             return (changed.then_some(cfg), Err(ConnectError::Failed(e)));
@@ -2569,17 +2573,40 @@ impl AppleTvActor {
         } else {
             Some(Self::parse(&msg)?)
         };
-        // The core can send a command before `exit_standby`.
-        if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
-            debug!("[{}] command while disconnected, connecting", self.cfg.name);
-            self.start_connect(ctx);
-        }
+        self.connect_for_command(ctx);
         let Some(run) = run else {
             return match msg.cmd_id.as_str() {
                 "voice_start" => self.voice_start(msg.params.as_ref(), ctx),
                 _ => Err(ServiceError::NotSupported(msg.cmd_id)),
             };
         };
+        // `stop_send` stops only long remote runs, so a single press is never lost.
+        let epoch = (msg.kind == EntityKind::Remote && run.is_long()).then(|| *self.stop.borrow());
+        let start = Start {
+            queued: Instant::now(),
+            epoch,
+            again: false,
+        };
+        self.start_run(msg, run, start, ctx)
+    }
+
+    /// Start a connect for a command if there is no connection. The core can send a command
+    /// before `exit_standby`.
+    fn connect_for_command(&mut self, ctx: &mut Context<Self>) {
+        if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
+            debug!("[{}] command while disconnected, connecting", self.cfg.name);
+            self.start_connect(ctx);
+        }
+    }
+
+    /// Run a checked command in the background, after the connect and the command before.
+    fn start_run(
+        &self,
+        msg: Command,
+        run: remote::RemoteRun,
+        start: Start,
+        ctx: &mut Context<Self>,
+    ) -> Result<(), ServiceError> {
         // A command can come right after the Remote wakes up, while the connect still runs.
         let connecting = self.running_connect();
         if self.tv.is_none() && connecting.is_none() {
@@ -2587,9 +2614,6 @@ impl AppleTvActor {
         }
         // The Remote core waits at most 10 s for the answer, so the command runs in the
         // background. Later errors are only logged.
-        // `stop_send` stops only long remote runs, so a single press is never lost.
-        let epoch = (msg.kind == EntityKind::Remote && run.is_long()).then(|| *self.stop.borrow());
-        let queued = Instant::now();
         // Plan after the command before has ended, so toggles see its result.
         let lock = self.cmd_lock.clone();
         let fut = async move {
@@ -2598,22 +2622,171 @@ impl AppleTvActor {
         }
         .into_actor(self)
         .then(move |guard, act, _| {
-            let skip = if epoch.is_some_and(|e| *act.stop.borrow() != e) {
-                Some("stopped by stop_send")
-            } else if queued.elapsed() > COMMAND_MAX_WAIT {
-                Some("waited too long")
-            } else {
-                None
-            };
-            if let Some(reason) = skip {
+            if let Some(reason) = act.skip_reason(start) {
                 info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
-                return fut::ready(()).boxed_local();
+                return Either::Left(fut::ready(()));
             }
-            act.run_command(&msg, &run, guard, epoch).boxed_local()
+            let generation = act.generation;
+            Either::Right(
+                act.run_command(&msg, &run, guard, start)
+                    .then(move |end, act, _| match end.first_error {
+                        None => Either::Left(fut::ready(())),
+                        // The lock is kept, so a later command cannot run before this one.
+                        Some(e) => {
+                            Either::Right(act.send_again(msg, run, start, generation, e, end.guard))
+                        }
+                    }),
+            )
         });
         ctx.spawn(fut);
         Ok(())
     }
+
+    /// Why a command is not sent now, if it is not.
+    fn skip_reason(&self, start: Start) -> Option<Skip> {
+        if start.epoch.is_some_and(|e| *self.stop.borrow() != e) {
+            Some(Skip::Stopped)
+        } else if start.queued.elapsed() > COMMAND_MAX_WAIT {
+            Some(Skip::TooLate)
+        } else {
+            None
+        }
+    }
+
+    /// Send a command once more that was not sent, holding `guard`. It waits
+    /// [`SEND_AGAIN_DELAY`], so that the actor has seen the closed connection, and then for the
+    /// reconnect. Only a new connection can help: without a connect and with the handle of the
+    /// first try (`generation`), it is not sent again. `error` is the error of the first try,
+    /// for the log.
+    fn send_again(
+        &self,
+        msg: Command,
+        run: remote::RemoteRun,
+        start: Start,
+        generation: u64,
+        error: ServiceError,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> fut::LocalBoxActorFuture<Self, ()> {
+        let start = Start {
+            again: true,
+            ..start
+        };
+        tokio::time::sleep(SEND_AGAIN_DELAY)
+            .into_actor(self)
+            .then(move |(), act, ctx| {
+                // A `Disconnect` came: the Remote does not want the device now.
+                if !act.want {
+                    warn!(
+                        "[{}] {} failed: {error} (device disconnected)",
+                        act.cfg.name, msg.cmd_id
+                    );
+                    return fut::ready(()).boxed_local();
+                }
+                act.connect_for_command(ctx);
+                let connecting = act.running_connect();
+                if connecting.is_none() {
+                    // No connect starts after a pairing error.
+                    if act.tv.is_none() {
+                        let e = not_connected(act.status);
+                        warn!("[{}] {} failed: {e}", act.cfg.name, msg.cmd_id);
+                        return fut::ready(()).boxed_local();
+                    }
+                    if act.generation == generation {
+                        warn!(
+                            "[{}] {} failed: {error} (no new connection)",
+                            act.cfg.name, msg.cmd_id
+                        );
+                        return fut::ready(()).boxed_local();
+                    }
+                }
+                info!("[{}] {} not sent, sending again", act.cfg.name, msg.cmd_id);
+                async move { connect_ended(connecting, JoinWait::Deadline).await }
+                    .into_actor(act)
+                    .then(move |(), act, _| {
+                        match act.skip_reason(start) {
+                            // The user asked for the stop, so it is no failure.
+                            Some(reason @ Skip::Stopped) => {
+                                info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
+                                return fut::ready(()).boxed_local();
+                            }
+                            Some(reason @ Skip::TooLate) => {
+                                warn!(
+                                    "[{}] {} failed: {error} ({reason})",
+                                    act.cfg.name, msg.cmd_id
+                                );
+                                return fut::ready(()).boxed_local();
+                            }
+                            None => {}
+                        }
+                        act.run_command(&msg, &run, guard, start)
+                            .map(|_, _, _| ())
+                            .boxed_local()
+                    })
+                    .boxed_local()
+            })
+            .boxed_local()
+    }
+
+    /// Log the error of a command. `send_again`: it is sent once more, so it is only info.
+    fn log_failure(&self, cmd_id: &str, e: &ServiceError, send_again: bool) {
+        match e {
+            // The device refused it in its current state, or the item is gone, for example
+            // from Up Next. The user cannot fix it on the Remote.
+            ServiceError::NotSupported(_)
+            | ServiceError::BadRequest(_)
+            | ServiceError::NotFound(_) => {
+                info!("[{}] {cmd_id} not run: {e}", self.cfg.name);
+            }
+            _ if send_again => info!("[{}] {cmd_id} failed: {e}", self.cfg.name),
+            _ => warn!("[{}] {cmd_id} failed: {e}", self.cfg.name),
+        }
+    }
+}
+
+/// End of a command run.
+struct RunEnd {
+    /// Error of a first try of which nothing was sent, if there is time left to send it once
+    /// more.
+    first_error: Option<ServiceError>,
+    /// The command lock. Kept while the command is sent again.
+    guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Why a command is not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    Stopped,
+    TooLate,
+}
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stopped => "stopped by stop_send",
+            Self::TooLate => "waited too long",
+        })
+    }
+}
+
+/// A protocol that the handle has no client for (`missing`) comes back only with a connect.
+/// On the handle of the first try (`same_handle`) and without an MRP join, none runs now, so
+/// sending again cannot help.
+const fn stays_missing(missing: bool, same_handle: bool, joining: bool) -> bool {
+    missing && same_handle && !joining
+}
+
+/// Send a first try of which nothing was sent (`unsent`) once more, if a new connection can
+/// help and `waited` since the key press is less than [`COMMAND_MAX_WAIT`].
+fn sends_again(unsent: bool, stays_missing: bool, start: Start, waited: Duration) -> bool {
+    unsent && !stays_missing && !start.again && waited < COMMAND_MAX_WAIT
+}
+
+/// When a command was queued, its `stop_send` epoch, and whether it is sent again.
+#[derive(Clone, Copy)]
+struct Start {
+    queued: Instant,
+    epoch: Option<u64>,
+    again: bool,
 }
 
 /// Error text for a Siri session whose connect failed on the pairing. `None` keeps the text of
@@ -2677,19 +2850,25 @@ impl Expect {
 }
 
 impl AppleTvActor {
-    /// Plan and run a command. `guard` is held until the results are applied. A `stop_send`
-    /// after `epoch` stops the run; without `epoch` the run cannot be stopped.
+    /// Plan and run a command. `guard` is held until the results are applied, and is returned.
+    /// A `stop_send` after `start.epoch` stops the run; without it the run cannot be stopped.
+    /// Sets [`RunEnd::first_error`] if nothing of a first try was sent (no connection, or see
+    /// [`exec_all`]), a new connection can help and there is time left. That error is then
+    /// logged at info, not warn.
     fn run_command(
         &mut self,
         msg: &Command,
         run: &remote::RemoteRun,
         guard: tokio::sync::OwnedMutexGuard<()>,
-        epoch: Option<u64>,
-    ) -> impl ActorFuture<Self, Output = ()> + use<> {
+        start: Start,
+    ) -> impl ActorFuture<Self, Output = RunEnd> + use<> {
+        let epoch = start.epoch;
         let generation = self.generation;
         // The power state comes from Companion, so an MRP join keeps the expected power.
         let companion_gen = self.companion_gen;
         let stop = self.stop.subscribe();
+        // Without a connection nothing was sent. A pairing error needs a new pairing.
+        let no_tv = self.tv.is_none() && self.status != DeviceStatus::AuthError;
         // Plan only when connected: the plan changes the seek state.
         let prepared = self
             .tv
@@ -2711,68 +2890,78 @@ impl AppleTvActor {
             Err(_) => Expect::default(),
         };
         let fut = async move {
-            let result = match prepared {
+            // `missing`: the handle has no client for the protocol of the call.
+            let (result, unsent, missing) = match prepared {
                 // Dropping the run releases held keys.
                 Ok((tv, calls)) => tokio::select! {
-                    r = exec_all(&tv, calls) => r.map_err(ServiceError::from).map(|()| true),
-                    () = stopped(stop, epoch) => Ok(false),
+                    r = exec_all(&tv, calls) => match r {
+                        Ok(()) => (Ok(true), false, false),
+                        Err(e) => {
+                            let missing = matches!(e.error, ratv::Error::NotConnected(_));
+                            (Err(ServiceError::from(e.error)), e.unsent, missing)
+                        }
+                    },
+                    () = stopped(stop, epoch) => (Ok(false), false, false),
                 },
-                Err(e) => Err(e),
+                Err(e) => (Err(e), no_tv, false),
             };
-            (result, guard)
+            (result, unsent, missing, guard)
         };
         let cmd_id = msg.cmd_id.clone();
-        fut.into_actor(self).map(move |(result, _guard), act, ctx| {
-            let result = match result {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    info!("[{}] {cmd_id} stopped by stop_send", act.cfg.name);
-                    // The device state after a partial run is not known.
-                    Err(ServiceError::ServiceUnavailable("stopped".into()))
-                }
-                Err(e) => {
-                    match &e {
-                        // The device refused it in its current state, or the item is gone,
-                        // for example from Up Next. The user cannot fix it on the Remote.
-                        ServiceError::NotSupported(_)
-                        | ServiceError::BadRequest(_)
-                        | ServiceError::NotFound(_) => {
-                            info!("[{}] {cmd_id} not run: {e}", act.cfg.name);
-                        }
-                        _ => warn!("[{}] {cmd_id} failed: {e}", act.cfg.name),
+        fut.into_actor(self)
+            .map(move |(result, unsent, missing, guard), act, ctx| {
+                let stays_missing = stays_missing(
+                    missing,
+                    act.generation == generation && act.tv.is_some(),
+                    act.joining(),
+                );
+                let send_again = sends_again(unsent, stays_missing, start, start.queued.elapsed());
+                let result = match result {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        info!("[{}] {cmd_id} stopped by stop_send", act.cfg.name);
+                        // The device state after a partial run is not known.
+                        Err(ServiceError::ServiceUnavailable("stopped".into()))
                     }
-                    Err(e)
+                    Err(e) => {
+                        act.log_failure(&cmd_id, &e, send_again);
+                        Err(e)
+                    }
+                };
+                let ok = result.is_ok();
+                if act.generation == generation && matches!(result, Err(ServiceError::Timeout)) {
+                    act.command_timed_out(ctx);
                 }
-            };
-            let ok = result.is_ok();
-            if act.generation == generation && matches!(result, Err(ServiceError::Timeout)) {
-                act.command_timed_out(ctx);
-            }
-            if act.generation == generation {
-                // After an error the device state is not known.
-                if begins_seek && !ok {
-                    act.seek = None;
+                if act.generation == generation {
+                    // After an error the device state is not known.
+                    if begins_seek && !ok {
+                        act.seek = None;
+                    }
+                    if mute.is_some() {
+                        act.expected_mute = mute.filter(|_| ok);
+                    }
                 }
-                if mute.is_some() {
-                    act.expected_mute = mute.filter(|_| ok);
+                if act.companion_gen == companion_gen && power.is_some() {
+                    act.expected_power = power.filter(|_| ok);
                 }
-            }
-            if act.companion_gen == companion_gen && power.is_some() {
-                act.expected_power = power.filter(|_| ok);
-            }
-            if !ok {
-                return;
-            }
-            if let Some(name) = account {
-                act.s.current_account = Some(name);
-                act.emit(Dirty::ACCOUNTS);
-            }
-            if let Some(id) = launched {
-                act.s.launched_app = Some(id);
-                act.launched_at = Some(Instant::now());
-                act.emit(Dirty::APP);
-            }
-        })
+                if !ok {
+                    let first_error = result.err().filter(|_| send_again);
+                    return RunEnd { first_error, guard };
+                }
+                if let Some(name) = account {
+                    act.s.current_account = Some(name);
+                    act.emit(Dirty::ACCOUNTS);
+                }
+                if let Some(id) = launched {
+                    act.s.launched_app = Some(id);
+                    act.launched_at = Some(Instant::now());
+                    act.emit(Dirty::APP);
+                }
+                RunEnd {
+                    first_error: None,
+                    guard,
+                }
+            })
     }
 }
 
@@ -2844,18 +3033,6 @@ fn http_base(
         Some(socket.local_addr().ok()?.ip())
     })?;
     Some(format!("http://{}", SocketAddr::new(ip, port)))
-}
-
-/// Returns `true` for errors that come while the network of the Remote starts, for example after wake-up.
-fn network_not_ready(e: &ratv::Error) -> bool {
-    use std::io::ErrorKind;
-    matches!(
-        e,
-        ratv::Error::Io(io) if matches!(
-            io.kind(),
-            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::NetworkDown
-        )
-    )
 }
 
 #[cfg(test)]
@@ -3273,6 +3450,72 @@ mod tests {
     }
 
     #[test]
+    fn retry_decision() {
+        let start = Start {
+            queued: Instant::now(),
+            epoch: None,
+            again: false,
+        };
+        let again = Start {
+            again: true,
+            ..start
+        };
+        let soon = Duration::from_secs(1);
+        assert!(sends_again(true, false, start, soon));
+        assert!(
+            !sends_again(false, false, start, soon),
+            "something was sent"
+        );
+        assert!(
+            !sends_again(true, true, start, soon),
+            "protocol stays missing"
+        );
+        assert!(!sends_again(true, false, again, soon), "only once");
+        assert!(
+            !sends_again(true, false, start, COMMAND_MAX_WAIT),
+            "too late"
+        );
+
+        assert!(stays_missing(true, true, false));
+        assert!(!stays_missing(false, true, false), "not a missing protocol");
+        assert!(!stays_missing(true, false, false), "new handle");
+        assert!(!stays_missing(true, true, true), "MRP join runs");
+    }
+
+    /// A command without a connection waits to be sent again and holds the command lock.
+    /// `Disconnect` ends the wait and frees the lock.
+    #[actix::test]
+    async fn unsent_command_keeps_lock_until_disconnect_ends_it() {
+        let actor = idle_actor("send-again", None);
+        let free = || {
+            actor.send(Run(|act: &mut AppleTvActor| {
+                act.cmd_lock.clone().try_lock_owned().is_ok()
+            }))
+        };
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connecting);
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        actor.send(Disconnect).await.unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY / 2).await;
+        assert!(
+            !free().await.unwrap(),
+            "lock held while waiting to send again"
+        );
+        tokio::time::sleep(SEND_AGAIN_DELAY * 2).await;
+        assert!(free().await.unwrap(), "lock released after Disconnect");
+    }
+
+    #[test]
     fn parse_checks_parameters_without_state() {
         let run = AppleTvActor::parse(&command(
             EntityKind::Remote,
@@ -3530,21 +3773,6 @@ mod tests {
         assert_eq!(merge_endpoints(old, found), found);
         // Nothing found before.
         assert_eq!(merge_endpoints(Endpoints::default(), found), found);
-    }
-
-    #[test]
-    fn network_errors() {
-        use std::io::{Error, ErrorKind};
-        assert!(network_not_ready(
-            &Error::from(ErrorKind::NetworkUnreachable).into()
-        ));
-        assert!(network_not_ready(
-            &Error::from(ErrorKind::HostUnreachable).into()
-        ));
-        assert!(!network_not_ready(
-            &Error::from(ErrorKind::ConnectionRefused).into()
-        ));
-        assert!(!network_not_ready(&ratv::Error::Timeout));
     }
 
     #[test]
