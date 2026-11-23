@@ -681,7 +681,7 @@ impl Controller {
             session.subscribed_entities.clear();
             session.stale.clear();
         }
-        // The cache files of the old devices are queued for removal. Start with empty lists.
+        // The old actors delete their cache files when they stop. Start with empty lists.
         for cfg in devices {
             self.add_device(cfg, DeviceCache::default(), ctx);
         }
@@ -1312,8 +1312,8 @@ mod tests {
         assert_eq!(None, parse_address(None).expect("ok"));
         assert_eq!(None, parse_address(Some(" ")).expect("ok"));
         assert_eq!(
-            Some(IpAddr::from([10, 0, 0, 2])),
-            parse_address(Some("10.0.0.2")).expect("ok")
+            Some(IpAddr::from([192, 0, 2, 2])),
+            parse_address(Some("192.0.2.2")).expect("ok")
         );
         assert!(parse_address(Some("tv.local")).is_err());
     }
@@ -1354,7 +1354,9 @@ mod tests {
         use crate::config_store::{ConfigStore, DeviceConfig, backup_json};
         use crate::controller::handler::AbortDriverSetup;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-        use crate::controller::test_util::{connect, controller, test_dir};
+        use crate::controller::test_util::{
+            DeviceAddr, connect, controller, test_dir, wait_stopped,
+        };
         use crate::controller::{Controller, R2SessionDisconnect};
         use crate::entities::EntityKind;
         use actix::{Addr, Context, Handler, Message};
@@ -1612,6 +1614,11 @@ mod tests {
             );
 
             // A restore removes the cache file and does not use it.
+            let old = controller
+                .send(DeviceAddr(cfg.key.clone()))
+                .await
+                .expect("send")
+                .expect("actor");
             start_setup(&controller, &events, "a", false).await;
             let before = setup_events(&events);
             controller
@@ -1629,6 +1636,8 @@ mod tests {
             let event = wait_stop(&events).await;
             assert_eq!(json!("OK"), event["state"]);
             assert_eq!(json!([]), source_list(&controller, &cfg.key).await);
+            // The old actor deletes the file when it stops.
+            wait_stopped(&controller, &old).await;
             assert!(!cache.exists());
             assert_eq!(1, config_len(name));
             let _ = std::fs::remove_dir_all(&dir);

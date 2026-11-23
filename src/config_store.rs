@@ -199,14 +199,17 @@ impl SiriMode {
     }
 }
 
-/// Load the driver settings. A missing or broken file gives the defaults.
+/// Load the driver settings. A missing file gives the defaults.
 ///
-/// It is a free function, because the logger needs the settings before the store exists.
-pub fn load_settings(dir: &Path) -> DriverSettings {
-    read_json(&dir.join(SETTINGS_FILE))
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+/// It is a free function, because the logger needs the settings before the store exists. So the
+/// caller logs the error of a file that cannot be read or parsed, and uses the defaults.
+pub fn load_settings(dir: &Path) -> io::Result<DriverSettings> {
+    let path = dir.join(SETTINGS_FILE);
+    let e = match read_json(&path) {
+        Ok(settings) => return Ok(settings.unwrap_or_default()),
+        Err(e) => e,
+    };
+    Err(io::Error::new(e.kind(), read_error_text(&path, &e)))
 }
 
 /// Reads and writes the configuration files.
@@ -226,38 +229,25 @@ impl ConfigStore {
 
     /// Load the configured devices. A missing file gives an empty list.
     ///
-    /// A broken file is moved to `config.json.bad-<unix time>`, so the next save does not
-    /// overwrite it.
+    /// A file that cannot be read or parsed is moved to `config.json.bad-<unix time>`, so the next
+    /// save does not overwrite it.
     pub fn load_devices(&self) -> Vec<DeviceConfig> {
         self.writer.flush();
         let path = self.dir.join(CONFIG_FILE);
-        match read_json(&path) {
-            Ok(Some(devices)) => devices,
-            Ok(None) => Vec::new(),
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                let secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                let bad = self.dir.join(format!("{CONFIG_FILE}.bad-{secs}"));
-                match fs::rename(&path, &bad) {
-                    Ok(()) => error!(
-                        "Invalid {}: {e}. The file was moved to {}",
-                        path.display(),
-                        bad.display()
-                    ),
-                    Err(re) => error!(
-                        "Invalid {}: {e}. Could not move the file to {}: {re}",
-                        path.display(),
-                        bad.display()
-                    ),
-                }
-                Vec::new()
-            }
-            Err(e) => {
-                error!("Error reading {}: {e}", path.display());
-                Vec::new()
-            }
+        let e = match read_json(&path) {
+            Ok(devices) => return devices.unwrap_or_default(),
+            Err(e) => e,
+        };
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let bad = self.dir.join(format!("{CONFIG_FILE}.bad-{secs}"));
+        let msg = read_error_text(&path, &e);
+        match fs::rename(&path, &bad) {
+            Ok(()) => error!("{msg}. The file was moved to {}", bad.display()),
+            Err(re) => error!("{msg}. Could not move the file to {}: {re}", bad.display()),
         }
+        Vec::new()
     }
 
     /// Queue the save of the configured devices. The write runs on the writer thread: the caller
@@ -308,6 +298,12 @@ impl ConfigStore {
     /// Delete the cache of a device.
     pub fn remove_cache(&self, key: &str) {
         self.writer.send(Job::Remove(self.cache_path(key)));
+    }
+
+    /// Wait for the queued jobs.
+    #[cfg(test)]
+    pub fn flush(&self) {
+        self.writer.flush();
     }
 
     fn cache_path(&self, key: &str) -> PathBuf {
@@ -469,6 +465,25 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     }
 }
 
+/// Text of a failed read. A parse error gives only its class and position, because serde
+/// messages can quote values of the file, for example credentials.
+fn read_error_text(path: &Path, e: &io::Error) -> String {
+    e.get_ref()
+        .and_then(|i| i.downcast_ref::<serde_json::Error>())
+        .map_or_else(
+            || format!("Error reading {}: {e}", path.display()),
+            |j| {
+                format!(
+                    "Invalid {}: {:?} error at line {} column {}",
+                    path.display(),
+                    j.classify(),
+                    j.line(),
+                    j.column()
+                )
+            },
+        )
+}
+
 fn write_file(
     path: &Path,
     data: &[u8],
@@ -521,7 +536,7 @@ pub(crate) mod tests {
             key: device_key("AA:BB:CC:DD:EE:FF"),
             name: "Living Room".into(),
             known_ids: vec!["AA:BB:CC:DD:EE:00".into(), "UUID-1".into()],
-            address: Some("10.0.30.6".parse().expect("ip")),
+            address: Some("192.0.2.6".parse().expect("ip")),
             manual_address: false,
             credentials: CREDS.parse().expect("credentials"),
             global_volume: true,
@@ -578,7 +593,10 @@ pub(crate) mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("dir");
-        assert_eq!(DriverSettings::default(), load_settings(&dir));
+        assert_eq!(
+            DriverSettings::default(),
+            load_settings(&dir).expect("defaults")
+        );
 
         let store = ConfigStore::new(&dir);
         let settings = DriverSettings {
@@ -587,11 +605,17 @@ pub(crate) mod tests {
         };
         store.save_settings(settings).expect("save");
         store.writer.flush();
-        assert_eq!(settings, load_settings(&dir));
+        assert_eq!(settings, load_settings(&dir).expect("settings"));
 
-        // A broken file gives the defaults.
+        // A broken file gives an error that names the file.
         fs::write(dir.join(SETTINGS_FILE), b"{").expect("write");
-        assert_eq!(DriverSettings::default(), load_settings(&dir));
+        let e = load_settings(&dir).expect_err("broken");
+        assert_eq!(io::ErrorKind::InvalidData, e.kind());
+        assert!(e.to_string().contains(SETTINGS_FILE));
+        // The error does not quote the file.
+        fs::write(dir.join(SETTINGS_FILE), br#"{"siri_mode":"quoted-value"}"#).expect("write");
+        let e = load_settings(&dir).expect_err("unknown mode");
+        assert!(!e.to_string().contains("quoted-value"), "{e}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -695,6 +719,70 @@ pub(crate) mod tests {
             b"{broken".as_slice(),
             fs::read(bad[0].path()).expect("read")
         );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A read error other than a missing file also moves the file, here a directory.
+    #[test]
+    fn unreadable_config_is_moved() {
+        let dir = std::env::temp_dir().join(format!(
+            "uc-intg-appletv-test-unreadable-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(CONFIG_FILE)).expect("dir");
+        let store = ConfigStore::new(&dir);
+        assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
+        assert!(!dir.join(CONFIG_FILE).exists());
+
+        let bad: Vec<_> = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad-")
+            })
+            .collect();
+        assert_eq!(1, bad.len());
+        assert!(bad[0].path().is_dir());
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A parse error of the configuration does not quote the values of the file.
+    #[test]
+    fn config_error_text_has_no_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "uc-intg-appletv-test-quoted-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join(CONFIG_FILE);
+        let text = br#"[{"id":"x","key":"x","name":"x","global_volume":"secret-marker"}]"#;
+        fs::write(&path, text).expect("write");
+
+        let e = read_json::<Vec<DeviceConfig>>(&path).expect_err("wrong type");
+        assert!(e.to_string().contains("secret-marker"), "serde quotes it");
+        let msg = read_error_text(&path, &e);
+        assert!(!msg.contains("secret-marker"), "{msg}");
+        assert!(msg.contains(CONFIG_FILE) && msg.contains("line 1"), "{msg}");
+
+        let store = ConfigStore::new(&dir);
+        assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
+        assert!(!path.exists());
+        let bad = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad-")
+            })
+            .expect("moved");
+        assert_eq!(text.as_slice(), fs::read(bad.path()).expect("read"));
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }

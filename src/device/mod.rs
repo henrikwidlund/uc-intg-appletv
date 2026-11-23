@@ -100,7 +100,16 @@ pub struct Disconnect;
 /// Disconnect and stop the actor.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
-pub struct Stop;
+pub struct Stop {
+    /// Delete the cache file when the actor stops, after its last save.
+    pub remove_cache: bool,
+}
+
+/// Save the cache file now.
+#[cfg(test)]
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct SaveCacheNow;
 
 /// New configuration of the device.
 #[derive(Debug, Message)]

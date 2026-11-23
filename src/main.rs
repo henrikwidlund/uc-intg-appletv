@@ -34,8 +34,12 @@ use uc_api::util::text_from_language_map;
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     let settings = Settings::from_env();
-    let driver_settings = config_store::load_settings(&settings.config_home);
+    let loaded = config_store::load_settings(&settings.config_home);
+    let driver_settings = loaded.as_ref().copied().unwrap_or_default();
     logging::init(driver_settings.debug_log);
+    if let Err(e) = &loaded {
+        error!("{e}. Using the default settings");
+    }
     info!("Starting {} {APP_VERSION}", built_info::PKG_NAME);
     if driver_settings.debug_log && !logging::env_filter() {
         info!("Debug log is on");

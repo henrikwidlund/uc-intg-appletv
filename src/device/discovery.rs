@@ -196,8 +196,8 @@ mod tests {
 
     #[test]
     fn address_changes_only_when_gone() {
-        let a: IpAddr = "10.0.30.6".parse().expect("ip");
-        let b: IpAddr = "10.0.30.7".parse().expect("ip");
+        let a: IpAddr = "192.0.2.6".parse().expect("ip");
+        let b: IpAddr = "192.0.2.7".parse().expect("ip");
         let v6: IpAddr = "fe80::1".parse().expect("ip");
         assert_eq!(None, new_address(Some(a), &[b, a]));
         assert_eq!(None, new_address(Some(a), &[]));

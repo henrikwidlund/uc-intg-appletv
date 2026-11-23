@@ -53,32 +53,38 @@ impl Serialize for Picked<'_> {
     }
 }
 
-/// `entity_change` event, the same as [`WsMessage::event`] gives.
+/// Event, the same as [`WsMessage::event`] gives. Borrows the data, so that it is not copied to
+/// serialize it.
 #[derive(Serialize)]
-struct EntityChangeEvent<T> {
+struct EventRef<'a, T> {
     kind: &'static str,
-    msg: &'static str,
+    msg: &'a str,
     cat: EventCategory,
     ts: jiff::Timestamp,
     msg_data: T,
 }
 
-/// Serialize an `entity_change` event once, to send it to each Remote.
-fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
-    let event = EntityChangeEvent {
+/// Serialize an event once, to send it to each Remote.
+fn event_text<T: Serialize>(msg: &str, cat: EventCategory, data: T) -> Option<ByteString> {
+    let event = EventRef {
         kind: "event",
-        msg: "entity_change",
-        cat: EventCategory::Entity,
+        msg,
+        cat,
         ts: jiff::Timestamp::now(),
         msg_data: data,
     };
     match serde_json::to_string(&event) {
         Ok(text) => Some(text.into()),
         Err(e) => {
-            warn!("entity_change serialize error: {e}");
+            warn!("{msg} serialize error: {e}");
             None
         }
     }
+}
+
+/// Serialize an `entity_change` event once, to send it to each Remote.
+fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
+    event_text("entity_change", EventCategory::Entity, data)
 }
 
 /// A voice command failed: forget the voice session.
@@ -136,8 +142,11 @@ impl Controller {
         )
         .start();
         // Remove first: `insert` keeps the old key, and events are matched by the key instance.
+        // The new actor uses the same cache file.
         if let Some(old) = self.devices.remove(&*key) {
-            old.addr.do_send(Stop);
+            old.addr.do_send(Stop {
+                remove_cache: false,
+            });
         }
         self.devices.insert(
             key,
@@ -157,14 +166,16 @@ impl Controller {
             .is_some_and(|(k, _)| Arc::ptr_eq(k, key))
     }
 
-    /// Stop the actor of a device and forget its entities.
+    /// Stop the actor of a device and forget its entities. The actor deletes the cache file when
+    /// it stops, so the delete comes after its last save. If the driver stops before the actor
+    /// handles `Stop`, the cache file stays. It is overwritten when the same device is configured
+    /// again.
     pub(super) fn remove_device(&mut self, key: &str) -> Option<DeviceConfig> {
         let device = self.devices.remove(key)?;
-        device.addr.do_send(Stop);
+        device.addr.do_send(Stop { remove_cache: true });
         self.entities
             .retain(|id, _| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
         self.voice_sessions.retain(|_, k| &**k != key);
-        self.store.remove_cache(key);
         // The removed device might have had an error.
         self.update_device_state();
         Some(device.cfg)
@@ -488,10 +499,16 @@ impl Controller {
         }
     }
 
-    /// Send an event to all Remotes.
-    fn broadcast(&self, msg_name: &str, category: EventCategory, data: &Value) {
-        for ws_id in self.sessions.keys() {
-            self.send_r2_msg(ws_id, WsMessage::event(msg_name, category, data.clone()));
+    /// Send an event to all Remotes that are not in standby. The event is serialized once.
+    fn broadcast<T: Serialize>(&self, msg: &str, cat: EventCategory, data: T) {
+        if self.sessions.values().all(|s| s.standby) {
+            return;
+        }
+        let Some(text) = event_text(msg, cat, data) else {
+            return;
+        };
+        for (ws_id, session) in &self.sessions {
+            Self::send_to_session(ws_id, session, SendWsMessage::Text(text.clone()));
         }
     }
 
@@ -550,7 +567,6 @@ impl Controller {
             .sessions
             .iter()
             .filter(|(_, s)| !s.standby && s.wants(entity_id))
-            .map(|(ws_id, _)| &**ws_id)
             .peekable();
         let Some(cache) = self.entities.get(entity_id) else {
             return;
@@ -565,8 +581,8 @@ impl Controller {
         }) else {
             return;
         };
-        for target in targets {
-            self.send_r2_msg(target, SendWsMessage::Text(text.clone()));
+        for (ws_id, session) in targets {
+            Self::send_to_session(ws_id, session, SendWsMessage::Text(text.clone()));
         }
     }
 
@@ -723,10 +739,7 @@ impl Handler<DeviceEvent> for Controller {
                 {
                     self.voice_sessions.remove(session_id);
                 }
-                match serde_json::to_value(event) {
-                    Ok(data) => self.broadcast("assistant_event", EventCategory::Entity, &data),
-                    Err(e) => warn!("assistant_event serialize error: {e}"),
-                }
+                self.broadcast("assistant_event", EventCategory::Entity, &event);
             }
         }
     }
@@ -921,6 +934,27 @@ mod tests {
     }
 
     #[test]
+    fn event_text_matches_ws_message() {
+        let event = AssistantEvent::Finished {
+            entity_id: "voice_assistant.x".into(),
+            session_id: 4,
+        };
+        let text = event_text("assistant_event", EventCategory::Entity, &event).expect("text");
+        let mut own: Value = serde_json::from_str(&text).expect("json");
+        let data = serde_json::to_value(&event).expect("json");
+        let mut expected = serde_json::to_value(WsMessage::event(
+            "assistant_event",
+            EventCategory::Entity,
+            data,
+        ))
+        .expect("json");
+        assert!(own["ts"].is_string());
+        own.as_object_mut().expect("object").remove("ts");
+        expected.as_object_mut().expect("object").remove("ts");
+        assert_eq!(expected, own);
+    }
+
+    #[test]
     fn entity_change_text_has_only_the_keys() {
         let cache = map(json!({ "state": "ON", "media_title": "Song" }));
         let keys = ["media_title".to_string()];
@@ -942,5 +976,74 @@ mod tests {
             json!({ "entity_type": "media_player", "entity_id": "media_player.x", "attributes": { "media_title": "Song" } }),
             v["msg_data"]
         );
+    }
+
+    mod cache {
+        use crate::config_store::ConfigStore;
+        use crate::config_store::tests::device;
+        use crate::controller::Controller;
+        use crate::controller::test_util::{DeviceAddr, controller, test_dir, wait_stopped};
+        use crate::device::{DeviceCache, SaveCacheNow};
+        use actix::{Context, Handler, Message};
+
+        /// Queue a cache save in the actor, then remove the device or start a new actor for it.
+        /// The save waits in the mailbox of the actor until the controller is done.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct SaveThenStop {
+            remove: bool,
+        }
+
+        impl Handler<SaveThenStop> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: SaveThenStop, ctx: &mut Context<Self>) {
+                let cfg = device();
+                let device = self.devices.get(cfg.key.as_str()).expect("device");
+                device.addr.do_send(SaveCacheNow);
+                if msg.remove {
+                    self.remove_device(&cfg.key);
+                } else {
+                    self.add_device(cfg, DeviceCache::default(), ctx);
+                }
+            }
+        }
+
+        /// Run [`SaveThenStop`] and return `true` if the cache file exists at the end.
+        async fn cache_exists_after(name: &str, remove: bool) -> bool {
+            let dir = test_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let cfg = device();
+            ConfigStore::new(&dir)
+                .save_devices(std::slice::from_ref(&cfg))
+                .expect("save")
+                .wait()
+                .await
+                .expect("write");
+            let controller = controller(name);
+            let actor = controller
+                .send(DeviceAddr(cfg.key.clone()))
+                .await
+                .expect("send")
+                .expect("actor");
+            controller
+                .send(SaveThenStop { remove })
+                .await
+                .expect("send");
+            wait_stopped(&controller, &actor).await;
+            let exists = dir.join(format!("cache_{}.json", cfg.key)).exists();
+            let _ = std::fs::remove_dir_all(&dir);
+            exists
+        }
+
+        #[actix::test]
+        async fn removed_device_has_no_cache_after_a_late_save() {
+            assert!(!cache_exists_after("cache-remove", true).await);
+        }
+
+        #[actix::test]
+        async fn replaced_device_keeps_the_cache() {
+            assert!(cache_exists_after("cache-replace", false).await);
+        }
     }
 }

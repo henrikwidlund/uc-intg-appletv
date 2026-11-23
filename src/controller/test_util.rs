@@ -7,6 +7,7 @@
 use crate::config_store::DriverSettings;
 use crate::configuration::{HeartbeatSettings, Settings};
 use crate::controller::{Controller, NewR2Session, SendWsMessage};
+use crate::device::AppleTvActor;
 use crate::server::ArtworkStore;
 use actix::{Actor, Addr, Context, Handler, Message};
 use serde_json::{Value, json};
@@ -45,6 +46,42 @@ impl Handler<Probe> for Remote {
 impl Handler<Probe> for Controller {
     type Result = ();
     fn handle(&mut self, _: Probe, _: &mut Context<Self>) {}
+}
+
+/// The actor of the device with this key.
+#[derive(Message)]
+#[rtype(result = "Option<Addr<AppleTvActor>>")]
+pub(crate) struct DeviceAddr(pub String);
+
+impl Handler<DeviceAddr> for Controller {
+    type Result = Option<Addr<AppleTvActor>>;
+    fn handle(&mut self, msg: DeviceAddr, _: &mut Context<Self>) -> Self::Result {
+        self.devices.get(msg.0.as_str()).map(|d| d.addr.clone())
+    }
+}
+
+/// Answer when the store has done all queued file jobs.
+#[derive(Message)]
+#[rtype(result = "()")]
+struct FlushStore;
+
+impl Handler<FlushStore> for Controller {
+    type Result = ();
+    fn handle(&mut self, _: FlushStore, _: &mut Context<Self>) {
+        self.store.flush();
+    }
+}
+
+/// Wait until the actor has stopped, then until the store has done all queued file jobs.
+pub(crate) async fn wait_stopped(controller: &Addr<Controller>, actor: &Addr<AppleTvActor>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while actor.connected() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor stopped");
+    controller.send(FlushStore).await.expect("send");
 }
 
 /// A connected test Remote. Derefs to the list of received messages.

@@ -218,21 +218,25 @@ impl Controller {
     /// Send a WebSocket message to a Remote. Messages are dropped while the Remote is in standby.
     fn send_r2_msg(&self, ws_id: &str, message: impl Into<SendWsMessage>) {
         if let Some(session) = self.sessions.get(ws_id) {
-            let message = message.into();
-            if session.standby {
-                if let SendWsMessage::Msg(m) = &message {
-                    debug!(
-                        "[{ws_id}] Remote is in standby, not sending message: {:?}",
-                        m.msg
-                    );
-                }
-                return;
-            }
-            if let Err(e) = session.recipient.try_send(message) {
-                error!("[{ws_id}] Internal message send error: {e}");
-            }
+            Self::send_to_session(ws_id, session, message.into());
         } else {
             warn!("Attempting to send message but couldn't find session: {ws_id}");
+        }
+    }
+
+    /// [`Self::send_r2_msg`] for a session that the caller found already.
+    fn send_to_session(ws_id: &str, session: &R2Session, message: SendWsMessage) {
+        if session.standby {
+            if let SendWsMessage::Msg(m) = &message {
+                debug!(
+                    "[{ws_id}] Remote is in standby, not sending message: {:?}",
+                    m.msg
+                );
+            }
+            return;
+        }
+        if let Err(e) = session.recipient.try_send(message) {
+            error!("[{ws_id}] Internal message send error: {e}");
         }
     }
 
@@ -615,6 +619,38 @@ mod tests {
             let event = position(&a, |m| m["msg"] == "assistant_event");
             assert!(reply.is_some());
             assert!(reply < event, "reply first");
+        }
+
+        #[actix::test]
+        async fn assistant_event_goes_to_each_remote() {
+            let controller = controller("assistant-broadcast");
+            let a = connect(&controller, "a").await;
+            let b = connect(&controller, "b").await;
+            let c = connect(&controller, "c").await;
+            event(&controller, "c", R2Event::EnterStandby).await;
+            controller.do_send(DeviceEvent::Assistant(AssistantEvent::Finished {
+                entity_id: "voice_assistant.x".into(),
+                session_id: 2,
+            }));
+            settle(&controller, &[&a, &b, &c]).await;
+            let events = |r: &TestRemote| -> Vec<Value> {
+                r.lock()
+                    .expect("lock")
+                    .iter()
+                    .filter(|m| m["msg"] == "assistant_event")
+                    .cloned()
+                    .collect()
+            };
+            assert!(events(&c).is_empty(), "in standby");
+            let (a, b) = (events(&a), events(&b));
+            assert_eq!(1, a.len());
+            assert_eq!(a, b, "the same text");
+            assert_eq!("event", a[0]["kind"]);
+            assert_eq!("ENTITY", a[0]["cat"]);
+            assert_eq!(
+                json!({ "type": "finished", "entity_id": "voice_assistant.x", "session_id": 2 }),
+                a[0]["msg_data"]
+            );
         }
 
         #[actix::test]

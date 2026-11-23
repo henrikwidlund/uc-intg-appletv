@@ -153,6 +153,7 @@ struct Timers {
     scan: Option<SpawnHandle>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppleTvActor {
     cfg: DeviceConfig,
     /// Incremented on each configuration change.
@@ -167,6 +168,8 @@ pub struct AppleTvActor {
     status_tx: watch::Sender<DeviceStatus>,
     /// The controller wants a connection.
     want: bool,
+    /// Delete the cache file in [`Actor::stopped`]. Set by [`Stop`].
+    remove_cache: bool,
     attempts: u32,
     /// Incremented on each connect attempt and on close. Results of older attempts are ignored.
     attempt: u64,
@@ -250,6 +253,7 @@ impl AppleTvActor {
             status: DeviceStatus::Disconnected,
             status_tx: watch::Sender::new(DeviceStatus::Disconnected),
             want: false,
+            remove_cache: false,
             attempts: 0,
             attempt: 0,
             connected_at: None,
@@ -1899,6 +1903,11 @@ impl Actor for AppleTvActor {
         }
         self.close(ctx);
         self.ctx.artwork.remove(&self.key);
+        // Messages and spawned futures do not run after this, so no save can follow the delete in
+        // the write queue.
+        if self.remove_cache {
+            self.ctx.store.remove_cache(&self.key);
+        }
     }
 }
 
@@ -1983,9 +1992,19 @@ impl Handler<Disconnect> for AppleTvActor {
 impl Handler<Stop> for AppleTvActor {
     type Result = ();
 
-    fn handle(&mut self, _: Stop, ctx: &mut Self::Context) {
+    fn handle(&mut self, msg: Stop, ctx: &mut Self::Context) {
         self.want = false;
+        self.remove_cache = msg.remove_cache;
         ctx.stop();
+    }
+}
+
+#[cfg(test)]
+impl Handler<super::SaveCacheNow> for AppleTvActor {
+    type Result = ();
+
+    fn handle(&mut self, _: super::SaveCacheNow, _: &mut Self::Context) {
+        self.save_cache();
     }
 }
 
@@ -2408,15 +2427,15 @@ mod tests {
     fn ip_prefers_companion() {
         let addr = |s: &str| Some(s.parse::<SocketAddr>().unwrap());
         let ep = Endpoints {
-            companion: addr("10.0.0.2:49153"),
-            airplay: addr("10.0.0.3:7000"),
+            companion: addr("192.0.2.2:49153"),
+            airplay: addr("192.0.2.3:7000"),
         };
-        assert_eq!(ip(ep), Some("10.0.0.2".parse().unwrap()));
+        assert_eq!(ip(ep), Some("192.0.2.2".parse().unwrap()));
         let ep = Endpoints {
             companion: None,
             ..ep
         };
-        assert_eq!(ip(ep), Some("10.0.0.3".parse().unwrap()));
+        assert_eq!(ip(ep), Some("192.0.2.3".parse().unwrap()));
         assert_eq!(ip(Endpoints::default()), None);
     }
 
@@ -2424,25 +2443,25 @@ mod tests {
     fn merge_endpoints_keeps_missing_service() {
         let addr = |s: &str| Some(s.parse::<SocketAddr>().unwrap());
         let old = Endpoints {
-            companion: addr("10.0.0.2:49153"),
-            airplay: addr("10.0.0.2:7000"),
+            companion: addr("192.0.2.2:49153"),
+            airplay: addr("192.0.2.2:7000"),
         };
         // Companion moved to a new port.
         let found = Endpoints {
-            companion: addr("10.0.0.2:49160"),
-            airplay: addr("10.0.0.2:7000"),
+            companion: addr("192.0.2.2:49160"),
+            airplay: addr("192.0.2.2:7000"),
         };
         assert_eq!(merge_endpoints(old, found), found);
         // Companion is not listed yet: keep the old port.
         let found = Endpoints {
             companion: None,
-            airplay: addr("10.0.0.2:7000"),
+            airplay: addr("192.0.2.2:7000"),
         };
         assert_eq!(merge_endpoints(old, found), old);
         // New IP address: old ports are not valid there.
         let found = Endpoints {
             companion: None,
-            airplay: addr("10.0.0.3:7000"),
+            airplay: addr("192.0.2.3:7000"),
         };
         assert_eq!(merge_endpoints(old, found), found);
         // Nothing found before.
