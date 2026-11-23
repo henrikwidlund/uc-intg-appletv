@@ -175,8 +175,8 @@ tools/remote-sim/target/debug/remote-sim 192.168.1.20
 
 Start a video with chapters and more than one audio language before the run to also test
 playback and languages. `--only a,b` and `--skip a,b` choose the checks, `--no-power` keeps the
-Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` adds log
-targets to the driver log, for example `RUST_LOG=ratv::mrp=trace`.
+Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to
+the driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`.
 
 ratv is a git dependency with a fixed commit. To test local ratv changes, add this to
 `~/.cargo/config.toml` and remove it when you are done:

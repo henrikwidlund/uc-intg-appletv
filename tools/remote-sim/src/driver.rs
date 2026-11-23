@@ -122,8 +122,8 @@ impl Driver {
 }
 
 /// Log filter of the driver. Checks read its info and debug lines. A `RUST_LOG` of the caller
-/// is added after the default, for example `ratv::mrp=trace`. A target in it replaces the same
-/// target of the default.
+/// is added after the default, for example `ratv::mrp=trace`. A level in it for the same target,
+/// or a global level, replaces the one in the default. A `/regex` part in it filters all lines.
 fn log_filter() -> String {
     const DEFAULT: &str = "info,uc_intg_appletv=debug";
     match std::env::var("RUST_LOG") {
