@@ -86,7 +86,7 @@ const LAUNCH_GRACE: Duration = Duration::from_secs(5);
 
 /// Lists that are kept between restarts.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct DeviceCache {
+pub struct DeviceCache {
     apps: Vec<AppInfo>,
     airplay_devices: Vec<(String, String)>,
 }
@@ -203,10 +203,10 @@ impl AppleTvActor {
     pub fn new(
         key: Arc<str>,
         cfg: DeviceConfig,
+        cache: DeviceCache,
         ctx: Arc<DeviceContext>,
         controller: Recipient<DeviceEvent>,
     ) -> Self {
-        let cache: DeviceCache = ctx.store.load_cache(&cfg.key).unwrap_or_default();
         let mut s = Snapshot {
             name: cfg.name.clone(),
             global_volume: cfg.global_volume,

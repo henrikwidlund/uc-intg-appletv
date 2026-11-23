@@ -3,10 +3,11 @@
 
 //! Apple TV devices of the controller: entity states, subscriptions and commands.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, SaveWait};
 use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg, SendWsMessage};
 use crate::device::{
-    AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceEvent, DeviceStatus, Disconnect, Stop,
+    AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceCache, DeviceEvent, DeviceStatus,
+    Disconnect, Stop,
 };
 use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
@@ -118,12 +119,18 @@ const fn connection_message(want: bool, was_wanted: bool, trigger: Trigger) -> O
 }
 
 impl Controller {
-    /// Start the actor of a device.
-    pub(super) fn add_device(&mut self, cfg: DeviceConfig, ctx: &Context<Self>) {
+    /// Start the actor of a device. `cache` holds the saved lists, or empty lists.
+    pub(super) fn add_device(
+        &mut self,
+        cfg: DeviceConfig,
+        cache: DeviceCache,
+        ctx: &Context<Self>,
+    ) {
         let key: Arc<str> = cfg.key.as_str().into();
         let addr = AppleTvActor::new(
             key.clone(),
             cfg.clone(),
+            cache,
             self.device_ctx.clone(),
             ctx.address().recipient(),
         )
@@ -170,13 +177,13 @@ impl Controller {
         devices
     }
 
-    /// Save the configuration of all devices.
-    pub(super) fn save_devices(&self) -> Result<(), ServiceError> {
-        self.store.save_devices(&self.sorted_configs())?;
-        Ok(())
+    /// Save the configuration of all devices. The write is queued. The result says when it is
+    /// done.
+    pub(super) fn save_devices(&self) -> Result<SaveWait, ServiceError> {
+        Ok(self.store.save_devices(&self.sorted_configs())?)
     }
 
-    /// Save the configuration of all devices without waiting for the disk.
+    /// Queue the save of the configuration of all devices. A write error is only logged.
     fn queue_devices(&self) -> Result<(), ServiceError> {
         self.store.queue_devices(&self.sorted_configs())?;
         Ok(())

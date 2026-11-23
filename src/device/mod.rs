@@ -9,7 +9,7 @@ mod commands;
 pub mod discovery;
 pub mod state;
 
-pub use actor::AppleTvActor;
+pub use actor::{AppleTvActor, DeviceCache};
 
 use crate::config_store::{ConfigStore, DeviceConfig, SiriMode};
 use crate::entities::EntityKind;

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 
 const CONFIG_FILE: &str = "config.json";
 const SETTINGS_FILE: &str = "settings.json";
@@ -259,23 +260,24 @@ impl ConfigStore {
         }
     }
 
-    /// Save the configured devices. Waits for the write, so the caller gets write errors.
-    pub fn save_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
+    /// Queue the save of the configured devices. The write runs on the writer thread: the caller
+    /// does not wait for the disk, and gets the result from the returned [`SaveWait`]. If the
+    /// writer thread is missing, the write runs at once on this thread.
+    pub fn save_devices(&self, devices: &[DeviceConfig]) -> io::Result<SaveWait> {
         let data = serde_json::to_vec_pretty(&devices).map_err(io::Error::other)?;
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = oneshot::channel();
         self.writer.send(Job::Write {
             path: self.dir.join(CONFIG_FILE),
             data,
             private: true,
             done: Some(tx),
         });
-        rx.recv().map_err(io::Error::other)??;
-        info!("Saved configuration with {} device(s)", devices.len());
-        Ok(())
+        info!("Saving the configuration with {} device(s)", devices.len());
+        Ok(SaveWait(rx))
     }
 
-    /// Queue the save of the configured devices and return at once. A write error is only
-    /// logged. Use it where no caller waits for the result.
+    /// Queue the save of the configured devices. A write error is only logged. Use it where no
+    /// caller waits for the result.
     pub fn queue_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
         self.write_json(self.dir.join(CONFIG_FILE), devices, true)
     }
@@ -286,6 +288,9 @@ impl ConfigStore {
     }
 
     /// Load the cache of a device. A missing or broken file gives `None`.
+    ///
+    /// It waits for the queued writes and reads the file on the caller thread. Use it only at
+    /// startup.
     pub fn load_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.writer.flush();
         let path = self.cache_path(key);
@@ -327,6 +332,24 @@ impl ConfigStore {
     }
 }
 
+/// The result of a write that the writer thread does. The caller logs a write error.
+#[derive(Debug)]
+#[must_use = "wait for the write result, or the caller does not know when the write ends"]
+pub struct SaveWait(oneshot::Receiver<io::Result<()>>);
+
+impl SaveWait {
+    /// Wait for the end of the write, without blocking the thread.
+    pub async fn wait(self) -> io::Result<()> {
+        self.0.await.map_err(io::Error::other)?
+    }
+
+    /// Wait for the end of the write on this thread. For tests outside of an async runtime.
+    #[cfg(test)]
+    pub fn wait_blocking(self) -> io::Result<()> {
+        self.0.blocking_recv().map_err(io::Error::other)?
+    }
+}
+
 /// File changes for the background thread.
 #[derive(Debug)]
 enum Job {
@@ -334,8 +357,8 @@ enum Job {
         path: PathBuf,
         data: Vec<u8>,
         private: bool,
-        /// Gets the result. Without it, errors are only logged.
-        done: Option<mpsc::SyncSender<io::Result<()>>>,
+        /// Gets the result, and the receiver logs errors. Without it, errors are logged here.
+        done: Option<oneshot::Sender<io::Result<()>>>,
     },
     Remove(PathBuf),
     /// Answer when all earlier jobs are done.
@@ -352,11 +375,13 @@ impl Job {
                 done,
             } => {
                 let result = write_file(&path, &data, private);
-                if let Err(e) = &result {
+                // The receiver logs the error. Log it here if there is no receiver or it is gone.
+                let unsent = match done {
+                    Some(done) => done.send(result).err(),
+                    None => Some(result),
+                };
+                if let Some(Err(e)) = unsent {
                     error!("Error writing {}: {e}", path.display());
-                }
-                if let Some(done) = done {
-                    let _ = done.send(result);
                 }
             }
             Self::Remove(path) => {
@@ -580,7 +605,11 @@ pub(crate) mod tests {
         // A file left from a failed write must not keep its mode.
         fs::write(dir.join("config.json.tmp"), b"x").expect("tmp");
         let devices = vec![device()];
-        store.save_devices(&devices).expect("save");
+        store
+            .save_devices(&devices)
+            .expect("save")
+            .wait_blocking()
+            .expect("write");
         assert_eq!(devices, store.load_devices());
 
         store.queue_devices(&[]).expect("queue");

@@ -375,7 +375,8 @@ impl Actor for Controller {
             let _ = self.sm_consume("", &operation_mode::Input::ConfigurationAvailable, ctx);
         }
         for cfg in devices {
-            self.add_device(cfg, ctx);
+            let cache = self.store.load_cache(&cfg.key).unwrap_or_default();
+            self.add_device(cfg, cache, ctx);
         }
     }
 }

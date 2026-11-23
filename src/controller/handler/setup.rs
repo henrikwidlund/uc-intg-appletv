@@ -5,17 +5,17 @@
 //! Driver setup flow: discovery, pairing and reconfiguration.
 
 use crate::config_store::{
-    DeviceConfig, DriverSettings, SiriMode, backup_json, device_key, parse_backup,
+    DeviceConfig, DriverSettings, SaveWait, SiriMode, backup_json, device_key, parse_backup,
 };
 use crate::controller::devices::Trigger;
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, operation_mode};
-use crate::device::{UpdateConfig, discovery};
+use crate::device::{DeviceCache, UpdateConfig, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use ratv::discovery::Device;
 use ratv::{Endpoints, PairOptions, PinPrompt};
 use serde_json::{Value, json};
@@ -104,8 +104,6 @@ pub enum SetupState {
 enum InputError {
     /// Invalid input. The page is shown again with the message.
     Invalid(Box<SetupState>, String),
-    /// The setup flow ends with this error.
-    Failed(IntegrationSetupError),
 }
 
 impl Handler<SetupDriverMsg> for Controller {
@@ -192,13 +190,6 @@ impl Handler<SetDriverUserDataMsg> for Controller {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.request_input_again(&ws_id, &message, ctx);
-                    }
-                });
-            }
-            Err(InputError::Failed(error)) => {
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, Some(error), ctx);
                     }
                 });
             }
@@ -354,12 +345,8 @@ impl Controller {
                         ));
                     }
                 };
-                let error = self.configure(&key, &found, address, values).err();
-                ctx.run_later(ACK_DELAY, move |act, ctx| {
-                    if act.is_setup_flow(flow, &ws_id) {
-                        act.finish_setup(&ws_id, error, ctx);
-                    }
-                });
+                let save = self.configure(&key, &found, address, values);
+                self.finish_after_save(ws_id, save, ctx);
             }
         }
         Ok(())
@@ -399,7 +386,6 @@ impl Controller {
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) -> Result<(), InputError> {
-        let flow = self.setup_flow;
         let devices = values
             .get("restore_data")
             .and_then(|text| parse_backup(text))
@@ -408,15 +394,11 @@ impl Controller {
                 InputError::Invalid(Box::new(SetupState::Restore), RESTORE_FAILED.into())
             })?;
         info!("[{ws_id}] restoring {} device(s)", devices.len());
-        let error = self.restore_devices(devices, ctx).err().map(|e| {
+        let save = self.restore_devices(devices, ctx).map_err(|e| {
             warn!("[{ws_id}] saving the configuration failed: {e}");
             IntegrationSetupError::Other
         });
-        ctx.run_later(ACK_DELAY, move |act, ctx| {
-            if act.is_setup_flow(flow, &ws_id) {
-                act.finish_setup(&ws_id, error, ctx);
-            }
-        });
+        self.finish_after_save(ws_id, save, ctx);
         Ok(())
     }
 
@@ -500,11 +482,11 @@ impl Controller {
             "remove" => {
                 let cfg = self.forget_device(key).ok_or_else(unknown_device)?;
                 info!("[{ws_id}] removed {}", cfg.name);
-                if let Err(e) = self.save_devices() {
+                let save = self.save_devices().map_err(|e| {
                     warn!("[{ws_id}] saving the configuration failed: {e}");
-                    return Err(InputError::Failed(IntegrationSetupError::Other));
-                }
-                self.finish_setup_later(ws_id, ctx);
+                    IntegrationSetupError::Other
+                });
+                self.finish_after_save(ws_id, save, ctx);
             }
             "configure" => {
                 let cfg = self
@@ -570,6 +552,45 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// End the setup when the configuration is written, without blocking the thread. A write
+    /// error ends the setup with an error.
+    fn finish_after_save(
+        &self,
+        ws_id: String,
+        save: Result<SaveWait, IntegrationSetupError>,
+        ctx: &mut Context<Self>,
+    ) {
+        let flow = self.setup_flow;
+        ctx.spawn(
+            async move {
+                match save {
+                    Ok(wait) => Ok(wait.wait().await),
+                    Err(e) => Err(e),
+                }
+            }
+            .into_actor(self)
+            .map(move |result, _, ctx| {
+                let error = match result {
+                    Ok(Ok(())) => {
+                        info!("[{ws_id}] configuration saved");
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        error!("[{ws_id}] error writing config.json: {e}");
+                        Some(IntegrationSetupError::Other)
+                    }
+                    Err(e) => Some(e),
+                };
+                // When called from a request handler, wait so the request gets its answer first.
+                ctx.run_later(ACK_DELAY, move |act, ctx| {
+                    if act.is_setup_flow(flow, &ws_id) {
+                        act.finish_setup(&ws_id, error, ctx);
+                    }
+                });
+            }),
+        );
     }
 
     /// End the setup after the request was acknowledged.
@@ -647,7 +668,7 @@ impl Controller {
         &mut self,
         devices: Vec<DeviceConfig>,
         ctx: &Context<Self>,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<SaveWait, ServiceError> {
         let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
         for key in &keys {
             self.remove_device(key);
@@ -660,8 +681,9 @@ impl Controller {
             session.subscribed_entities.clear();
             session.stale.clear();
         }
+        // The cache files of the old devices are queued for removal. Start with empty lists.
         for cfg in devices {
-            self.add_device(cfg, ctx);
+            self.add_device(cfg, DeviceCache::default(), ctx);
         }
         self.save_devices()
     }
@@ -865,13 +887,14 @@ impl Controller {
                         device.cfg = cfg.clone();
                         device.addr.do_send(UpdateConfig(cfg));
                     } else {
-                        act.add_device(cfg, ctx);
+                        // A new device starts with empty lists.
+                        act.add_device(cfg, DeviceCache::default(), ctx);
                     }
-                    let error = act.save_devices().err().map(|e| {
+                    let save = act.save_devices().map_err(|e| {
                         warn!("[{ws_id}] saving the configuration failed: {e}");
                         IntegrationSetupError::Other
                     });
-                    act.finish_setup(&ws_id, error, ctx);
+                    act.finish_after_save(ws_id, save, ctx);
                 }),
         );
     }
@@ -883,7 +906,7 @@ impl Controller {
         found: &[Found],
         address: Option<IpAddr>,
         values: &HashMap<String, String>,
-    ) -> Result<(), IntegrationSetupError> {
+    ) -> Result<SaveWait, IntegrationSetupError> {
         let device = self
             .devices
             .get_mut(key)
@@ -1327,16 +1350,31 @@ mod tests {
     }
 
     mod flow {
-        use crate::config_store::ConfigStore;
         use crate::config_store::tests::device;
-        use crate::controller::R2SessionDisconnect;
+        use crate::config_store::{ConfigStore, DeviceConfig, backup_json};
         use crate::controller::handler::AbortDriverSetup;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::test_util::{connect, controller, test_dir};
+        use crate::controller::{Controller, R2SessionDisconnect};
+        use crate::entities::EntityKind;
+        use actix::{Addr, Context, Handler, Message};
         use serde_json::{Value, json};
+        use std::path::Path;
         use std::sync::Mutex;
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
+
+        /// Returns the attributes that the controller keeps for an entity.
+        #[derive(Message)]
+        #[rtype(result = "Option<Value>")]
+        struct EntityAttrs(String);
+
+        impl Handler<EntityAttrs> for Controller {
+            type Result = Option<Value>;
+            fn handle(&mut self, msg: EntityAttrs, _: &mut Context<Self>) -> Option<Value> {
+                self.entities.get(&msg.0).cloned().map(Value::Object)
+            }
+        }
 
         fn input(ws_id: &str, address: &str) -> SetDriverUserDataMsg {
             values(ws_id, &[("address", address)])
@@ -1443,6 +1481,159 @@ mod tests {
             ConfigStore::new(test_dir(name)).load_devices().len()
         }
 
+        /// Create an empty test directory with a configuration of `cfg`.
+        async fn config_dir(name: &str, cfg: &DeviceConfig) -> std::path::PathBuf {
+            let dir = test_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            ConfigStore::new(&dir)
+                .save_devices(std::slice::from_ref(cfg))
+                .expect("save")
+                .wait()
+                .await
+                .expect("write");
+            dir
+        }
+
+        /// Start a setup and wait for its first page.
+        async fn start_setup(
+            controller: &Addr<Controller>,
+            events: &Mutex<Vec<Value>>,
+            ws_id: &str,
+            reconfigure: bool,
+        ) {
+            let before = setup_events(events);
+            let data =
+                serde_json::from_value(json!({ "reconfigure": reconfigure, "setup_data": {} }))
+                    .expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: ws_id.into(),
+                    data,
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            wait_page(events, before).await;
+        }
+
+        /// Number of `driver_setup_change` events.
+        fn setup_events(events: &Mutex<Vec<Value>>) -> usize {
+            events
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|m| m["msg"] == "driver_setup_change")
+                .count()
+        }
+
+        /// Wait for a new setup page after `before` setup events.
+        async fn wait_page(events: &Mutex<Vec<Value>>, before: usize) {
+            for _ in 0..100 {
+                if setup_events(events) > before && last(events)["state"] == "WAIT_USER_ACTION" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no new setup page");
+        }
+
+        /// Wait for the event that ends the setup and return its data.
+        async fn wait_stop(events: &Mutex<Vec<Value>>) -> Value {
+            for _ in 0..100 {
+                let event = last(events);
+                if event["event_type"] == "STOP" {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("the setup did not end");
+        }
+
+        /// Wait until the controller keeps the media player, and return its `source_list`.
+        async fn source_list(controller: &Addr<Controller>, key: &str) -> Value {
+            let id = EntityKind::MediaPlayer.entity_id(key);
+            for _ in 0..100 {
+                if let Some(attrs) = controller
+                    .send(EntityAttrs(id.clone()))
+                    .await
+                    .expect("send")
+                {
+                    return attrs["source_list"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no media player entity");
+        }
+
+        /// A directory with the name of the temporary file makes each write fail.
+        fn break_writes(dir: &Path) {
+            std::fs::create_dir(dir.join("config.json.tmp")).expect("dir");
+        }
+
+        #[actix::test]
+        async fn failing_save_ends_the_setup_with_an_error() {
+            let name = "save-error";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+
+            start_setup(&controller, &events, "a", true).await;
+            break_writes(&dir);
+            // The request is acknowledged. The setup ends after the write.
+            controller
+                .send(values("a", &[("action", "remove"), ("choice", &cfg.key)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("ERROR"), event["state"]);
+            assert_eq!(json!("OTHER"), event["error"]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn startup_loads_the_cache_and_restore_starts_empty() {
+            let name = "load-cache";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let cache = dir.join(format!("cache_{}.json", cfg.key));
+            std::fs::write(
+                &cache,
+                r#"{"apps":[{"bundle_id":"com.example.app","name":"Cached App"}],"airplay_devices":[]}"#,
+            )
+            .expect("cache");
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            assert_eq!(
+                json!(["Cached App"]),
+                source_list(&controller, &cfg.key).await
+            );
+
+            // A restore removes the cache file and does not use it.
+            start_setup(&controller, &events, "a", false).await;
+            let before = setup_events(&events);
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, before).await;
+            let backup = backup_json(std::slice::from_ref(&cfg)).expect("backup");
+            controller
+                .send(values("a", &[("restore_data", &backup)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("OK"), event["state"]);
+            assert_eq!(json!([]), source_list(&controller, &cfg.key).await);
+            assert!(!cache.exists());
+            assert_eq!(1, config_len(name));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[actix::test]
         async fn first_setup_and_reset_keep_the_devices_until_a_device_is_paired() {
             let name = "keep-devices";
@@ -1452,7 +1643,10 @@ mod tests {
             let cfg = device();
             ConfigStore::new(&dir)
                 .save_devices(std::slice::from_ref(&cfg))
-                .expect("save");
+                .expect("save")
+                .wait()
+                .await
+                .expect("write");
             let controller = controller(name);
             let events = connect(&controller, "a").await;
 
