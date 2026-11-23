@@ -32,6 +32,8 @@ pub struct DeviceContext {
     pub client_name: String,
     /// Address of the HTTP server for the artwork route. `None` if it listens on all interfaces.
     pub http_address: Option<IpAddr>,
+    /// The HTTP server listens on `::`, so it can also be reached over IPv6.
+    pub http_ipv6: bool,
     pub http_port: u16,
     pub store: ConfigStore,
     pub artwork: ArtworkStore,
@@ -77,6 +79,8 @@ pub enum DeviceEvent {
     Config {
         key: Arc<str>,
         cfg: DeviceConfig,
+        /// Number of [`UpdateConfig`] messages the actor has handled.
+        version: u64,
     },
     Status {
         key: Arc<str>,

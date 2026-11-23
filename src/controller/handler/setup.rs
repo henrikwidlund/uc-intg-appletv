@@ -7,10 +7,10 @@
 use crate::config_store::{
     DeviceConfig, DriverSettings, SaveWait, SiriMode, backup_json, device_key, parse_backup,
 };
-use crate::controller::devices::Trigger;
+use crate::controller::devices::{Trigger, sort_configs};
 use crate::controller::handler::AbortDriverSetup;
-use crate::controller::{Controller, operation_mode};
-use crate::device::{DeviceCache, UpdateConfig, discovery};
+use crate::controller::{Controller, SendWsMessage, operation_mode, response_text};
+use crate::device::{DeviceCache, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -20,6 +20,7 @@ use ratv::discovery::Device;
 use ratv::{Endpoints, PairOptions, PinPrompt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +28,8 @@ use uc_api::intg::{DriverSetupChange, IntegrationSetup, SetupDriver};
 use uc_api::model::intg::{IntegrationSetupError, IntegrationSetupState, SetupChangeEventType};
 use uc_api::ws::{EventCategory, WsMessage};
 
-/// Delay so that the request is acknowledged before the next setup event.
+/// Time between the acknowledgment of a setup request and the next setup event. The order
+/// does not depend on it: the acknowledgment goes first through the same queue.
 const ACK_DELAY: Duration = Duration::from_millis(100);
 
 /// Start the setup flow.
@@ -36,6 +38,8 @@ const ACK_DELAY: Duration = Duration::from_millis(100);
 pub struct SetupDriverMsg {
     pub ws_id: String,
     pub data: SetupDriver,
+    /// Request id and response message. The handler sends the acknowledgment.
+    pub ack: Option<(u32, &'static str)>,
 }
 
 /// User input of a setup page.
@@ -44,6 +48,8 @@ pub struct SetupDriverMsg {
 pub struct SetDriverUserDataMsg {
     pub ws_id: String,
     pub data: IntegrationSetup,
+    /// Request id and response message. The handler sends the acknowledgment.
+    pub ack: Option<(u32, &'static str)>,
 }
 
 /// Apple TV found in the setup flow.
@@ -119,6 +125,7 @@ impl Handler<SetupDriverMsg> for Controller {
                 "Cannot start driver setup. Please abort setup first.".into(),
             ));
         }
+        self.send_ack(&msg.ws_id, msg.ack);
         let reconfigure = msg.data.reconfigure == Some(true);
         self.end_setup_flow();
         self.setup_owner = Some(msg.ws_id.as_str().into());
@@ -176,9 +183,11 @@ impl Handler<SetDriverUserDataMsg> for Controller {
             ));
         }
         let ws_id = msg.ws_id;
+        self.send_ack(&ws_id, msg.ack);
         let Some(step) = self.setup.take() else {
+            warn!("[{ws_id}] setup input without an active setup step");
             self.finish_setup(&ws_id, Some(IntegrationSetupError::Other), ctx);
-            return Err(ServiceError::BadRequest("No active setup step".into()));
+            return Ok(());
         };
         let flow = self.setup_flow;
         match self.setup_input(&ws_id, step, &values, ctx) {
@@ -207,6 +216,16 @@ impl Handler<AbortDriverSetup> for Controller {
 }
 
 impl Controller {
+    /// Acknowledge a setup request. It goes through the event queue, so it comes before the
+    /// setup events that follow.
+    fn send_ack(&self, ws_id: &str, ack: Option<(u32, &'static str)>) {
+        let Some((req_id, msg)) = ack else { return };
+        match response_text(req_id, msg, Value::Null) {
+            Ok(text) => self.send_r2_response(ws_id, SendWsMessage::Text(text)),
+            Err(e) => error!("[{ws_id}] setup response: {e:?}"),
+        }
+    }
+
     /// Abort the setup flow, because of a timeout, an abort event or a disconnect of the Remote.
     pub(super) fn abort_setup(&mut self, ws_id: &str, timeout: bool, ctx: &mut Context<Self>) {
         debug!("[{ws_id}] abort driver setup, timeout: {timeout}");
@@ -217,6 +236,9 @@ impl Controller {
         {
             warn!("[{ws_id}] setup was started by another Remote, not aborting");
             return;
+        }
+        if let Some(handle) = self.pairing.take() {
+            ctx.cancel_future(handle);
         }
         if timeout {
             self.finish_setup(ws_id, Some(IntegrationSetupError::Timeout), ctx);
@@ -345,8 +367,7 @@ impl Controller {
                         ));
                     }
                 };
-                let save = self.configure(&key, &found, address, values);
-                self.finish_after_save(ws_id, save, ctx);
+                self.configure_device(ws_id, &key, &found, address, values, ctx);
             }
         }
         Ok(())
@@ -381,7 +402,7 @@ impl Controller {
     ///
     /// Nothing of the pasted data is logged.
     fn restore(
-        &mut self,
+        &self,
         ws_id: String,
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
@@ -394,11 +415,12 @@ impl Controller {
                 InputError::Invalid(Box::new(SetupState::Restore), RESTORE_FAILED.into())
             })?;
         info!("[{ws_id}] restoring {} device(s)", devices.len());
-        let save = self.restore_devices(devices, ctx).map_err(|e| {
-            warn!("[{ws_id}] saving the configuration failed: {e}");
-            IntegrationSetupError::Other
+        let mut devices = devices;
+        sort_configs(&mut devices);
+        let save = self.store.save_devices(&devices);
+        self.apply_after_save(ws_id, save, ctx, move |act, ctx| {
+            act.restore_devices(devices, ctx);
         });
-        self.finish_after_save(ws_id, save, ctx);
         Ok(())
     }
 
@@ -454,24 +476,45 @@ impl Controller {
         );
     }
 
+    /// Check the action of the configuration page, and that it has a device if it needs one.
+    fn check_config_action(&self, action: &str, key: &str) -> Result<(), InputError> {
+        let invalid = |m: String| Err(InputError::Invalid(Box::new(SetupState::ConfigMode), m));
+        match action {
+            "settings" | "add" | "restore" | "reset" => Ok(()),
+            "remove" | "configure" | "pair" if self.devices.contains_key(key) => Ok(()),
+            "remove" | "configure" | "pair" => invalid("Unknown device".into()),
+            "backup" if !self.devices.is_empty() => Ok(()),
+            "backup" => invalid("Nothing to back up".into()),
+            _ => invalid(format!("Unknown action: {action}")),
+        }
+    }
+
     fn config_mode(
         &mut self,
         ws_id: String,
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) -> Result<(), InputError> {
-        let unknown_device =
-            || InputError::Invalid(Box::new(SetupState::ConfigMode), "Unknown device".into());
         let flow = self.setup_flow;
         let action = values.get("action").map_or_default(String::as_str);
         let key = values.get("choice").map_or_default(String::as_str);
+        // Check the input first: a page that is shown again changes no settings.
+        self.check_config_action(action, key)?;
+        let backup = if action == "backup" {
+            Some(backup_json(&self.sorted_configs()).ok_or_else(|| {
+                InputError::Invalid(Box::new(SetupState::ConfigMode), "Backup failed".into())
+            })?)
+        } else {
+            None
+        };
         self.set_debug_log(
             &ws_id,
             parse_bool(values, "debug_log", self.driver_settings.debug_log),
         );
         self.set_siri_mode(&ws_id, values);
+        // `check_config_action` has checked the action, the device and that devices exist.
         match action {
-            "settings" => self.finish_setup_later(ws_id, ctx),
+            "settings" => self.finish_setup_later(ws_id, None, ctx),
             "add" => {
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
@@ -480,30 +523,22 @@ impl Controller {
                 });
             }
             "remove" => {
-                let cfg = self.forget_device(key).ok_or_else(unknown_device)?;
-                info!("[{ws_id}] removed {}", cfg.name);
-                let save = self.save_devices().map_err(|e| {
-                    warn!("[{ws_id}] saving the configuration failed: {e}");
-                    IntegrationSetupError::Other
+                let mut configs = self.sorted_configs();
+                configs.retain(|c| c.key != key);
+                let save = self.store.save_devices(&configs);
+                let (key, id) = (key.to_owned(), ws_id.clone());
+                self.apply_after_save(ws_id, save, ctx, move |act, _| {
+                    if let Some(cfg) = act.forget_device(&key) {
+                        info!("[{id}] removed {}", cfg.name);
+                    }
                 });
-                self.finish_after_save(ws_id, save, ctx);
             }
             "configure" => {
-                let cfg = self
-                    .devices
-                    .get(key)
-                    .ok_or_else(unknown_device)?
-                    .cfg
-                    .clone();
+                let cfg = self.devices[key].cfg.clone();
                 self.request_configure(ws_id, cfg, ctx);
             }
             "pair" => {
-                let cfg = self
-                    .devices
-                    .get(key)
-                    .ok_or_else(unknown_device)?
-                    .cfg
-                    .clone();
+                let cfg = self.devices[key].cfg.clone();
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.pair_again(ws_id, cfg, ctx);
@@ -511,14 +546,7 @@ impl Controller {
                 });
             }
             "backup" => {
-                let text = backup_json(&self.sorted_configs())
-                    .filter(|_| !self.devices.is_empty())
-                    .ok_or_else(|| {
-                        InputError::Invalid(
-                            Box::new(SetupState::ConfigMode),
-                            "Nothing to back up".into(),
-                        )
-                    })?;
+                let text = backup.unwrap_or_default();
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.setup = Some(SetupState::Backup);
@@ -544,46 +572,83 @@ impl Controller {
                     }
                 });
             }
-            _ => {
-                return Err(InputError::Invalid(
-                    Box::new(SetupState::ConfigMode),
-                    format!("Unknown action: {action}"),
-                ));
-            }
+            _ => {}
         }
         Ok(())
     }
 
-    /// End the setup when the configuration is written, without blocking the thread. A write
-    /// error ends the setup with an error.
-    fn finish_after_save(
+    /// Apply the options page of a configured device: write the configuration, then use it.
+    fn configure_device(
         &self,
         ws_id: String,
-        save: Result<SaveWait, IntegrationSetupError>,
+        key: &str,
+        found: &[Found],
+        address: Option<IpAddr>,
+        values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) {
+        let mut configs = self.sorted_configs();
+        let Some(cfg) = configs.iter_mut().find(|c| c.key == key) else {
+            self.finish_setup_later(ws_id, Some(IntegrationSetupError::NotFound), ctx);
+            return;
+        };
+        configure(cfg, found, address, values, false);
+        let save = self.store.save_devices(&configs);
+        let (key, found, values) = (key.to_owned(), found.to_vec(), values.clone());
+        self.apply_after_save(ws_id, save, ctx, move |act, _| {
+            // Apply the page again: the device can have changed its address or ids meanwhile.
+            if let Some(device) = act.devices.get_mut(key.as_str()) {
+                let mut cfg = device.cfg.clone();
+                configure(&mut cfg, &found, address, &values, true);
+                device.update_config(cfg);
+            }
+        });
+    }
+
+    /// Wait for `save`, the write of the new device list, then change the devices with `apply`
+    /// and end the setup. `apply` makes the devices match the written list. If `apply` keeps
+    /// values that a device found on the network during the write, the queued write after
+    /// `apply` saves them. If the write fails, nothing changes and the setup ends with an error.
+    /// `apply` also runs when the setup was aborted during the write, so that memory and disk
+    /// stay the same.
+    fn apply_after_save<F>(
+        &self,
+        ws_id: String,
+        save: io::Result<SaveWait>,
+        ctx: &mut Context<Self>,
+        apply: F,
+    ) where
+        F: FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    {
         let flow = self.setup_flow;
         ctx.spawn(
             async move {
                 match save {
-                    Ok(wait) => Ok(wait.wait().await),
+                    Ok(wait) => wait.wait().await,
                     Err(e) => Err(e),
                 }
             }
             .into_actor(self)
-            .map(move |result, _, ctx| {
+            .map(move |result, act, ctx| {
                 let error = match result {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         info!("[{ws_id}] configuration saved");
+                        apply(act, ctx);
+                        // A device can have queued an older list during the write.
+                        if let Err(e) = act.queue_devices() {
+                            warn!("[{ws_id}] saving the configuration failed: {e}");
+                        }
+                        // Without the end of the setup, nothing else makes the devices usable.
+                        if act.setup_flow != flow {
+                            act.devices_changed(&ws_id, ctx);
+                        }
                         None
                     }
-                    Ok(Err(e)) => {
-                        error!("[{ws_id}] error writing config.json: {e}");
+                    Err(e) => {
+                        error!("[{ws_id}] error writing config.json, nothing changed: {e}");
                         Some(IntegrationSetupError::Other)
                     }
-                    Err(e) => Some(e),
                 };
-                // When called from a request handler, wait so the request gets its answer first.
                 ctx.run_later(ACK_DELAY, move |act, ctx| {
                     if act.is_setup_flow(flow, &ws_id) {
                         act.finish_setup(&ws_id, error, ctx);
@@ -593,12 +658,33 @@ impl Controller {
         );
     }
 
+    /// Use the changed devices after the setup flow has ended: leave the setup state if there are
+    /// devices now, and connect the devices that a Remote uses.
+    fn devices_changed(&mut self, ws_id: &str, ctx: &mut Context<Self>) {
+        if !self.devices.is_empty()
+            && matches!(
+                self.machine.state(),
+                operation_mode::State::RequireSetup | operation_mode::State::SetupError
+            )
+        {
+            let _ = self.sm_consume(ws_id, &operation_mode::Input::ConfigurationAvailable, ctx);
+        }
+        if matches!(self.machine.state(), operation_mode::State::Running) {
+            self.update_connections(Trigger::Change);
+        }
+    }
+
     /// End the setup after the request was acknowledged.
-    fn finish_setup_later(&self, ws_id: String, ctx: &mut Context<Self>) {
+    fn finish_setup_later(
+        &self,
+        ws_id: String,
+        error: Option<IntegrationSetupError>,
+        ctx: &mut Context<Self>,
+    ) {
         let flow = self.setup_flow;
         ctx.run_later(ACK_DELAY, move |act, ctx| {
             if act.is_setup_flow(flow, &ws_id) {
-                act.finish_setup(&ws_id, None, ctx);
+                act.finish_setup(&ws_id, error, ctx);
             }
         });
     }
@@ -639,12 +725,12 @@ impl Controller {
         }
     }
 
-    /// Remove a device, and remove its entities from the sessions. The configuration is not saved.
+    /// Remove a device, and its changes that a Remote did not get yet. The subscriptions stay
+    /// as the Remotes sent them. The configuration is not saved.
     fn forget_device(&mut self, key: &str) -> Option<DeviceConfig> {
         let cfg = self.remove_device(key)?;
         let other = |id: &String| EntityKind::parse(id).is_none_or(|(k, _)| k != key);
         for session in self.sessions.values_mut() {
-            session.subscribed_entities.retain(other);
             session.stale.retain(other);
         }
         Some(cfg)
@@ -663,29 +749,23 @@ impl Controller {
         }
     }
 
-    /// Replace all devices with the devices of a backup.
-    fn restore_devices(
-        &mut self,
-        devices: Vec<DeviceConfig>,
-        ctx: &Context<Self>,
-    ) -> Result<SaveWait, ServiceError> {
-        let keys: Vec<String> = self.devices.keys().map(ToString::to_string).collect();
+    /// Replace all devices with the devices of a backup. The configuration is not saved.
+    /// The subscriptions stay as the Remotes sent them.
+    fn restore_devices(&mut self, devices: Vec<DeviceConfig>, ctx: &Context<Self>) {
+        let keys: Vec<Arc<str>> = self.devices.keys().cloned().collect();
         for key in &keys {
-            self.remove_device(key);
+            // A kept key keeps its stale entries: the new actor sends the state again.
+            if devices.iter().any(|d| d.key == **key) {
+                self.remove_device(key);
+            } else {
+                self.forget_device(key);
+            }
         }
         self.entities.clear();
-        // Like a new connection: the Remote reads the states again.
-        for session in self.sessions.values_mut() {
-            session.subscribe_all = false;
-            session.states_read = false;
-            session.subscribed_entities.clear();
-            session.stale.clear();
-        }
         // The old actors delete their cache files when they stop. Start with empty lists.
         for cfg in devices {
             self.add_device(cfg, DeviceCache::default(), ctx);
         }
-        self.save_devices()
     }
 
     /// Scan the network, then show the options of a configured device.
@@ -774,7 +854,7 @@ impl Controller {
 
     /// Start pairing. The Apple TV shows a PIN.
     fn pair(
-        &self,
+        &mut self,
         ws_id: String,
         found: Found,
         global_volume: bool,
@@ -791,7 +871,7 @@ impl Controller {
         let mut options = PairOptions::default();
         options.name.clone_from(&self.device_ctx.client_name);
         let flow = self.setup_flow;
-        ctx.spawn(
+        let handle = ctx.spawn(
             async move { ratv::pair(&endpoints, &options).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
@@ -817,11 +897,14 @@ impl Controller {
                     }
                 }),
         );
+        if let Some(old) = self.pairing.replace(handle) {
+            ctx.cancel_future(old);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn finish_pairing(
-        &self,
+        &mut self,
         ws_id: String,
         prompt: Box<PinPrompt>,
         pin: String,
@@ -832,7 +915,7 @@ impl Controller {
         ctx: &mut Context<Self>,
     ) {
         let flow = self.setup_flow;
-        ctx.spawn(
+        let handle = ctx.spawn(
             async move { prompt.finish(&pin).await }
                 .into_actor(self)
                 .map(move |result, act, ctx| {
@@ -880,60 +963,32 @@ impl Controller {
                             global_volume,
                         },
                     };
-                    if act.setup_replace {
-                        act.forget_other_devices(&cfg.key);
-                    }
-                    if let Some(device) = act.devices.get_mut(cfg.key.as_str()) {
-                        device.cfg = cfg.clone();
-                        device.addr.do_send(UpdateConfig(cfg));
+                    let replace = act.setup_replace;
+                    let mut configs = if replace {
+                        Vec::new()
                     } else {
-                        // A new device starts with empty lists.
-                        act.add_device(cfg, DeviceCache::default(), ctx);
-                    }
-                    let save = act.save_devices().map_err(|e| {
-                        warn!("[{ws_id}] saving the configuration failed: {e}");
-                        IntegrationSetupError::Other
+                        act.sorted_configs()
+                    };
+                    configs.retain(|c| c.key != cfg.key);
+                    configs.push(cfg.clone());
+                    sort_configs(&mut configs);
+                    let save = act.store.save_devices(&configs);
+                    act.apply_after_save(ws_id, save, ctx, move |act, ctx| {
+                        if replace {
+                            act.forget_other_devices(&cfg.key);
+                        }
+                        if let Some(device) = act.devices.get_mut(cfg.key.as_str()) {
+                            device.update_config(cfg);
+                        } else {
+                            // A new device starts with empty lists.
+                            act.add_device(cfg, DeviceCache::default(), ctx);
+                        }
                     });
-                    act.finish_after_save(ws_id, save, ctx);
                 }),
         );
-    }
-
-    /// Apply the options page of a configured device.
-    fn configure(
-        &mut self,
-        key: &str,
-        found: &[Found],
-        address: Option<IpAddr>,
-        values: &HashMap<String, String>,
-    ) -> Result<SaveWait, IntegrationSetupError> {
-        let device = self
-            .devices
-            .get_mut(key)
-            .ok_or(IntegrationSetupError::NotFound)?;
-        let cfg = &mut device.cfg;
-        cfg.global_volume = parse_bool(values, "global_volume", cfg.global_volume);
-        cfg.manual_address = address.is_some();
-        if address.is_some() {
-            cfg.address = address;
+        if let Some(old) = self.pairing.replace(handle) {
+            ctx.cancel_future(old);
         }
-        // The identifiers can all change, for example after a tvOS update. Link to the chosen device.
-        let choice = values.get("device").map_or_default(String::as_str);
-        if let Some(f) = found.iter().find(|f| f.id == choice) {
-            if !cfg.matches(f.known_ids.iter().map(String::as_str)) {
-                info!("[{}] linked to {} ({:?})", cfg.name, f.name, f.known_ids);
-                cfg.known_ids.clone_from(&f.known_ids);
-            }
-            // Without a manual address, use the address of the found device.
-            if !cfg.manual_address && f.address.is_some() {
-                cfg.address = f.address;
-            }
-        }
-        device.addr.do_send(UpdateConfig(cfg.clone()));
-        self.save_devices().map_err(|e| {
-            warn!("Saving the configuration failed: {e}");
-            IntegrationSetupError::Other
-        })
     }
 
     /// Show a setup page.
@@ -1084,6 +1139,35 @@ impl Controller {
 
 /// Shown for invalid restore data. It must not contain the data.
 const RESTORE_FAILED: &str = "Restore failed or invalid backup data. Please try again.";
+
+/// Apply the options page to the configuration of a device. `log` logs a new link.
+fn configure(
+    cfg: &mut DeviceConfig,
+    found: &[Found],
+    address: Option<IpAddr>,
+    values: &HashMap<String, String>,
+    log: bool,
+) {
+    cfg.global_volume = parse_bool(values, "global_volume", cfg.global_volume);
+    cfg.manual_address = address.is_some();
+    if address.is_some() {
+        cfg.address = address;
+    }
+    // The identifiers can all change, for example after a tvOS update. Link to the chosen device.
+    let choice = values.get("device").map_or_default(String::as_str);
+    if let Some(f) = found.iter().find(|f| f.id == choice) {
+        if !cfg.matches(f.known_ids.iter().map(String::as_str)) {
+            if log {
+                info!("[{}] linked to {} ({:?})", cfg.name, f.name, f.known_ids);
+            }
+            cfg.known_ids.clone_from(&f.known_ids);
+        }
+        // Without a manual address, use the address of the found device.
+        if !cfg.manual_address && f.address.is_some() {
+            cfg.address = f.address;
+        }
+    }
+}
 
 fn restore_choice_page(settings: DriverSettings) -> Value {
     json!({
@@ -1351,13 +1435,13 @@ mod tests {
 
     mod flow {
         use crate::config_store::tests::device;
-        use crate::config_store::{ConfigStore, DeviceConfig, backup_json};
+        use crate::config_store::{ConfigStore, DeviceConfig, backup_json, device_key};
         use crate::controller::handler::AbortDriverSetup;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
         use crate::controller::test_util::{
             DeviceAddr, connect, controller, test_dir, wait_stopped,
         };
-        use crate::controller::{Controller, R2SessionDisconnect};
+        use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
         use crate::entities::EntityKind;
         use actix::{Addr, Context, Handler, Message};
         use serde_json::{Value, json};
@@ -1365,6 +1449,7 @@ mod tests {
         use std::sync::Mutex;
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
+        use uc_api::intg::ws::R2Request;
 
         /// Returns the attributes that the controller keeps for an entity.
         #[derive(Message)]
@@ -1376,6 +1461,58 @@ mod tests {
             fn handle(&mut self, msg: EntityAttrs, _: &mut Context<Self>) -> Option<Value> {
                 self.entities.get(&msg.0).cloned().map(Value::Object)
             }
+        }
+
+        /// Returns `true` if Remote `.0` subscribed entity `.1`.
+        #[derive(Message)]
+        #[rtype(result = "bool")]
+        struct Subscribed(&'static str, String);
+
+        impl Handler<Subscribed> for Controller {
+            type Result = bool;
+            fn handle(&mut self, msg: Subscribed, _: &mut Context<Self>) -> bool {
+                self.sessions.get(msg.0).is_some_and(|s| s.wants(&msg.1))
+            }
+        }
+
+        /// Returns the Siri mode id of the driver settings.
+        #[derive(Message)]
+        #[rtype(result = "String")]
+        struct SiriModeId;
+
+        impl Handler<SiriModeId> for Controller {
+            type Result = String;
+            fn handle(&mut self, _: SiriModeId, _: &mut Context<Self>) -> String {
+                self.driver_settings.siri_mode.id().into()
+            }
+        }
+
+        #[actix::test]
+        async fn invalid_config_action_changes_no_settings() {
+            let controller = controller("config-action");
+            let events = connect(&controller, "a").await;
+            start_setup(&controller, &events, "a", true).await;
+            let before = controller.send(SiriModeId).await.expect("send");
+            let other = if before == "mrp" { "auto" } else { "mrp" };
+            let before_pages = setup_events(&events);
+            controller
+                .send(values(
+                    "a",
+                    &[
+                        ("action", "remove"),
+                        ("choice", "none"),
+                        ("siri_mode", other),
+                    ],
+                ))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, before_pages).await;
+            assert_eq!(
+                json!("Unknown device"),
+                last(&events)["error_message"]["en"]
+            );
+            assert_eq!(before, controller.send(SiriModeId).await.expect("send"));
         }
 
         fn input(ws_id: &str, address: &str) -> SetDriverUserDataMsg {
@@ -1390,6 +1527,7 @@ mod tests {
             SetDriverUserDataMsg {
                 ws_id: ws_id.into(),
                 data: IntegrationSetup::InputValues(values),
+                ack: None,
             }
         }
 
@@ -1404,6 +1542,32 @@ mod tests {
         }
 
         #[actix::test]
+        async fn setup_ack_comes_before_the_setup_events() {
+            let controller = controller("setup-ack");
+            let events = connect(&controller, "a").await;
+            let data = serde_json::from_value(json!({ "setup_data": {} })).expect("setup");
+            controller
+                .send(SetupDriverMsg {
+                    ws_id: "a".into(),
+                    data,
+                    ack: Some((5, "result")),
+                })
+                .await
+                .expect("send")
+                .expect("setup started");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let messages = events.lock().expect("lock");
+            let ack = messages
+                .iter()
+                .position(|m| m["req_id"] == 5 && m["code"] == 200);
+            let event = messages
+                .iter()
+                .position(|m| m["msg"] == "driver_setup_change");
+            assert!(ack.is_some() && event.is_some());
+            assert!(ack < event, "ack first");
+        }
+
+        #[actix::test]
         async fn invalid_input_shows_the_page_again() {
             let controller = controller("invalid-input");
             let events = connect(&controller, "a").await;
@@ -1413,6 +1577,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "a".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1473,6 +1638,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "b".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1512,6 +1678,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: ws_id.into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1592,6 +1759,43 @@ mod tests {
             let event = wait_stop(&events).await;
             assert_eq!(json!("ERROR"), event["state"]);
             assert_eq!(json!("OTHER"), event["error"]);
+            // Nothing changed: the device is still configured.
+            let addr = controller.send(DeviceAddr(cfg.key.clone()));
+            assert!(addr.await.expect("send").is_some());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn failing_restore_write_changes_nothing() {
+            let name = "restore-error";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            let mut other = device();
+            other.id = "02:00:00:00:00:01".into();
+            other.key = device_key(&other.id);
+            let backup = backup_json(std::slice::from_ref(&other)).expect("backup");
+
+            start_setup(&controller, &events, "a", false).await;
+            let before = setup_events(&events);
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, before).await;
+            break_writes(&dir);
+            controller
+                .send(values("a", &[("restore_data", &backup)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("ERROR"), event["state"]);
+            let addr = |key: &str| controller.send(DeviceAddr(key.into()));
+            assert!(addr(&cfg.key).await.expect("send").is_some(), "kept");
+            assert!(addr(&other.key).await.expect("send").is_none(), "not added");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1613,7 +1817,20 @@ mod tests {
                 source_list(&controller, &cfg.key).await
             );
 
-            // A restore removes the cache file and does not use it.
+            // A restore removes the cache file and does not use it. The subscriptions stay.
+            let entity_id = EntityKind::MediaPlayer.entity_id(&cfg.key);
+            controller
+                .send(R2RequestMsg {
+                    ws_id: "a".into(),
+                    req_id: 1,
+                    request: R2Request::SubscribeEvents,
+                    msg_data: Some(json!({ "entity_ids": [entity_id] })),
+                })
+                .await
+                .expect("send")
+                .expect("ok");
+            let subscribed = || controller.send(Subscribed("a", entity_id.clone()));
+            assert!(subscribed().await.expect("send"));
             let old = controller
                 .send(DeviceAddr(cfg.key.clone()))
                 .await
@@ -1636,6 +1853,7 @@ mod tests {
             let event = wait_stop(&events).await;
             assert_eq!(json!("OK"), event["state"]);
             assert_eq!(json!([]), source_list(&controller, &cfg.key).await);
+            assert!(subscribed().await.expect("send"));
             // The old actor deletes the file when it stops.
             wait_stopped(&controller, &old).await;
             assert!(!cache.exists());
@@ -1665,6 +1883,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "a".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1688,6 +1907,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "a".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1720,6 +1940,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "a".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")
@@ -1741,6 +1962,7 @@ mod tests {
                 .send(SetupDriverMsg {
                     ws_id: "a".into(),
                     data,
+                    ack: None,
                 })
                 .await
                 .expect("send")

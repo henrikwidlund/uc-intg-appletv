@@ -3,11 +3,11 @@
 
 //! Apple TV devices of the controller: entity states, subscriptions and commands.
 
-use crate::config_store::{DeviceConfig, SaveWait};
+use crate::config_store::DeviceConfig;
 use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg, SendWsMessage};
 use crate::device::{
     AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceCache, DeviceEvent, DeviceStatus,
-    Disconnect, Reply, Stop,
+    Disconnect, Reply, Stop, UpdateConfig,
 };
 use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
@@ -92,6 +92,14 @@ fn entity_change_text<T: Serialize>(data: T) -> Option<ByteString> {
 #[rtype(result = "()")]
 struct EndVoiceSession(u32);
 
+/// An active voice session.
+pub(super) struct VoiceSession {
+    /// Device key.
+    pub key: Arc<str>,
+    /// The Remote that started it. It gets the assistant events.
+    pub ws_id: Arc<str>,
+}
+
 /// One configured Apple TV.
 pub(super) struct Device {
     pub cfg: DeviceConfig,
@@ -99,6 +107,22 @@ pub(super) struct Device {
     pub status: DeviceStatus,
     /// An awake Remote uses the device. Set by [`Controller::update_connections`].
     pub wanted: bool,
+    /// Number of [`UpdateConfig`] messages sent to the actor.
+    pub cfg_version: u64,
+}
+
+impl Device {
+    /// Use `cfg` and send it to the actor.
+    pub fn update_config(&mut self, cfg: DeviceConfig) {
+        self.cfg = cfg;
+        self.send_config();
+    }
+
+    /// Send `cfg` to the actor.
+    fn send_config(&mut self) {
+        self.cfg_version += 1;
+        self.addr.do_send(UpdateConfig(self.cfg.clone()));
+    }
 }
 
 /// What made [`Controller::update_connections`] run.
@@ -155,6 +179,7 @@ impl Controller {
                 addr,
                 status: DeviceStatus::Disconnected,
                 wanted: false,
+                cfg_version: 0,
             },
         );
     }
@@ -175,7 +200,7 @@ impl Controller {
         device.addr.do_send(Stop { remove_cache: true });
         self.entities
             .retain(|id, _| EntityKind::parse(id).is_none_or(|(k, _)| k != key));
-        self.voice_sessions.retain(|_, k| &**k != key);
+        // A voice session stays until the stopping actor sends its last event.
         // The removed device might have had an error.
         self.update_device_state();
         Some(device.cfg)
@@ -184,28 +209,27 @@ impl Controller {
     /// The configuration of all devices, sorted by name and key.
     pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
         let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+        sort_configs(&mut devices);
         devices
     }
 
-    /// Save the configuration of all devices. The write is queued. The result says when it is
-    /// done.
-    pub(super) fn save_devices(&self) -> Result<SaveWait, ServiceError> {
-        Ok(self.store.save_devices(&self.sorted_configs())?)
-    }
-
     /// Queue the save of the configuration of all devices. A write error is only logged.
-    fn queue_devices(&self) -> Result<(), ServiceError> {
+    pub(super) fn queue_devices(&self) -> Result<(), ServiceError> {
         self.store.queue_devices(&self.sorted_configs())?;
         Ok(())
     }
 
-    /// All entity definitions, in the order of [`Self::send_order`].
-    pub(super) fn available_entities(&self) -> Vec<AvailableIntgEntity> {
+    /// The entity definitions, only of `entity_type` if it is given, in the order of
+    /// [`Self::send_order`].
+    pub(super) fn available_entities(
+        &self,
+        entity_type: Option<EntityType>,
+    ) -> Vec<AvailableIntgEntity> {
         let mut list: Vec<AvailableIntgEntity> = self
             .devices
             .values()
             .flat_map(|d| entities::definitions(&d.cfg))
+            .filter(|e| entity_type.is_none_or(|t| e.entity_type == t))
             .collect();
         list.sort_unstable_by(|a, b| {
             self.send_order(a.entity_type, &a.entity_id)
@@ -415,7 +439,7 @@ impl Controller {
                 command.entity_id
             )));
         }
-        let voice_session = self.voice_session(&command);
+        let voice_session = self.voice_session(&command, &ws_id);
         let controller = ctx.address();
         // The device answers a voice command through the controller, so the answer comes
         // before the assistant events of the session.
@@ -496,19 +520,6 @@ impl Controller {
     fn send_entity_change(&self, ws_id: &str, change: &EntityChangeRef<'_>) {
         if let Some(text) = entity_change_text(change) {
             self.send_r2_msg(ws_id, SendWsMessage::Text(text));
-        }
-    }
-
-    /// Send an event to all Remotes that are not in standby. The event is serialized once.
-    fn broadcast<T: Serialize>(&self, msg: &str, cat: EventCategory, data: T) {
-        if self.sessions.values().all(|s| s.standby) {
-            return;
-        }
-        let Some(text) = event_text(msg, cat, data) else {
-            return;
-        };
-        for (ws_id, session) in &self.sessions {
-            Self::send_to_session(ws_id, session, SendWsMessage::Text(text.clone()));
         }
     }
 
@@ -701,13 +712,16 @@ impl Handler<DeviceEvent> for Controller {
         }
         match msg {
             DeviceEvent::Changes { key, changes } => self.apply_changes(&key, changes),
-            DeviceEvent::Config { key, cfg } => {
-                let Some(device) = self.devices.get_mut(&*key) else {
+            DeviceEvent::Config { key, cfg, version } => {
+                // An actor that did not handle the last `UpdateConfig` yet has old values.
+                let Some(device) = self
+                    .devices
+                    .get_mut(&*key)
+                    .filter(|d| d.cfg_version == version)
+                else {
                     return;
                 };
-                // Only take the values the device finds on the network. The event can be older
-                // than the credentials and settings of the controller, for example after pairing
-                // again.
+                // Only take the values the device finds on the network.
                 let own = &mut device.cfg;
                 let address = own.address != cfg.address;
                 if own.name == cfg.name && own.known_ids == cfg.known_ids && !address {
@@ -734,12 +748,28 @@ impl Handler<DeviceEvent> for Controller {
                 self.send_r2_response(&ws_id, SendWsMessage::Msg(command_sent(req_id)));
             }
             DeviceEvent::Assistant(event) => {
-                if let AssistantEvent::Finished { session_id, .. }
-                | AssistantEvent::Error { session_id, .. } = &event
-                {
-                    self.voice_sessions.remove(session_id);
+                let session_id = assistant_session_id(&event);
+                let last = matches!(
+                    event,
+                    AssistantEvent::Finished { .. } | AssistantEvent::Error { .. }
+                );
+                let ws_id = if last {
+                    self.voice_sessions.remove(&session_id).map(|v| v.ws_id)
+                } else {
+                    self.voice_sessions
+                        .get(&session_id)
+                        .map(|v| v.ws_id.clone())
+                };
+                let session = ws_id.as_ref().and_then(|w| self.sessions.get_key_value(w));
+                let Some((ws_id, session)) = session.filter(|(_, s)| !s.standby) else {
+                    debug!(
+                        "assistant_event of voice session {session_id} not sent: no voice session or no awake Remote"
+                    );
+                    return;
+                };
+                if let Some(text) = event_text("assistant_event", EventCategory::Entity, &event) {
+                    Self::send_to_session(ws_id, session, SendWsMessage::Text(text));
                 }
-                self.broadcast("assistant_event", EventCategory::Entity, &event);
             }
         }
     }
@@ -752,7 +782,7 @@ impl Handler<R2AudioChunkMsg> for Controller {
         let device = self
             .voice_sessions
             .get(&msg.session_id)
-            .and_then(|key| self.devices.get(key));
+            .and_then(|v| self.devices.get(&v.key));
         let Some(device) = device else {
             // An end marker can come again after the session has ended.
             if msg.data.is_empty() {
@@ -778,8 +808,13 @@ impl Handler<EndVoiceSession> for Controller {
 }
 
 impl Controller {
-    /// Remember the device of a voice session, for the audio chunks. Returns the session id.
-    pub(super) fn voice_session(&mut self, command: &EntityCommand) -> Option<u32> {
+    /// Remember the device of a voice session, for the audio chunks, and the Remote that
+    /// started it. Returns the session id.
+    pub(super) fn voice_session(
+        &mut self,
+        command: &EntityCommand,
+        ws_id: &Arc<str>,
+    ) -> Option<u32> {
         if command.entity_type != EntityType::VoiceAssistant {
             return None;
         }
@@ -793,10 +828,33 @@ impl Controller {
             (session_id, EntityKind::parse(&command.entity_id))
             && let Some((key, _)) = self.devices.get_key_value(key)
         {
-            self.voice_sessions.insert(session_id, key.clone());
+            self.voice_sessions.insert(
+                session_id,
+                VoiceSession {
+                    key: key.clone(),
+                    ws_id: ws_id.clone(),
+                },
+            );
             return Some(session_id);
         }
         None
+    }
+}
+
+/// Sort device configurations by name and key, the order of `config.json`.
+pub(super) fn sort_configs(devices: &mut [DeviceConfig]) {
+    devices.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+}
+
+/// Session id of an assistant event.
+const fn assistant_session_id(event: &AssistantEvent) -> u32 {
+    match event {
+        AssistantEvent::Ready { session_id, .. }
+        | AssistantEvent::SttResponse { session_id, .. }
+        | AssistantEvent::TextResponse { session_id, .. }
+        | AssistantEvent::SpeechResponse { session_id, .. }
+        | AssistantEvent::Finished { session_id, .. }
+        | AssistantEvent::Error { session_id, .. } => *session_id,
     }
 }
 

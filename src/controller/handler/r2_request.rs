@@ -14,10 +14,13 @@ use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
 use actix::{Handler, ResponseFuture};
 use log::debug;
+use serde::Deserialize;
 use serde_json::Value;
 use strum::EnumMessage;
-use uc_api::intg::IntegrationVersion;
-use uc_api::intg::ws::{AvailableEntitiesMsgData, DriverVersionMsgData, R2Request};
+use uc_api::intg::ws::{
+    AvailableEntitiesFilter, AvailableEntitiesMsgData, DriverVersionMsgData, R2Request,
+};
+use uc_api::intg::{IntegrationDriverUpdate, IntegrationVersion};
 use uc_api::ws::WsMessage;
 
 /// Integration-API version from the `uc_api` dependency.
@@ -26,6 +29,23 @@ fn api_version() -> &'static str {
         .iter()
         .find(|p| p.0 == "uc_api")
         .map_or("?", |v| v.1)
+}
+
+/// `msg_data` of `get_available_entities`.
+#[derive(Deserialize)]
+struct AvailableEntitiesRequest {
+    filter: Option<AvailableEntitiesFilter>,
+}
+
+/// Driver name and versions, for `get_driver_version` and the `authentication` message.
+pub(crate) fn driver_version(metadata: &IntegrationDriverUpdate) -> DriverVersionMsgData {
+    DriverVersionMsgData {
+        name: metadata.name.as_ref().and_then(|n| n.get("en").cloned()),
+        version: Some(IntegrationVersion {
+            api: Some(api_version().into()),
+            driver: Some(APP_VERSION.into()),
+        }),
+    }
 }
 
 impl Handler<R2RequestMsg> for Controller {
@@ -71,17 +91,7 @@ impl Handler<R2RequestMsg> for Controller {
                 return_fut_ok!(Some(WsMessage::response(
                     req_id,
                     resp_msg,
-                    DriverVersionMsgData {
-                        name: self
-                            .drv_metadata
-                            .name
-                            .as_ref()
-                            .and_then(|n| n.get("en").cloned()),
-                        version: Some(IntegrationVersion {
-                            api: Some(api_version().into()),
-                            driver: Some(APP_VERSION.into()),
-                        }),
-                    },
+                    driver_version(&self.drv_metadata),
                 )));
             }
             R2Request::GetDriverMetadata => {
@@ -98,22 +108,24 @@ impl Handler<R2RequestMsg> for Controller {
                 let result = msg
                     .deserialize()
                     .map_err(ServiceError::from)
-                    .and_then(|data| self.handle(SetupDriverMsg { ws_id, data }, ctx));
-                return Box::pin(async move {
-                    result?;
-                    Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
-                });
+                    .and_then(|data| {
+                        let ack = Some((req_id, resp_msg));
+                        self.handle(SetupDriverMsg { ws_id, data, ack }, ctx)
+                    });
+                // The handler has sent the acknowledgment.
+                return Box::pin(async move { result.map(|()| None) });
             }
             R2Request::SetDriverUserData => {
                 let ws_id = msg.ws_id.to_string();
                 let result = msg
                     .deserialize()
                     .map_err(ServiceError::from)
-                    .and_then(|data| self.handle(SetDriverUserDataMsg { ws_id, data }, ctx));
-                return Box::pin(async move {
-                    result?;
-                    Ok(Some(WsMessage::response(req_id, resp_msg, Value::Null)))
-                });
+                    .and_then(|data| {
+                        let ack = Some((req_id, resp_msg));
+                        self.handle(SetDriverUserDataMsg { ws_id, data, ack }, ctx)
+                    });
+                // The handler has sent the acknowledgment.
+                return Box::pin(async move { result.map(|()| None) });
             }
             _ => {}
         }
@@ -122,9 +134,17 @@ impl Handler<R2RequestMsg> for Controller {
         // keep running. Without devices the lists are empty and commands get 404.
         match msg.request {
             R2Request::GetAvailableEntities => {
+                let filter = match msg.msg_data.filter(|v| !v.is_null()) {
+                    Some(data) => match serde_json::from_value::<AvailableEntitiesRequest>(data) {
+                        Ok(request) => request.filter,
+                        Err(e) => return_fut_err!(e.into()),
+                    },
+                    None => None,
+                };
+                let entity_type = filter.as_ref().and_then(|f| f.entity_type);
                 let msg_data = AvailableEntitiesMsgData {
-                    filter: None,
-                    available_entities: self.available_entities(),
+                    available_entities: self.available_entities(entity_type),
+                    filter,
                 };
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, msg_data)));
             }

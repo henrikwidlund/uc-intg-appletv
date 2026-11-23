@@ -28,12 +28,12 @@ pub fn definition(mut entity: AvailableIntgEntity) -> AvailableIntgEntity {
     entity
 }
 
-/// Insert the state attribute.
+/// Insert the state attribute: ON with Siri, OFF when connected without Siri.
 pub fn attributes(s: &Snapshot, out: &mut Map<String, Value>) {
-    let state = if s.connected && s.siri {
-        "ON"
-    } else {
-        "UNAVAILABLE"
+    let state = match (s.connected, s.siri) {
+        (true, true) => "ON",
+        (true, false) => "OFF",
+        (false, _) => "UNAVAILABLE",
     };
     out.insert("state".into(), state.into());
 }
@@ -45,7 +45,7 @@ mod tests {
     use serde_json::{Map, json};
 
     #[test]
-    fn unavailable_without_companion_and_mrp() {
+    fn off_without_siri_unavailable_without_connection() {
         let mut s = Snapshot {
             connected: true,
             siri: true,
@@ -56,6 +56,10 @@ mod tests {
         assert_eq!(Some(&json!("ON")), out.get("state"));
 
         s.siri = false;
+        attributes(&s, &mut out);
+        assert_eq!(Some(&json!("OFF")), out.get("state"));
+
+        s.connected = false;
         attributes(&s, &mut out);
         assert_eq!(Some(&json!("UNAVAILABLE")), out.get("state"));
     }

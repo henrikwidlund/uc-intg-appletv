@@ -5,13 +5,16 @@
 //! WebSocket server for the Remote Two integration API.
 
 use crate::configuration::{ENV_API_MSG_TRACING, HeartbeatSettings};
-use crate::controller::{Controller, R2AudioChunkMsg};
+use crate::controller::{Controller, R2AudioChunkMsg, driver_version};
 use actix::{Addr, Recipient};
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
+use bytestring::ByteString;
 use log::debug;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
+use uc_api::intg::IntegrationDriverUpdate;
+use uc_api::ws::WsMessage;
 
 mod connection;
 mod events;
@@ -35,6 +38,22 @@ struct WsConn {
     voice: VoiceCount,
     /// Receives the voice audio chunks.
     audio: Recipient<R2AudioChunkMsg>,
+    /// The `authentication` message, sent first.
+    authentication: ByteString,
+}
+
+/// The `authentication` message with the driver version. It is the same for each connection.
+#[derive(Clone)]
+pub struct Authentication(pub ByteString);
+
+impl Authentication {
+    pub fn new(metadata: &IntegrationDriverUpdate) -> Self {
+        let msg = WsMessage::response(0, "authentication", driver_version(metadata));
+        let text = serde_json::to_string(&msg).unwrap_or_else(|_| {
+            r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#.into()
+        });
+        Self(text.into())
+    }
 }
 
 /// Audio received from the Remote in one voice session.
@@ -52,9 +71,11 @@ impl WsConn {
         client_id: String,
         controller_addr: Addr<Controller>,
         heartbeat: HeartbeatSettings,
+        authentication: ByteString,
     ) -> Self {
         let msg_tracing = env::var(ENV_API_MSG_TRACING).unwrap_or_default();
         Self {
+            authentication,
             id: client_id.into(),
             hb: Instant::now(),
             heartbeat,
@@ -74,6 +95,7 @@ pub async fn ws_index(
     stream: web::Payload,
     heartbeat: web::Data<HeartbeatSettings>,
     controller: web::Data<Addr<Controller>>,
+    authentication: web::Data<Authentication>,
 ) -> Result<HttpResponse, Error> {
     // Use peer IP:port as unique client identifier.
     let client_id = request
@@ -93,6 +115,7 @@ pub async fn ws_index(
         client_id,
         controller.get_ref().clone(),
         *heartbeat.get_ref(),
+        authentication.0.clone(),
     );
 
     actix_web::rt::spawn(async move {
@@ -100,4 +123,24 @@ pub async fn ws_index(
     });
 
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Authentication;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn authentication_has_driver_version() {
+        let metadata =
+            serde_json::from_value(json!({ "name": { "en": "Apple TV" } })).expect("metadata");
+        let text = Authentication::new(&metadata).0;
+        let msg: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!("resp", msg["kind"]);
+        assert_eq!(0, msg["req_id"]);
+        assert_eq!(200, msg["code"]);
+        assert_eq!("authentication", msg["msg"]);
+        assert_eq!("Apple TV", msg["msg_data"]["name"]);
+        assert_eq!(crate::APP_VERSION, msg["msg_data"]["version"]["driver"]);
+    }
 }

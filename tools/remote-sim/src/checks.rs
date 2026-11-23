@@ -1480,7 +1480,13 @@ async fn sweep(ctx: &mut Ctx, kind: &str) -> Result<usize, Fail> {
 pub async fn languages(ctx: &mut Ctx) -> Check {
     need_playback(ctx, PlaybackSeen::Driver)?;
     let swept_audio = sweep(ctx, "audio_language").await?;
-    let subtitles = sweep(ctx, "subtitles").await?;
+    // The Apple TV lists Auto only while it is current, so a sweep cannot set it back.
+    let auto = ctx.client.text(&ctx.select("subtitles"), "current_option") == "Auto";
+    let subtitles = if auto {
+        0
+    } else {
+        sweep(ctx, "subtitles").await?
+    };
     // The driver sends each entity in its own message, the select first. The sensor can be one
     // message behind, so wait for it.
     let sensor_id = ctx.sensor("subtitles");
@@ -1535,14 +1541,17 @@ pub async fn languages(ctx: &mut Ctx) -> Check {
         );
     }
     // Languages that came after the sweep were not tested.
-    if subtitles == 0 && shown_subtitles > 0 {
+    if !auto && subtitles == 0 && shown_subtitles > 0 {
         return Err(Fail::skip("subtitles came after the sweep"));
     }
     if swept_audio < 2 && audio >= 2 {
         return Err(Fail::skip("audio languages came after the sweep"));
     }
     // Use the sweep result (0 or at least 2), also when the item changed after the sweep.
-    if swept_audio == 0 && subtitles == 0 {
+    if auto && swept_audio == 0 {
+        return Err(Fail::skip("subtitles are on Auto and were not swept"));
+    }
+    if !auto && swept_audio == 0 && subtitles == 0 {
         let no_item = match ctx.oracle.as_ref().and_then(Oracle::has_item) {
             Some(item) => !item,
             None => ctx.client.text(&ctx.mp(), "media_title").is_empty(),
@@ -1558,9 +1567,11 @@ pub async fn languages(ctx: &mut Ctx) -> Check {
     // The sweep gives 0 for a single option, so show the option count then.
     let tested = if swept_audio >= 2 { swept_audio } else { audio };
     let s = plural(tested);
-    Ok(format!(
-        "{tested} audio language{s}, {subtitles} subtitle options"
-    ))
+    Ok(if auto {
+        format!("{tested} audio language{s}, subtitles on Auto and not swept")
+    } else {
+        format!("{tested} audio language{s}, {subtitles} subtitle options")
+    })
 }
 
 /// "s" for a count other than 1.

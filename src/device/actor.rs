@@ -24,7 +24,7 @@ use ratv::{AppleTv, ClientOptions, Endpoints, Protocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -183,6 +183,37 @@ struct Timers {
     screen: Option<SpawnHandle>,
     /// Running AirPlay scan.
     scan: Option<SpawnHandle>,
+    /// Streams of now playing, volume and Companion events.
+    now_playing: Option<SpawnHandle>,
+    volume: Option<SpawnHandle>,
+    companion: Option<SpawnHandle>,
+}
+
+/// Like `add_message_stream`, but the returned handle can stop the stream.
+fn spawn_stream<M, S>(ctx: &mut Context<AppleTvActor>, stream: S) -> SpawnHandle
+where
+    S: futures::Stream<Item = M> + 'static,
+    M: Message + 'static,
+    AppleTvActor: Handler<M>,
+{
+    ctx.spawn(
+        fut::wrap_stream(stream)
+            .map(|msg, act: &mut AppleTvActor, ctx| {
+                let _ = act.handle(msg, ctx);
+            })
+            .finish(),
+    )
+}
+
+/// Keep `new` in `slot` and stop the stream that was there.
+fn replace_handle(
+    ctx: &mut Context<AppleTvActor>,
+    slot: &mut Option<SpawnHandle>,
+    new: SpawnHandle,
+) {
+    if let Some(old) = slot.replace(new) {
+        ctx.cancel_future(old);
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -457,6 +488,7 @@ impl AppleTvActor {
                 act.controller.do_send(DeviceEvent::Config {
                     key: act.key.clone(),
                     cfg,
+                    version,
                 });
             }
             if act.attempt != attempt {
@@ -584,12 +616,17 @@ impl AppleTvActor {
         }
 
         if let Some(rx) = tv.now_playing() {
-            ctx.add_message_stream(changes(rx.clone(), WatchChanged::NowPlaying(generation)));
+            let h = spawn_stream(
+                ctx,
+                changes(rx.clone(), WatchChanged::NowPlaying(generation)),
+            );
+            replace_handle(ctx, &mut self.timers.now_playing, h);
             self.np = Some(rx);
         }
         // `volume()` also returns the channel of a closed MRP client.
         if let Some(rx) = tv.volume().filter(|_| tv.is_open(Protocol::Mrp)) {
-            ctx.add_message_stream(changes(rx.clone(), WatchChanged::Volume(generation)));
+            let h = spawn_stream(ctx, changes(rx.clone(), WatchChanged::Volume(generation)));
+            replace_handle(ctx, &mut self.timers.volume, h);
             self.volume = Some(rx);
         }
         // The stream of a kept Companion still runs.
@@ -600,7 +637,8 @@ impl AppleTvActor {
                 companion_gen,
                 event: e.ok(),
             });
-            ctx.add_message_stream(events);
+            let h = spawn_stream(ctx, events);
+            replace_handle(ctx, &mut self.timers.companion, h);
         }
 
         let mrp_open = tv.is_open(Protocol::Mrp);
@@ -824,6 +862,9 @@ impl AppleTvActor {
             self.timers.closed.take(),
             self.timers.screen.take(),
             self.timers.scan.take(),
+            self.timers.now_playing.take(),
+            self.timers.volume.take(),
+            self.timers.companion.take(),
         ]
         .into_iter()
         .flatten()
@@ -847,6 +888,9 @@ impl AppleTvActor {
             t.closed,
             t.screen,
             t.scan,
+            t.now_playing,
+            t.volume,
+            t.companion,
         ]
         .into_iter()
         .flatten()
@@ -926,7 +970,13 @@ impl AppleTvActor {
                 ctx.cancel_future(handle);
             }
             self.attempts = 0;
-            self.network_retry_end = None;
+            // A running fast network retry keeps its end, so key presses cannot extend it.
+            if self
+                .network_retry_end
+                .is_none_or(|end| Instant::now() >= end)
+            {
+                self.network_retry_end = None;
+            }
             self.connect(ctx);
         }
     }
@@ -1002,6 +1052,7 @@ impl AppleTvActor {
                         act.controller.do_send(DeviceEvent::Config {
                             key: act.key.clone(),
                             cfg,
+                            version,
                         });
                     }
                     if act.generation != generation {
@@ -1022,6 +1073,8 @@ impl AppleTvActor {
                     }
                     match result {
                         Err(e) if network_not_ready(&e) => act.missing_network_retry(ctx),
+                        // Retries cannot fix the pairing. The next connect tries again.
+                        Err(e) if e.is_auth() => act.stop_missing(&e, joined, ctx),
                         Err(e) => {
                             act.missing_network_end = None;
                             // `mrp_join_failed` has logged it.
@@ -1093,6 +1146,24 @@ impl AppleTvActor {
         });
     }
 
+    /// Stop connecting the missing protocols after an auth error. Retries cannot fix the
+    /// pairing. The next connect tries again. With `joined`, `mrp_join_failed` has logged it.
+    fn stop_missing(&mut self, e: &ratv::Error, joined: bool, ctx: &mut Context<Self>) {
+        self.missing_network_end = None;
+        if let Some(handle) = self.timers.missing.take() {
+            ctx.cancel_future(handle);
+        }
+        if joined {
+            info!("[{}] no more tries until the next connect", self.cfg.name);
+        } else {
+            warn!(
+                "[{}] missing protocols not connected, pairing not accepted: {e}. No more tries \
+                 until the next connect",
+                self.cfg.name
+            );
+        }
+    }
+
     /// Use a handle that has more protocols than the current one. `start` is the start of the
     /// connect. Both handles share the open protocols, so the old one is dropped without close.
     /// Requests and events of a Companion that stays open go on.
@@ -1114,6 +1185,9 @@ impl AppleTvActor {
             self.timers.missing.take(),
             self.timers.closed.take(),
             self.timers.scan.take(),
+            // The Companion stream goes on if Companion stays open.
+            self.timers.now_playing.take(),
+            self.timers.volume.take(),
         ]
         .into_iter()
         .flatten()
@@ -1359,6 +1433,15 @@ impl AppleTvActor {
         );
     }
 
+    /// Stop showing the image of an older item while the fetch waits for MRP.
+    fn clear_older_artwork(&mut self) -> Dirty {
+        let dirty = self.s.clear_older_artwork_url();
+        if self.s.artwork_url.is_none() {
+            self.shown_file = None;
+        }
+        dirty
+    }
+
     /// Use the artwork URL, or serve the image from a file. The image comes from Companion, or is
     /// fetched over MRP.
     ///
@@ -1413,7 +1496,7 @@ impl AppleTvActor {
                 self.cfg.name
             );
             self.artwork_after_mrp = true;
-            return Dirty::NONE;
+            return self.clear_older_artwork();
         }
         debug!("[{}] fetching artwork {id:?}", self.cfg.name);
         let generation = self.generation;
@@ -1517,8 +1600,14 @@ impl AppleTvActor {
     fn find_http_base(&self) -> Option<String> {
         let ip = self.ctx.http_address.or_else(|| {
             // No packet is sent: connect only selects the local address.
-            let target = SocketAddr::new(self.cfg.address?, 9);
-            let socket = UdpSocket::bind((IpAddr::from([0, 0, 0, 0]), 0)).ok()?;
+            let device = self.cfg.address?;
+            // An IPv6 address only if the server listens on `::`.
+            let any = match device {
+                IpAddr::V6(_) if self.ctx.http_ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            };
+            let target = SocketAddr::new(device, 9);
+            let socket = UdpSocket::bind((any, 0)).ok()?;
             socket.connect(target).ok()?;
             Some(socket.local_addr().ok()?.ip())
         })?;

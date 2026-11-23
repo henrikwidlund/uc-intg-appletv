@@ -51,6 +51,7 @@ async fn main() -> io::Result<()> {
 
     let artwork = ArtworkStore::new(settings.config_home.join("artwork"));
     let heartbeat = web::Data::new(settings.heartbeat);
+    let authentication = web::Data::new(server::Authentication::new(&driver_metadata));
     let api_port = settings.http_port;
     let controller = web::Data::new(
         Controller::new(
@@ -66,6 +67,7 @@ async fn main() -> io::Result<()> {
     let http_server = HttpServer::new(move || {
         App::new()
             .app_data(heartbeat.clone())
+            .app_data(authentication.clone())
             .app_data(controller.clone())
             .app_data(artwork.clone())
             .service(server::ws_index)

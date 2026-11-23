@@ -10,11 +10,12 @@ mod messages;
 #[cfg(test)]
 pub(crate) mod test_util;
 
+pub(crate) use handler::driver_version;
 pub use messages::*;
 
 use crate::config_store::{ConfigStore, DriverSettings};
 use crate::configuration::{DEF_SETUP_TIMEOUT_SEC, ENV_SETUP_TIMEOUT, Settings};
-use crate::controller::devices::Device;
+use crate::controller::devices::{Device, VoiceSession};
 use crate::controller::handler::{AbortDriverSetup, SetupState};
 use crate::device::DeviceContext;
 use crate::errors::ServiceError;
@@ -159,6 +160,8 @@ pub struct Controller {
     setup_owner: Option<Arc<str>>,
     /// Id of the setup flow. Changes on each start and end, so that old setup tasks are ignored.
     setup_flow: u32,
+    /// Running pairing of the setup flow. An abort stops it, so it cannot finish later.
+    pairing: Option<SpawnHandle>,
     /// A first setup or a reset: when an Apple TV is paired, a matching configured device keeps
     /// its key, id and name, and all other devices are removed. Nothing is removed if no Apple TV
     /// is paired. Discovery also shows configured devices. A restore replaces all devices on its
@@ -171,8 +174,8 @@ pub struct Controller {
     devices: HashMap<Arc<str>, Device>,
     /// Last sent attributes by entity id.
     entities: HashMap<String, serde_json::Map<String, serde_json::Value>>,
-    /// Device key of each active voice session.
-    voice_sessions: HashMap<u32, Arc<str>>,
+    /// Device and Remote of each active voice session.
+    voice_sessions: HashMap<u32, VoiceSession>,
 }
 
 impl Controller {
@@ -183,14 +186,19 @@ impl Controller {
         artwork: ArtworkStore,
     ) -> Self {
         let store = ConfigStore::new(settings.config_home.clone());
-        let http_address = settings
+        // An IPv6 address can be written with brackets: `[::]`.
+        let interface = settings
             .interface
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .parse::<IpAddr>()
-            .ok()
-            .filter(|ip| !ip.is_unspecified());
+            .ok();
+        let http_address = interface.filter(|ip| !ip.is_unspecified());
+        let http_ipv6 = interface.is_some_and(|ip| ip.is_ipv6() && ip.is_unspecified());
         let device_ctx = Arc::new(DeviceContext {
             client_name: settings.client_name.clone(),
             http_address,
+            http_ipv6,
             http_port: settings.http_port,
             store: store.clone(),
             artwork,
@@ -205,6 +213,7 @@ impl Controller {
             setup: None,
             setup_owner: None,
             setup_flow: 0,
+            pairing: None,
             setup_replace: false,
             store,
             driver_settings,
@@ -429,7 +438,7 @@ mod tests {
 
     mod flow {
         use crate::config_store::tests::device;
-        use crate::controller::devices::Device;
+        use crate::controller::devices::{Device, VoiceSession};
         use crate::controller::test_util::{TestRemote, connect, controller, settle};
         use crate::controller::{Controller, R2EventMsg, R2RequestMsg};
         use crate::device::{AppleTvActor, DeviceEvent, DeviceStatus, Reply};
@@ -460,6 +469,7 @@ mod tests {
                         addr,
                         status: DeviceStatus::Disconnected,
                         wanted: false,
+                        cfg_version: 0,
                     },
                 );
                 Some(key)
@@ -558,6 +568,108 @@ mod tests {
             messages.lock().expect("lock").iter().position(f)
         }
 
+        /// Name of a device in the controller.
+        #[derive(Message)]
+        #[rtype(result = "Option<String>")]
+        struct DeviceName(Arc<str>);
+
+        impl Handler<DeviceName> for Controller {
+            type Result = Option<String>;
+            fn handle(&mut self, msg: DeviceName, _: &mut Context<Self>) -> Option<String> {
+                self.devices.get(&msg.0).map(|d| d.cfg.name.clone())
+            }
+        }
+
+        #[actix::test]
+        async fn config_of_an_old_version_is_dropped() {
+            let (controller, key, _a) = single("config-version").await;
+            let config = |name: &str, version| {
+                let mut cfg = device();
+                cfg.name = name.into();
+                DeviceEvent::Config {
+                    key: key.clone(),
+                    cfg,
+                    version,
+                }
+            };
+            let name = || controller.send(DeviceName(key.clone()));
+            let before = name().await.expect("send");
+            controller.do_send(config("Old", 1));
+            assert_eq!(before, name().await.expect("send"));
+            controller.do_send(config("New", 0));
+            assert_eq!(Some("New".into()), name().await.expect("send"));
+        }
+
+        #[actix::test]
+        async fn available_entities_filter() {
+            let (controller, _, _a) = single("filter").await;
+            let entities = |v: Option<Value>| {
+                v.expect("response")["msg_data"]["available_entities"]
+                    .as_array()
+                    .expect("list")
+                    .iter()
+                    .map(|e| e["entity_type"].as_str().expect("type").to_owned())
+                    .collect::<Vec<_>>()
+            };
+            let all = entities(request(&controller, "a", R2Request::GetAvailableEntities).await);
+            assert!(all.len() > 1);
+            let data = Some(json!({ "filter": { "entity_type": "select" } }));
+            let response =
+                request_data(&controller, "a", R2Request::GetAvailableEntities, data).await;
+            assert_eq!(
+                Some(&json!({ "entity_type": "select" })),
+                response.as_ref().map(|r| &r["msg_data"]["filter"])
+            );
+            let selects = entities(response);
+            assert!(!selects.is_empty() && selects.iter().all(|t| t == "select"));
+            assert_eq!(selects.len(), all.iter().filter(|t| *t == "select").count());
+        }
+
+        /// Start a voice session of Remote `ws_id` without a device.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct AddVoiceSession(u32, &'static str, Arc<str>);
+
+        impl Handler<AddVoiceSession> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: AddVoiceSession, _: &mut Context<Self>) {
+                self.voice_sessions.insert(
+                    msg.0,
+                    VoiceSession {
+                        key: msg.2,
+                        ws_id: msg.1.into(),
+                    },
+                );
+            }
+        }
+
+        /// Remove a device like the setup does.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct RemoveDevice(Arc<str>);
+
+        impl Handler<RemoveDevice> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: RemoveDevice, _: &mut Context<Self>) {
+                self.remove_device(&msg.0);
+            }
+        }
+
+        #[actix::test]
+        async fn voice_session_of_a_removed_device_gets_its_last_event() {
+            let (controller, key, a) = single("voice-removed").await;
+            controller.do_send(AddVoiceSession(6, "a", key.clone()));
+            controller.do_send(RemoveDevice(key.clone()));
+            // The stopping actor ends the session.
+            controller.do_send(DeviceEvent::Assistant(AssistantEvent::Finished {
+                entity_id: EntityKind::VoiceAssistant.entity_id(&key),
+                session_id: 6,
+            }));
+            settle(&controller, &[&a]).await;
+            assert!(position(&a, |m| m["msg"] == "assistant_event").is_some());
+            assert!(!controller.send(HasVoiceSession(6)).await.expect("send"));
+        }
+
         /// Returns `true` if the controller knows the voice session.
         #[derive(Message)]
         #[rtype(result = "bool")]
@@ -604,6 +716,7 @@ mod tests {
         async fn voice_reply_comes_before_assistant_events() {
             let controller = controller("voice-reply");
             let a = connect(&controller, "a").await;
+            controller.do_send(AddVoiceSession(1, "a", "x".into()));
             // The device sends these in this order: the reply when Siri started, then the
             // events of the session.
             controller.do_send(DeviceEvent::Accepted(Reply {
@@ -622,16 +735,25 @@ mod tests {
         }
 
         #[actix::test]
-        async fn assistant_event_goes_to_each_remote() {
-            let controller = controller("assistant-broadcast");
+        async fn assistant_event_goes_to_the_remote_of_the_session() {
+            let controller = controller("assistant-session");
             let a = connect(&controller, "a").await;
             let b = connect(&controller, "b").await;
             let c = connect(&controller, "c").await;
             event(&controller, "c", R2Event::EnterStandby).await;
-            controller.do_send(DeviceEvent::Assistant(AssistantEvent::Finished {
-                entity_id: "voice_assistant.x".into(),
-                session_id: 2,
-            }));
+            controller.do_send(AddVoiceSession(2, "a", "x".into()));
+            controller.do_send(AddVoiceSession(3, "c", "x".into()));
+            let finished = |session_id| {
+                DeviceEvent::Assistant(AssistantEvent::Finished {
+                    entity_id: "voice_assistant.x".into(),
+                    session_id,
+                })
+            };
+            controller.do_send(finished(2));
+            controller.do_send(finished(3));
+            // Unknown, or ended by the event before.
+            controller.do_send(finished(4));
+            controller.do_send(finished(2));
             settle(&controller, &[&a, &b, &c]).await;
             let events = |r: &TestRemote| -> Vec<Value> {
                 r.lock()
@@ -642,9 +764,10 @@ mod tests {
                     .collect()
             };
             assert!(events(&c).is_empty(), "in standby");
-            let (a, b) = (events(&a), events(&b));
+            assert!(events(&b).is_empty(), "not its session");
+            assert!(!controller.send(HasVoiceSession(3)).await.expect("send"));
+            let a = events(&a);
             assert_eq!(1, a.len());
-            assert_eq!(a, b, "the same text");
             assert_eq!("event", a[0]["kind"]);
             assert_eq!("ENTITY", a[0]["cat"]);
             assert_eq!(

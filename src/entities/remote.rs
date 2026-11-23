@@ -178,13 +178,7 @@ pub fn command(
         IntgRemoteCommand::Toggle => Ok(single(Action::Toggle)),
         IntgRemoteCommand::SendCmd => {
             let command = media_player::param_str(params, "command")?;
-            let mut action = map_command(command)?;
-            let hold = param_u64(params, "hold").min(MAX_HOLD_MS);
-            if hold > 0
-                && let Some(key) = action.key()
-            {
-                action = Action::Hold(key, Duration::from_millis(hold));
-            }
+            let action = with_hold(map_command(command)?, hold(params));
             Ok(RemoteRun {
                 actions: vec![action],
                 repeat: repeat(params),
@@ -196,6 +190,7 @@ pub fn command(
                 .and_then(|p| p.get("sequence"))
                 .and_then(Value::as_array)
                 .ok_or_else(|| ServiceError::BadRequest("Missing parameter: sequence".into()))?;
+            let hold = hold(params);
             let actions = sequence
                 .iter()
                 .map(|c| {
@@ -204,6 +199,7 @@ pub fn command(
                             ServiceError::BadRequest("Invalid command in sequence".into())
                         })
                         .and_then(map_command)
+                        .map(|a| with_hold(a, hold))
                 })
                 .collect::<Result<_, _>>()?;
             Ok(RemoteRun {
@@ -236,6 +232,19 @@ fn repeat(params: Option<&Map<String, Value>>) -> u64 {
     match param_u64(params, "repeat") {
         0 | 4 => 1,
         r => r.min(MAX_REPEAT),
+    }
+}
+
+/// Time before a key is released. 0 is a normal press.
+fn hold(params: Option<&Map<String, Value>>) -> Duration {
+    Duration::from_millis(param_u64(params, "hold").min(MAX_HOLD_MS))
+}
+
+/// Hold the key of `action` for `hold`. Actions without a key are not changed.
+fn with_hold(action: Action, hold: Duration) -> Action {
+    match action.key() {
+        Some(key) if !hold.is_zero() => Action::Hold(key, hold),
+        _ => action,
     }
 }
 
@@ -346,6 +355,15 @@ mod tests {
                 Action::AppSwitcher,
                 Action::Press(Key::Down)
             ],
+            run.actions
+        );
+
+        // `hold` is used for each key. Actions without a key stay as they are.
+        let p = params(json!({ "sequence": ["HOME", "APP_SWITCHER"], "hold": 500 }));
+        let run = command("send_cmd_sequence", Some(&p)).expect("ok");
+        let hold = Duration::from_millis(500);
+        assert_eq!(
+            vec![Action::Hold(Key::Home, hold), Action::AppSwitcher],
             run.actions
         );
     }

@@ -692,6 +692,16 @@ impl Snapshot {
             .any(|v| v.as_deref().is_some_and(|t| !t.is_empty()))
     }
 
+    /// Stop showing the image if it belongs to an older item, unless [`Self::keep_artwork`]
+    /// keeps it. Returns [`Dirty::ARTWORK`] if an image was shown.
+    pub fn clear_older_artwork_url(&mut self) -> Dirty {
+        if self.artwork_item == self.item_seq || self.keep_artwork(self.item_seq) {
+            Dirty::NONE
+        } else {
+            self.clear_artwork_url()
+        }
+    }
+
     /// Stop showing the image. Returns [`Dirty::ARTWORK`] if an image was shown.
     pub fn clear_artwork_url(&mut self) -> Dirty {
         if self.artwork_url.take().is_some() {
@@ -1269,6 +1279,26 @@ mod tests {
         s.artwork_kept = false;
         s.prev_item_lasted = Some(Duration::from_secs(60));
         assert!(!s.keep_artwork(2));
+    }
+
+    #[test]
+    fn older_artwork_is_cleared() {
+        let mut s = Snapshot {
+            artwork_url: Some("url".into()),
+            artwork_item: 1,
+            item_seq: 1,
+            ..Snapshot::default()
+        };
+        assert_eq!(Dirty::NONE, s.clear_older_artwork_url());
+        assert!(s.artwork_url.is_some());
+        // The image of a short item before stays.
+        s.item_seq = 2;
+        s.prev_item_lasted = Some(Duration::from_secs(1));
+        assert_eq!(Dirty::NONE, s.clear_older_artwork_url());
+        s.prev_item_lasted = Some(Duration::from_secs(60));
+        assert_eq!(Dirty::ARTWORK, s.clear_older_artwork_url());
+        assert_eq!(None, s.artwork_url);
+        assert_eq!(Dirty::NONE, s.clear_older_artwork_url());
     }
 
     #[test]

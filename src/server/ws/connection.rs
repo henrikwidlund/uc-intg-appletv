@@ -106,9 +106,7 @@ impl WsConn {
         use futures::StreamExt;
 
         // The driver does not check the auth token, so the authentication message is sent right away.
-        let _ = session
-            .text(r#"{"kind":"resp","req_id":0,"code":200,"msg":"authentication"}"#)
-            .await;
+        let _ = session.text(self.authentication.clone()).await;
 
         let sender = WsSender {
             id: Arc::clone(&self.id),
@@ -223,7 +221,8 @@ impl WsConn {
             AggregatedMessage::Pong(_) => Ok(()),
             AggregatedMessage::Close(reason) => {
                 info!("[{}] Remote closed connection. Reason: {reason:?}", self.id);
-                Err(None)
+                // The close is answered with a close, with the same code and description.
+                Err(Some(reason.unwrap_or_else(|| CloseCode::Normal.into())))
             }
         }
     }
@@ -536,6 +535,7 @@ mod tests {
     use crate::controller::test_util::controller;
     use crate::server::ws::WsConn;
     use actix::{Actor, Handler, MessageResult};
+    use bytestring::ByteString;
     use prost::Message;
     use uc_api::intg::proto::{
         AudioConfiguration, AudioFormat, IntegrationMessage, RemoteVoiceBegin, RemoteVoiceData,
@@ -611,6 +611,7 @@ mod tests {
             "test".into(),
             controller("ws-voice"),
             HeartbeatSettings::default(),
+            ByteString::new(),
         );
         let probe = AudioProbe::default().start();
         conn.audio = probe.clone().recipient();

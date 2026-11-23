@@ -10,6 +10,7 @@ mod r2_request;
 mod r2_response;
 mod setup;
 
+pub(crate) use r2_request::driver_version;
 pub(crate) use setup::SetupState;
 
 use actix::Message;

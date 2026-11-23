@@ -36,6 +36,8 @@ impl Handler<R2SessionDisconnect> for Controller {
             self.abort_setup(&msg.id, false, ctx);
         }
         self.sessions.remove(&msg.id);
+        // Its voice sessions cannot get audio or events any more.
+        self.voice_sessions.retain(|_, v| v.ws_id != msg.id);
         self.update_connections(Trigger::Sleep);
     }
 }
