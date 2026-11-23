@@ -133,8 +133,8 @@ pub struct Snapshot {
     pub connected: bool,
     /// MRP is connected: needed for volume and the full now playing.
     pub mrp: bool,
-    /// Siri can be used with the connected protocols and the Siri mode. Set at connect and when a
-    /// protocol closes.
+    /// Siri can be used with the connected protocols and the Siri mode. In MRP mode also true
+    /// while MRP joins. Set at connect, when a protocol closes and when the MRP join fails.
     pub siri: bool,
     pub power: Power,
     pub name: String,
@@ -324,6 +324,146 @@ impl Snapshot {
         self.skip_backward_interval = np.skip_backward_interval;
 
         d | self.update_artwork(np, item_changed)
+    }
+
+    /// Copy only the fields that Companion gives, while MRP connects. The other fields keep
+    /// their values until MRP sends them, or until [`Self::update_now_playing`] clears them.
+    /// A new title clears the fields of the item before. An empty title, or no title and no
+    /// state, means that nothing plays. No title with a state keeps the current item: Companion
+    /// has no title before its first full update. For the same item, a missing duration or
+    /// captions value keeps the known one.
+    pub fn update_companion_now_playing(&mut self, np: &NowPlaying) -> Dirty {
+        let mut d = Dirty::NONE;
+        // `None`: the title is not in this update.
+        let title = match &np.title {
+            Some(t) if t.is_empty() => Some(None),
+            Some(t) => Some(Some(t)),
+            None if np.state.is_none() => Some(None),
+            None => None,
+        };
+        let new_item = title.is_some_and(|t| self.title.as_ref() != t);
+        if new_item {
+            self.item_seq = self.item_seq.wrapping_add(1);
+            let now = Instant::now();
+            self.prev_item_lasted = self.item_started.map(|t| now - t);
+            self.item_started = Some(now);
+            self.title = title.flatten().cloned();
+            d |= Dirty::METADATA | self.clear_item_fields();
+        }
+        let had_state = self.state.is_some();
+        update!(d, Dirty::PLAYBACK, self.state, np.state);
+        if had_state != self.state.is_some() {
+            d |= Dirty::ARTWORK;
+        }
+        // Companion gives the app only for some apps.
+        if np.app.is_some() && self.app != np.app {
+            self.launched_app = None;
+            self.app.clone_from(&np.app);
+            self.app_name = None;
+            d |= Dirty::APP;
+        }
+        let duration = np.duration.filter(|d| *d > 0.0);
+        if new_item || duration.is_some() {
+            update!(d, Dirty::POSITION, self.duration, duration);
+        }
+        update!(d, Dirty::POSITION, self.elapsed, np.elapsed);
+        update!(
+            d,
+            Dirty::POSITION,
+            self.elapsed_timestamp,
+            np.elapsed_timestamp
+        );
+        // ratv already matches the rate to the state.
+        update!(d, Dirty::POSITION | Dirty::RATE, self.rate, np.rate);
+        if new_item || np.captions_enabled.is_some() {
+            update!(
+                d,
+                Dirty::LANGUAGE,
+                self.captions_enabled,
+                np.captions_enabled
+            );
+        }
+        // Companion sends the title and the image in the same update.
+        if new_item {
+            // No image for an empty title: nothing plays.
+            let image = np.artwork_data.as_ref().filter(|_| self.title.is_some());
+            self.artwork_id = None;
+            self.artwork_data = image.cloned();
+            // With an image, it is served from the data. Without one, it is fetched when MRP
+            // connects.
+            self.artwork_fetch = self.title.is_some();
+            // Also without a change to show: the actor then waits for MRP to fetch it.
+            if self.artwork_url.take().is_some() || self.artwork_fetch {
+                d |= Dirty::ARTWORK;
+            }
+            return d;
+        }
+        // A shown image of a known artwork id stays: no new file for the same image. A shown
+        // CDN image stays too.
+        if self.artwork_url.is_some() && (self.artwork_id.is_some() || !self.artwork_fetch) {
+            return d;
+        }
+        let data_changed = match (&self.artwork_data, &np.artwork_data) {
+            (Some(a), Some(b)) => a.as_ptr() != b.as_ptr() || a.len() != b.len(),
+            (a, b) => a.is_some() != b.is_some(),
+        };
+        if data_changed && np.artwork_data.is_some() && self.title.is_some() {
+            // Shown from the data. Without an id, the file name comes from the data, so a file
+            // of the MRP image is not replaced. MRP later sends the id as a change.
+            self.artwork_data.clone_from(&np.artwork_data);
+            self.artwork_id = None;
+            self.artwork_fetch = true;
+            d |= Dirty::ARTWORK;
+        }
+        d
+    }
+
+    /// Clear the MRP fields that belong to the current item. App, shuffle, repeat, rates and
+    /// the artwork stay: the caller sets the artwork, duration, position and captions.
+    fn clear_item_fields(&mut self) -> Dirty {
+        fn clear<T>(field: &mut Option<T>) -> bool {
+            field.take().is_some()
+        }
+        let mut d = Dirty::NONE;
+        let metadata = clear(&mut self.subtitle)
+            | clear(&mut self.artist)
+            | clear(&mut self.album)
+            | clear(&mut self.series_name)
+            | clear(&mut self.season)
+            | clear(&mut self.episode)
+            | clear(&mut self.genre)
+            | clear(&mut self.content_rating)
+            | clear(&mut self.media_type)
+            | clear(&mut self.media_sub_type)
+            | clear(&mut self.is_live)
+            | clear(&mut self.audio_format);
+        if metadata {
+            d |= Dirty::METADATA;
+        }
+        if !self.chapters.is_empty() {
+            self.chapters.clear();
+            d |= Dirty::CHAPTERS;
+        }
+        if !self.up_next.is_empty() {
+            self.up_next.clear();
+            d |= Dirty::QUEUE;
+        }
+        if !self.audio_languages.is_empty() || !self.subtitle_languages.is_empty() {
+            self.audio_languages.clear();
+            self.subtitle_languages.clear();
+            d |= Dirty::LANGUAGES;
+        }
+        let language = clear(&mut self.audio_language)
+            | clear(&mut self.subtitle_language)
+            | std::mem::take(&mut self.subtitles_auto);
+        if language {
+            d |= Dirty::LANGUAGE;
+        }
+        // Used only for commands.
+        self.commands.clear();
+        self.skip_forward_interval = None;
+        self.skip_backward_interval = None;
+        d
     }
 
     /// Copy the artwork fields of a now playing update.
@@ -652,6 +792,236 @@ mod tests {
         let d = s.update_now_playing(&np);
         assert!(d.any(Dirty::PLAYBACK) && d.any(Dirty::POSITION));
         assert!(!d.any(Dirty::METADATA));
+    }
+
+    #[test]
+    fn companion_update_keeps_mrp_fields() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.app = Some("com.app".into());
+        np.app_name = Some("App".into());
+        np.title = Some("Old".into());
+        np.artist = Some("Artist".into());
+        np.artwork_id = Some("id".into());
+        np.skip_forward_interval = Some(15.0);
+        np.state = Some(PlaybackState::Paused);
+        np.duration = Some(200.0);
+        np.audio_languages = vec![LanguageOption::default()];
+        np.audio_language = Some(LanguageOption::default());
+        np.up_next = vec![QueueItem::default()];
+        let mut chapter = Chapter::default();
+        chapter.start = Some(10.0);
+        np.chapters = vec![chapter];
+        s.update_now_playing(&np);
+        s.artwork_url = Some("saved".into());
+
+        // Companion data as ratv merges it without MRP. Same item: MRP fields and the image of
+        // the known artwork id stay.
+        let mut comp = NowPlaying::default();
+        comp.title = Some("Old".into());
+        comp.state = Some(PlaybackState::Playing);
+        comp.rate = Some(1.0);
+        comp.elapsed = Some(3.0);
+        comp.artwork_data = Some(Bytes::from_static(b"old"));
+        let item = s.item_seq;
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::PLAYBACK));
+        assert!(d.any(Dirty::POSITION));
+        assert!(!d.any(Dirty::METADATA));
+        assert!(!d.any(Dirty::CHAPTERS));
+        assert!(!d.any(Dirty::APP));
+        assert!(!d.any(Dirty::ARTWORK));
+        assert_eq!(s.item_seq, item);
+        assert_eq!(s.elapsed, Some(3.0));
+        assert_eq!(s.app.as_deref(), Some("com.app"));
+        assert_eq!(s.app_name.as_deref(), Some("App"));
+        assert_eq!(s.artist.as_deref(), Some("Artist"));
+        assert_eq!(s.chapters.len(), 1);
+        assert_eq!(s.skip_forward_interval, Some(15.0));
+        assert_eq!(s.artwork_id.as_deref(), Some("id"));
+        assert_eq!(s.artwork_url.as_deref(), Some("saved"));
+        assert_eq!(s.artwork_data, None);
+        assert_eq!(s.duration, Some(200.0));
+        assert_eq!(Dirty::NONE, s.update_companion_now_playing(&comp));
+
+        // New title: the fields of the item before are cleared, the app stays, and the
+        // Companion image is used.
+        comp.title = Some("New".into());
+        comp.artwork_data = Some(Bytes::from_static(b"new"));
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::METADATA));
+        assert!(d.any(Dirty::CHAPTERS));
+        assert!(d.any(Dirty::LANGUAGES));
+        assert!(d.any(Dirty::LANGUAGE));
+        assert!(d.any(Dirty::QUEUE));
+        assert!(d.any(Dirty::ARTWORK));
+        assert!(!d.any(Dirty::APP));
+        assert_ne!(s.item_seq, item);
+        assert_eq!(s.duration, None, "not sent for the new item");
+        assert_eq!(s.audio_languages, Vec::new());
+        assert_eq!(s.audio_language, None);
+        assert_eq!(s.up_next, Vec::new());
+        assert_eq!(s.title.as_deref(), Some("New"));
+        assert_eq!(s.artist, None);
+        assert_eq!(s.chapters, Vec::new());
+        assert_eq!(s.skip_forward_interval, None);
+        assert_eq!(s.app.as_deref(), Some("com.app"));
+        assert_eq!(s.artwork_id, None);
+        assert_eq!(s.artwork_url, None);
+        assert_eq!(s.artwork_data, comp.artwork_data);
+        assert!(s.artwork_fetch);
+
+        // A new app from Companion: its name comes later from MRP.
+        s.launched_app = Some("com.launched".into());
+        comp.app = Some("com.other".into());
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::APP));
+        assert_eq!(s.app.as_deref(), Some("com.other"));
+        assert_eq!(s.app_name, None);
+        assert_eq!(s.launched_app, None);
+
+        // An empty title: nothing plays. No image is kept for it.
+        s.artist = Some("Artist".into());
+        s.artwork_url = Some("file".into());
+        comp.title = Some(String::new());
+        comp.state = Some(PlaybackState::Stopped);
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::METADATA));
+        assert!(d.any(Dirty::ARTWORK));
+        assert_eq!(s.title, None);
+        assert_eq!(s.artist, None);
+        assert_eq!(s.artwork_url, None);
+        assert_eq!(s.artwork_data, None);
+        assert!(!s.artwork_fetch);
+        assert_eq!(Dirty::NONE, s.update_companion_now_playing(&comp));
+
+        // Without MRP, the full update clears the MRP fields.
+        comp.app = None;
+        s.update_now_playing(&comp);
+        assert_eq!(s.app, None);
+    }
+
+    #[test]
+    fn companion_partial_updates() {
+        let image = |b: &'static [u8]| Some(Bytes::from_static(b));
+        let mut s = Snapshot::default();
+        let mut full = NowPlaying::default();
+        full.title = Some("A".into());
+        full.state = Some(PlaybackState::Playing);
+        full.duration = Some(100.0);
+        full.captions_enabled = Some(true);
+        // No artwork id and no URL: the image is to be fetched.
+        s.update_now_playing(&full);
+        s.artist = Some("Artist".into());
+        assert!(s.artwork_fetch);
+
+        // Same title, no id: a new image is used.
+        let mut comp = NowPlaying::default();
+        comp.title = Some("A".into());
+        comp.state = Some(PlaybackState::Playing);
+        comp.artwork_data = image(b"one");
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::ARTWORK));
+        assert!(!d.any(Dirty::METADATA));
+        assert_eq!(s.artwork_data, comp.artwork_data);
+        assert_eq!(Dirty::NONE, s.update_companion_now_playing(&comp));
+        comp.artwork_data = image(b"two");
+        assert!(s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+
+        // Partial update: duration and captions are not sent and stay.
+        assert_eq!(s.duration, Some(100.0));
+        assert_eq!(s.captions_enabled, Some(true));
+
+        // No title with a state: the same item.
+        comp.title = None;
+        let d = s.update_companion_now_playing(&comp);
+        assert!(!d.any(Dirty::METADATA));
+        assert_eq!(s.title.as_deref(), Some("A"));
+        assert_eq!(s.artist.as_deref(), Some("Artist"));
+
+        // A shown CDN image is not replaced.
+        s.artwork_url = Some("cdn".into());
+        s.artwork_fetch = false;
+        comp.artwork_data = image(b"three");
+        assert!(!s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+        assert_eq!(s.artwork_url.as_deref(), Some("cdn"));
+
+        // A new item without an image, then its image in a later update.
+        comp.title = Some("B".into());
+        comp.artwork_data = None;
+        comp.duration = Some(50.0);
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::METADATA));
+        assert!(d.any(Dirty::ARTWORK));
+        assert_eq!(s.artwork_url, None);
+        assert_eq!(s.artwork_data, None);
+        assert!(s.artwork_fetch, "fetched over MRP after the join");
+        assert_eq!(s.duration, Some(50.0), "replaced for the new item");
+        comp.artwork_data = image(b"b");
+        assert!(s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+        assert!(s.artwork_fetch);
+        assert_eq!(s.artwork_data, comp.artwork_data);
+
+        // A new item without an image while no image is shown: the fetch waits for MRP.
+        s.artwork_url = None;
+        comp.title = Some("D".into());
+        comp.artwork_data = None;
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::ARTWORK));
+        assert!(s.artwork_fetch);
+        assert_eq!(s.artwork_data, None);
+
+        // A shown file without an id is replaced by a new image.
+        s.artwork_url = Some("file".into());
+        comp.artwork_data = image(b"b2");
+        assert!(s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+        assert_eq!(s.artwork_data, comp.artwork_data);
+
+        // No title and no state: nothing plays.
+        let d = s.update_companion_now_playing(&NowPlaying::default());
+        assert!(d.any(Dirty::METADATA));
+        assert!(d.any(Dirty::ARTWORK));
+        assert_eq!(s.title, None);
+        assert_eq!(s.artwork_data, None);
+
+        // An empty title: its image is not used.
+        comp.title = Some("C".into());
+        s.update_companion_now_playing(&comp);
+        comp.title = Some(String::new());
+        let d = s.update_companion_now_playing(&comp);
+        assert!(d.any(Dirty::METADATA));
+        assert_eq!(s.title, None);
+        assert_eq!(s.artwork_data, None);
+        assert!(!s.artwork_fetch);
+        assert!(!s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+        assert_eq!(s.artwork_data, None);
+    }
+
+    #[test]
+    fn companion_image_without_item() {
+        let image = Some(Bytes::from_static(b"img"));
+        // No title, but a state: no item starts and the image is not used.
+        let mut s = Snapshot::default();
+        let mut comp = NowPlaying::default();
+        comp.state = Some(PlaybackState::Playing);
+        comp.artwork_data.clone_from(&image);
+        s.update_companion_now_playing(&comp);
+        assert_eq!(s.title, None);
+        assert_eq!(s.item_seq, 0);
+        assert_eq!(s.artwork_data, None);
+
+        // Same title with a known id, but no image shown: the Companion image is used.
+        let mut full = NowPlaying::default();
+        full.title = Some("A".into());
+        full.state = Some(PlaybackState::Playing);
+        full.artwork_id = Some("id".into());
+        s.update_now_playing(&full);
+        assert_eq!(s.artwork_url, None);
+        comp.title = Some("A".into());
+        assert!(s.update_companion_now_playing(&comp).any(Dirty::ARTWORK));
+        assert_eq!(s.artwork_data, image);
+        assert_eq!(s.artwork_id, None);
+        assert!(s.artwork_fetch);
     }
 
     #[test]

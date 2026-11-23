@@ -51,13 +51,20 @@ const NOT_READY_RETRY: [Duration; 3] = [
 /// A command is dropped when it waited longer than this for the connect or for the command
 /// before it. The user does not expect it any more.
 const COMMAND_MAX_WAIT: Duration = Duration::from_secs(10);
-/// Longest wait for a running connect before a command runs.
+/// Longest wait for a running connect before a command runs. Also limits the wait for the MRP
+/// join.
 const CONNECT_WAIT: Duration = COMMAND_MAX_WAIT;
 /// A connect step without answer in this time is started again once.
 ///
 /// After wake-up, the Wi-Fi link of the Remote can go down for a short time during the connect.
 /// Lost packets then wait for the TCP resend (1 s or more). A connect step takes much less.
 const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Time that Companion connects alone. If it takes longer, MRP alone is tried at the same time.
+/// Companion connects in about 30 ms, so a longer time means that a step stalled.
+const COMPANION_HEAD_START: Duration = STALL_TIMEOUT;
+/// Longest wait of a command for MRP after a connect with Companion only. Siri over MRP waits for
+/// the end of the join, see [`JoinWait::Full`].
+const MRP_JOIN_WAIT: Duration = STALL_TIMEOUT;
 /// Longest wait for the first now playing and volume state after a connect.
 const FIRST_STATE_WAIT: Duration = Duration::from_secs(1);
 /// Time between connects while the network is not ready, for example right after wake-up.
@@ -103,8 +110,33 @@ enum WatchChanged {
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 struct CompanionEvent {
-    generation: u64,
+    /// Value of [`AppleTvActor::companion_gen`] when the stream started.
+    companion_gen: u64,
     event: Option<Event>,
+}
+
+/// How [`AppleTvActor::on_connected`] got its handle.
+#[derive(Clone, Copy)]
+enum Link {
+    /// A new connect. `via` tells how the address was found. With `join`, the handle has only
+    /// Companion, and MRP is connected next at these endpoints.
+    New {
+        via: &'static str,
+        join: Option<Endpoints>,
+    },
+    /// From `connect_missing`. `added` names the new protocols for the log. With
+    /// `keep_companion`, Companion is the same as in the handle before, so its requests and
+    /// events go on.
+    Missing {
+        added: &'static str,
+        keep_companion: bool,
+    },
+}
+
+/// Receivers that a command waits on while a connect or the MRP join runs.
+struct ConnectWait {
+    status: watch::Receiver<DeviceStatus>,
+    mrp_join: watch::Receiver<Option<tokio::time::Instant>>,
 }
 
 struct SiriSession {
@@ -177,6 +209,14 @@ pub struct AppleTvActor {
     connected_at: Option<Instant>,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
+    /// Incremented when Companion connects or closes. Results of older Companion requests are
+    /// ignored. A handle from `connect_missing` that keeps Companion keeps this value.
+    companion_gen: u64,
+    /// Set while MRP connects after a connect with Companion only. Holds the end of the
+    /// command wait for it, see [`MRP_JOIN_WAIT`].
+    mrp_join: watch::Sender<Option<tokio::time::Instant>>,
+    /// The artwork needs MRP. It is fetched when MRP connects.
+    artwork_after_mrp: bool,
     np: Option<watch::Receiver<NowPlaying>>,
     volume: Option<watch::Receiver<Volume>>,
     attention: Option<AttentionState>,
@@ -258,6 +298,9 @@ impl AppleTvActor {
             attempt: 0,
             connected_at: None,
             generation: 0,
+            companion_gen: 0,
+            mrp_join: watch::Sender::new(None),
+            artwork_after_mrp: false,
             np: None,
             volume: None,
             attention: None,
@@ -323,12 +366,32 @@ impl AppleTvActor {
         }
     }
 
-    /// Status updates while a connect runs and there is no connection yet.
+    /// What to wait on while a connect runs and there is no connection yet, or while MRP
+    /// connects after a connect with Companion only.
     /// Uses the shown status: it stays `Connecting` between quick retries while the network is
     /// not ready.
-    fn running_connect(&self) -> Option<watch::Receiver<DeviceStatus>> {
-        (self.tv.is_none() && *self.status_tx.borrow() == DeviceStatus::Connecting)
-            .then(|| self.status_tx.subscribe())
+    fn running_connect(&self) -> Option<ConnectWait> {
+        let connecting = self.tv.is_none() && *self.status_tx.borrow() == DeviceStatus::Connecting;
+        (connecting || self.joining()).then(|| ConnectWait {
+            status: self.status_tx.subscribe(),
+            mrp_join: self.mrp_join.subscribe(),
+        })
+    }
+
+    /// MRP connects after a connect with Companion only.
+    fn joining(&self) -> bool {
+        self.mrp_join.borrow().is_some()
+    }
+
+    /// Start the MRP join. Commands wait for it until [`MRP_JOIN_WAIT`] from now.
+    fn start_mrp_join(&self) {
+        self.mrp_join
+            .send_replace(Some(tokio::time::Instant::now() + MRP_JOIN_WAIT));
+    }
+
+    /// End the MRP join. Returns `true` if it was running.
+    fn end_mrp_join(&self) -> bool {
+        self.mrp_join.send_if_modified(|j| j.take().is_some())
     }
 
     /// Set the status and show it, if the shown status is different.
@@ -401,7 +464,7 @@ impl AppleTvActor {
                     "[{}] result of an old connect attempt ignored",
                     act.cfg.name
                 );
-                if let Ok((tv, ..)) = result {
+                if let Ok(Connected { tv, .. }) = result {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
@@ -409,13 +472,15 @@ impl AppleTvActor {
                 return;
             }
             match result {
-                Ok((tv, ep, via)) if act.want && act.status == DeviceStatus::Connecting => {
+                Ok(Connected { tv, ep, via, join })
+                    if act.want && act.status == DeviceStatus::Connecting =>
+                {
                     if act.cfg_version == version {
                         act.endpoints = Some(ep);
                     }
-                    act.on_connected(tv, via, start, ctx);
+                    act.on_connected(tv, Link::New { via, join }, start, ctx);
                 }
-                Ok((tv, ..)) => {
+                Ok(Connected { tv, .. }) => {
                     actix::spawn(async move {
                         let _ = tv.close().await;
                     });
@@ -452,16 +517,41 @@ impl AppleTvActor {
         }));
     }
 
-    /// `via` tells how the address was found, `start` is the start of the connect.
-    fn on_connected(&mut self, tv: AppleTv, via: &str, start: Instant, ctx: &mut Context<Self>) {
+    /// Log the new handle. Returns the endpoints for the MRP join and `keep_companion`.
+    fn log_link(&self, link: Link, ms: u128) -> (Option<Endpoints>, bool) {
+        match link {
+            Link::New { via, join: None } => {
+                info!("[{}] connected in {ms} ms ({via})", self.cfg.name);
+                (None, false)
+            }
+            Link::New {
+                via,
+                join: Some(ep),
+            } => {
+                info!(
+                    "[{}] Companion connected in {ms} ms ({via}), MRP next",
+                    self.cfg.name
+                );
+                (Some(ep), false)
+            }
+            Link::Missing {
+                added,
+                keep_companion,
+            } => {
+                info!("[{}] {added} connected in {ms} ms", self.cfg.name);
+                (None, keep_companion)
+            }
+        }
+    }
+
+    /// Use a new handle. `start` is the start of the connect. While MRP joins, the MRP state
+    /// stays as it is.
+    fn on_connected(&mut self, tv: AppleTv, link: Link, start: Instant, ctx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
         let now = Instant::now();
-        info!(
-            "[{}] connected in {} ms ({via})",
-            self.cfg.name,
-            (now - start).as_millis()
-        );
+        let (join, keep_companion) = self.log_link(link, (now - start).as_millis());
+        let join_mrp = join.is_some();
         self.connected_at = Some(now);
         self.network_retry_end = None;
         self.command_timeouts.clear();
@@ -470,6 +560,9 @@ impl AppleTvActor {
         let mut any_missing = false;
         for protocol in missing(&tv) {
             any_missing = true;
+            if join_mrp && protocol == Protocol::Mrp {
+                continue;
+            }
             warn!(
                 "[{}] not connected: {}",
                 self.cfg.name,
@@ -480,11 +573,14 @@ impl AppleTvActor {
 
         self.s.connected = true;
         self.s.mrp = tv.is_open(Protocol::Mrp);
-        self.s.siri = siri_available(&tv, self.ctx.siri_mode());
-        let own_uid = tv.mrp().and_then(|m| m.device_info().device_uid.clone());
-        if self.s.own_output_uid != own_uid {
-            self.s.own_output_uid = own_uid;
-            dirty |= Dirty::OUTPUTS;
+        // Companion is open, so only the MRP mode can need the join.
+        self.s.siri = siri_available(&tv, self.ctx.siri_mode()) || join_mrp;
+        if !join_mrp {
+            let own_uid = tv.mrp().and_then(|m| m.device_info().device_uid.clone());
+            if self.s.own_output_uid != own_uid {
+                self.s.own_output_uid = own_uid;
+                dirty |= Dirty::OUTPUTS;
+            }
         }
 
         if let Some(rx) = tv.now_playing() {
@@ -496,25 +592,36 @@ impl AppleTvActor {
             ctx.add_message_stream(changes(rx.clone(), WatchChanged::Volume(generation)));
             self.volume = Some(rx);
         }
-        if let Some(companion) = tv.companion() {
+        // The stream of a kept Companion still runs.
+        if !keep_companion && let Some(companion) = tv.companion() {
+            self.companion_gen += 1;
+            let companion_gen = self.companion_gen;
             let events = BroadcastStream::new(companion.events()).map(move |e| CompanionEvent {
-                generation,
+                companion_gen,
                 event: e.ok(),
             });
             ctx.add_message_stream(events);
         }
 
+        let mrp_open = tv.is_open(Protocol::Mrp);
         self.tv = Some(tv);
+        // Before the status: a command that waits for the connect then waits for MRP too.
+        if join_mrp {
+            self.start_mrp_join();
+        } else {
+            self.end_mrp_join();
+        }
         self.watch_closed(ctx);
         self.set_status(DeviceStatus::Connected);
-        // One request at a time: ratv closes Companion after two silent timeouts in a row.
-        self.query_power(ctx, 0, true);
+        // A kept Companion has these from the handle before.
+        if !keep_companion {
+            // One request at a time: ratv closes Companion after two silent timeouts in a row.
+            self.query_power(ctx, 0, true);
+        }
         // Until the device sends its state, the channels hold empty values. Using them would clear
         // what the Remote shows, so they are used only when they have data, after the first
         // update or after a wait. The first value can already have data without a change mark.
-        if self.np.as_ref().is_some_and(|rx| {
-            rx.has_changed().unwrap_or(false) || *rx.borrow() != NowPlaying::default()
-        }) {
+        if self.np_has_data() {
             dirty |= self.update_now_playing(ctx);
         }
         if self
@@ -523,6 +630,9 @@ impl AppleTvActor {
             .is_some_and(|rx| rx.has_changed().unwrap_or(false))
         {
             dirty |= self.update_volume();
+        }
+        if mrp_open && self.artwork_after_mrp {
+            self.update_artwork(ctx);
         }
         ctx.run_later(FIRST_STATE_WAIT, move |act, ctx| {
             if act.generation == generation {
@@ -536,8 +646,15 @@ impl AppleTvActor {
         self.timers.poll = Some(ctx.run_interval(POLL_INTERVAL, Self::poll));
         // `watch_closed` sees only the open protocols, so the missing ones are tried again here.
         if any_missing {
-            self.start_missing(ctx);
+            self.start_missing(join, ctx);
         }
+    }
+
+    /// The now playing channel has data from the device.
+    fn np_has_data(&self) -> bool {
+        self.np.as_ref().is_some_and(|rx| {
+            rx.has_changed().unwrap_or(false) || *rx.borrow() != NowPlaying::default()
+        })
     }
 
     /// Wait until one of the open protocols closes. When the other protocol is still open, it
@@ -606,6 +723,8 @@ impl AppleTvActor {
     }
 
     /// One protocol closed and the other is still open. Show what is gone and connect it again.
+    /// This is not an MRP join: commands do not wait, and the full update clears the MRP fields,
+    /// because a lost MRP can stay lost.
     fn protocol_lost(&mut self, protocol: Protocol, ctx: &mut Context<Self>) {
         let Some(tv) = &self.tv else { return };
         let mut dirty = Dirty::NONE;
@@ -617,7 +736,7 @@ impl AppleTvActor {
         dirty |= self.clear_protocol_state(protocol);
         self.emit(dirty);
         self.watch_closed(ctx);
-        self.start_missing(ctx);
+        self.start_missing(None, ctx);
     }
 
     /// Clear the state that comes from `protocol`, which is not connected.
@@ -633,6 +752,8 @@ impl AppleTvActor {
                 self.s.update_volume(&Volume::default())
             }
             Protocol::Companion => {
+                // Results of requests to the closed client are not used.
+                self.companion_gen += 1;
                 self.attention = None;
                 self.media_flags = None;
                 self.expected_power = None;
@@ -645,12 +766,13 @@ impl AppleTvActor {
     /// Try the missing protocols now and then at each [`MISSING_RETRY_INTERVAL`].
     /// Now, because after a restart of the device the connect is refused and a scan finds the new
     /// port in about 2 s.
-    fn start_missing(&mut self, ctx: &mut Context<Self>) {
+    /// `ep` is used for this try instead of the known endpoints.
+    fn start_missing(&mut self, ep: Option<Endpoints>, ctx: &mut Context<Self>) {
         if self.timers.missing.is_none() {
             self.timers.missing =
                 Some(ctx.run_interval(MISSING_RETRY_INTERVAL, Self::retry_missing));
         }
-        self.retry_missing(ctx);
+        self.retry_missing_at(ep, ctx);
     }
 
     /// Drop the connection and mark the entities unavailable.
@@ -666,6 +788,7 @@ impl AppleTvActor {
     /// Close the connection and stop all tasks of it.
     fn close(&mut self, ctx: &mut Context<Self>) {
         self.generation += 1;
+        self.companion_gen += 1;
         self.attempt += 1;
         // A connection that drops at once keeps the reconnect delay growing.
         if self
@@ -687,6 +810,8 @@ impl AppleTvActor {
         self.expected_power = None;
         self.missing_running = false;
         self.missing_network_end = None;
+        self.end_mrp_join();
+        self.artwork_after_mrp = false;
         for handle in [
             self.timers.poll.take(),
             self.timers.chapter.take(),
@@ -805,12 +930,21 @@ impl AppleTvActor {
     /// device refused the connect or an endpoint is not known. The open protocols stay connected.
     /// Skipped while Siri or a fast forward or rewind is active: a new handle restarts the tasks
     /// of the connection, and a new MRP connection does not know about a running fast forward.
+    /// Not skipped when the MRP join starts: commands wait for it a short time, Siri over MRP
+    /// until it ends, and no fast forward runs yet. The check holds only at the start: a fast
+    /// forward that starts after the short wait can end through the new handle after the join.
+    /// Later tries, after the join ended, are skipped as above.
     fn retry_missing(&mut self, ctx: &mut Context<Self>) {
+        self.retry_missing_at(None, ctx);
+    }
+
+    /// [`Self::retry_missing`] with `ep` instead of the known endpoints, if set.
+    fn retry_missing_at(&mut self, ep: Option<Endpoints>, ctx: &mut Context<Self>) {
         let Some(tv) = self.tv.clone() else { return };
         if self.missing_running {
             return;
         }
-        if self.siri.is_some() || self.seek.is_some() {
+        if !self.joining() && (self.siri.is_some() || self.seek.is_some()) {
             debug!(
                 "[{}] missing protocol retry skipped: device is busy",
                 self.cfg.name
@@ -823,7 +957,7 @@ impl AppleTvActor {
         let generation = self.generation;
         let version = self.cfg_version;
         let mut cfg = self.cfg.clone();
-        let ep = self.endpoints.unwrap_or_default();
+        let ep = ep.or(self.endpoints).unwrap_or_default();
         let options = self.client_options();
         let fut = async move {
             if has_missing_endpoints(&tv, ep) {
@@ -877,11 +1011,18 @@ impl AppleTvActor {
                     if act.cfg_version == version {
                         act.endpoints = Some(ep);
                     }
+                    let joined = act.end_mrp_join();
+                    if joined && let Err(e) = &result {
+                        act.mrp_join_failed(e, ctx);
+                    }
                     match result {
                         Err(e) if network_not_ready(&e) => act.missing_network_retry(ctx),
                         Err(e) => {
                             act.missing_network_end = None;
-                            debug!("[{}] missing protocols did not connect: {e}", act.cfg.name);
+                            // `mrp_join_failed` has logged it.
+                            if !joined {
+                                debug!("[{}] missing protocols did not connect: {e}", act.cfg.name);
+                            }
                         }
                         Ok(Some(tv)) => {
                             act.missing_network_end = None;
@@ -891,6 +1032,36 @@ impl AppleTvActor {
                     }
                 }),
         );
+    }
+
+    /// MRP did not connect after a connect with Companion only. Show what is missing and clear
+    /// the MRP fields of now playing, as a connect without MRP does.
+    fn mrp_join_failed(&mut self, e: &ratv::Error, ctx: &mut Context<Self>) {
+        let Some(tv) = &self.tv else { return };
+        warn!(
+            "[{}] MRP did not connect: {e}. {}",
+            self.cfg.name,
+            lost_features(Protocol::Mrp)
+        );
+        let mut dirty = Dirty::NONE;
+        let siri = siri_available(tv, self.ctx.siri_mode());
+        if self.s.siri != siri {
+            self.s.siri = siri;
+            dirty |= Dirty::CONNECTION;
+        }
+        if self.s.own_output_uid.take().is_some() {
+            dirty |= Dirty::OUTPUTS;
+        }
+        dirty |= self.clear_protocol_state(Protocol::Mrp);
+        // After the first state wait, a connect without MRP has also cleared the MRP fields.
+        if self.np_has_data()
+            || self
+                .connected_at
+                .is_some_and(|t| t.elapsed() >= FIRST_STATE_WAIT)
+        {
+            dirty |= self.update_now_playing(ctx);
+        }
+        self.emit(dirty);
     }
 
     /// Try the missing protocols again soon while the network is not ready, for example right
@@ -919,7 +1090,20 @@ impl AppleTvActor {
 
     /// Use a handle that has more protocols than the current one. `start` is the start of the
     /// connect. Both handles share the open protocols, so the old one is dropped without close.
+    /// Requests and events of a Companion that stays open go on.
     fn use_handle(&mut self, tv: AppleTv, start: Instant, ctx: &mut Context<Self>) {
+        let open = |tv: Option<&AppleTv>, p| tv.is_some_and(|tv| tv.is_open(p));
+        let old = self.tv.as_ref();
+        let keep_companion = open(old, Protocol::Companion) && open(Some(&tv), Protocol::Companion);
+        let added = match (
+            !open(old, Protocol::Companion) && open(Some(&tv), Protocol::Companion),
+            !open(old, Protocol::Mrp) && open(Some(&tv), Protocol::Mrp),
+        ) {
+            (true, true) => "Companion and MRP",
+            (true, false) => "Companion",
+            (false, true) => "MRP",
+            (false, false) => "no new protocol",
+        };
         for handle in [
             self.timers.poll.take(),
             self.timers.missing.take(),
@@ -935,7 +1119,11 @@ impl AppleTvActor {
         self.np = None;
         self.volume = None;
         let connected_at = self.connected_at;
-        self.on_connected(tv, "missing protocols", start, ctx);
+        let link = Link::Missing {
+            added,
+            keep_companion,
+        };
+        self.on_connected(tv, link, start, ctx);
         // The connection did not drop, so the time for the reconnect delay stays.
         self.connected_at = connected_at;
     }
@@ -947,7 +1135,7 @@ impl AppleTvActor {
         if !tv.is_open(Protocol::Companion) {
             return;
         }
-        let generation = self.generation;
+        let companion_gen = self.companion_gen;
         ctx.spawn(
             async move {
                 match tv.companion() {
@@ -957,7 +1145,7 @@ impl AppleTvActor {
             }
             .into_actor(self)
             .map(move |result, act, ctx| {
-                if act.generation != generation {
+                if act.companion_gen != companion_gen {
                     return;
                 }
                 match result {
@@ -970,7 +1158,7 @@ impl AppleTvActor {
                                 delay.as_secs()
                             );
                             ctx.run_later(delay, move |act, ctx| {
-                                if act.generation == generation {
+                                if act.companion_gen == companion_gen {
                                     act.query_power(ctx, attempt + 1, then_poll);
                                 }
                             });
@@ -999,7 +1187,8 @@ impl AppleTvActor {
             // still be the app from before the Home Screen.
             if !self.home_dropped {
                 self.home_dropped = true;
-                let generation = self.generation;
+                // The Home Screen comes from Companion, so an MRP join does not stop the timer.
+                let companion_gen = self.companion_gen;
                 ctx.run_later(
                     HOME_GRACE.saturating_sub(since.elapsed()),
                     move |act, ctx| {
@@ -1008,7 +1197,8 @@ impl AppleTvActor {
                             .np
                             .as_ref()
                             .is_some_and(|rx| rx.borrow().state == Some(PlaybackState::Playing));
-                        if act.generation == generation && act.home_since.is_some() && playing {
+                        if act.companion_gen == companion_gen && act.home_since.is_some() && playing
+                        {
                             let dirty = act.update_now_playing(ctx);
                             act.emit(dirty);
                         }
@@ -1026,7 +1216,11 @@ impl AppleTvActor {
                 self.cfg.name
             );
         }
-        let dirty = self.s.update_now_playing(&rx.borrow());
+        let dirty = if self.joining() {
+            self.s.update_companion_now_playing(&rx.borrow())
+        } else {
+            self.s.update_now_playing(&rx.borrow())
+        };
         self.apply_now_playing(dirty, ctx)
     }
 
@@ -1066,7 +1260,8 @@ impl AppleTvActor {
         if let Some(handle) = self.timers.screen.take() {
             ctx.cancel_future(handle);
         }
-        let generation = self.generation;
+        // Screen events come from Companion, so an MRP join does not stop the timer.
+        let companion_gen = self.companion_gen;
         self.timers.screen = Some(ctx.run_later(SCREEN_SETTLE, move |act, ctx| {
             act.timers.screen = None;
             // Another screen opened after the launch: the launched app may not be in front.
@@ -1076,7 +1271,7 @@ impl AppleTvActor {
                 act.launched_at = None;
                 act.emit(Dirty::APP);
             }
-            if act.generation != generation
+            if act.companion_gen != companion_gen
                 || act.home_since.is_some()
                 || act.s.state == Some(PlaybackState::Playing)
                 || act.media_flags.is_some_and(|f| f != 0)
@@ -1148,11 +1343,17 @@ impl AppleTvActor {
     /// has the image.
     fn update_artwork(&mut self, ctx: &mut Context<Self>) {
         self.artwork_seq += 1;
+        self.artwork_after_mrp = false;
+        // No URL means no file is shown: the file before must not pass to this item.
+        if self.s.artwork_url.is_none() {
+            self.shown_file = None;
+        }
         if !self.s.artwork_fetch {
             if let Some(url) = &self.s.artwork_url {
                 debug!("[{}] artwork url: {url}", self.cfg.name);
+                // A CDN URL is not a file.
+                self.shown_file = None;
             }
-            self.shown_file = None;
             return;
         }
         let Some(tv) = self.tv.clone().filter(|_| self.s.state.is_some()) else {
@@ -1167,6 +1368,14 @@ impl AppleTvActor {
             debug!("[{}] artwork {id:?} from Companion", self.cfg.name);
             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&data)));
             self.save_artwork(&id, None, data, (item, item_key));
+            return;
+        }
+        if !tv.is_open(Protocol::Mrp) {
+            debug!(
+                "[{}] artwork {id:?} is fetched when MRP connects",
+                self.cfg.name
+            );
+            self.artwork_after_mrp = true;
             return;
         }
         debug!("[{}] fetching artwork {id:?}", self.cfg.name);
@@ -1333,7 +1542,7 @@ impl AppleTvActor {
         let Some(tv) = self.tv.clone().filter(|tv| tv.is_open(Protocol::Companion)) else {
             return;
         };
-        let generation = self.generation;
+        let companion_gen = self.companion_gen;
         let fetch_apps = poll_due(self.apps_fetched);
         // One after the other: ratv closes Companion after two silent timeouts in a row.
         let fut = async move {
@@ -1345,7 +1554,7 @@ impl AppleTvActor {
             (apps, tv.accounts().await)
         };
         ctx.spawn(fut.into_actor(self).map(move |(apps, accounts), act, ctx| {
-            if act.generation != generation {
+            if act.companion_gen != companion_gen {
                 return;
             }
             let apps_error = act.apply_apps(apps);
@@ -1375,7 +1584,7 @@ impl AppleTvActor {
                     delay.as_secs()
                 );
                 ctx.run_later(delay, move |act, ctx| {
-                    if act.generation == generation {
+                    if act.companion_gen == companion_gen {
                         act.poll_companion(ctx, attempt + 1);
                     }
                 });
@@ -1635,7 +1844,13 @@ impl AppleTvActor {
             siri.finish().await?;
             Ok(Some(chunks))
         };
-        let start = connect_ended(connecting)
+        // Siri over MRP needs MRP. Over Companion it starts after the short join wait.
+        let join_wait = if mode == SiriMode::Mrp {
+            JoinWait::Full
+        } else {
+            JoinWait::Deadline
+        };
+        let start = connect_ended(connecting, join_wait)
             .into_actor(self)
             .then(move |(), act, _| fut(act.tv.clone()).into_actor(act));
         ctx.spawn(start.map(move |result, act, _| {
@@ -1668,8 +1883,17 @@ enum ConnectError {
     Failed(ratv::Error),
 }
 
-/// Connect result with the address source for the log.
-type ConnectResult = Result<(AppleTv, Endpoints, &'static str), ConnectError>;
+/// A successful connect.
+struct Connected {
+    tv: AppleTv,
+    ep: Endpoints,
+    /// How the address was found, for the log.
+    via: &'static str,
+    /// Set when the handle has only Companion: MRP is connected next at these endpoints.
+    join: Option<Endpoints>,
+}
+
+type ConnectResult = Result<Connected, ConnectError>;
 
 /// Connect at the last endpoints, else find the device and connect there. Also returns the
 /// configuration if discovery changed it.
@@ -1682,8 +1906,12 @@ async fn connect_device(
     // address now. Then the scan below finds the device by its ids.
     let mut auth_failed_at = None;
     if let Some(ep) = known {
-        match AppleTv::connect(&ep, &cfg.credentials, &options).await {
-            Ok(tv) => return (None, Ok((tv, ep, "last address"))),
+        match connect_endpoints(ep, &cfg.credentials, &options).await {
+            Ok((tv, join_mrp)) => {
+                let via = "last address";
+                let join = join_mrp.then_some(ep);
+                return (None, Ok(Connected { tv, ep, via, join }));
+            }
             Err(e) if e.is_auth() => {
                 debug!("[{}] last endpoints failed, scanning: {e}", cfg.name);
                 auth_failed_at = Some((ep, e));
@@ -1715,13 +1943,104 @@ async fn connect_device(
             );
         }
     }
-    let result = AppleTv::connect(&ep, &cfg.credentials, &options).await;
+    let result = connect_endpoints(ep, &cfg.credentials, &options).await;
     (
         changed.then_some(cfg),
         result
-            .map(|tv| (tv, ep, "scan"))
+            .map(|(tv, join_mrp)| Connected {
+                tv,
+                ep,
+                via: "scan",
+                join: join_mrp.then_some(ep),
+            })
             .map_err(ConnectError::Failed),
     )
+}
+
+/// Connect Companion first: it is faster and has the power state, so a slow MRP does not hold
+/// it back. MRP is then connected with `connect_missing`. Returns the handle and `true` if MRP
+/// is still to be connected.
+///
+/// MRP alone is tried when Companion fails, and also when Companion takes longer than
+/// [`COMPANION_HEAD_START`]. So a device with only MRP still connects. A fast Companion error
+/// adds the MRP connect time, a slow one at most [`COMPANION_HEAD_START`]. MRP is not tried when
+/// the network is not ready: it fails the same way.
+async fn connect_endpoints(
+    ep: Endpoints,
+    credentials: &ratv::Credentials,
+    options: &ClientOptions,
+) -> Result<(AppleTv, bool), ratv::Error> {
+    let (Some(companion), Some(airplay)) = (ep.companion, ep.airplay) else {
+        return AppleTv::connect(&ep, credentials, options)
+            .await
+            .map(|tv| (tv, false));
+    };
+    let companion_ep = Endpoints {
+        companion: Some(companion),
+        airplay: None,
+    };
+    let mrp_ep = Endpoints {
+        companion: None,
+        airplay: Some(airplay),
+    };
+    // Boxed: a connect future is large, and two run here.
+    let (result, extra) = companion_first(
+        Box::pin(AppleTv::connect(&companion_ep, credentials, options)),
+        || Box::pin(AppleTv::connect(&mrp_ep, credentials, options)),
+        COMPANION_HEAD_START,
+        |e| !network_not_ready(e),
+    )
+    .await;
+    // Companion won: MRP is connected again with `connect_missing`, which needs one handle.
+    if let Some(tv) = extra {
+        actix::spawn(async move {
+            let _ = tv.close().await;
+        });
+    }
+    result
+}
+
+/// Run `companion`. Start `mrp` when `companion` fails and `try_mrp` allows it, or when
+/// `companion` takes longer than `head_start`. A Companion result wins. When both fail, the
+/// Companion error is returned, as `AppleTv::connect` does.
+///
+/// Returns the result with `true` if it came from `companion`, and an MRP result that is not
+/// used and must be closed.
+async fn companion_first<T, E, C, M>(
+    companion: C,
+    mrp: impl FnOnce() -> M,
+    head_start: Duration,
+    try_mrp: impl Fn(&E) -> bool,
+) -> (Result<(T, bool), E>, Option<T>)
+where
+    C: Future<Output = Result<T, E>>,
+    M: Future<Output = Result<T, E>>,
+{
+    let mut companion = std::pin::pin!(companion);
+    let (companion, mrp) = match tokio::time::timeout(head_start, &mut companion).await {
+        Ok(Ok(tv)) => (Ok(tv), None),
+        Ok(Err(e)) if !try_mrp(&e) => (Err(e), None),
+        Ok(Err(e)) => (Err(e), Some(mrp().await)),
+        Err(_) => {
+            let mut mrp = std::pin::pin!(mrp());
+            tokio::select! {
+                biased;
+                result = &mut companion => match result {
+                    // Dropping `mrp` stops its connect.
+                    Ok(tv) => (Ok(tv), None),
+                    Err(e) if !try_mrp(&e) => (Err(e), None),
+                    Err(e) => (Err(e), Some(mrp.await)),
+                },
+                result = &mut mrp => (companion.await, Some(result)),
+            }
+        }
+    };
+    match (companion, mrp) {
+        (Ok(tv), Some(Ok(extra))) => (Ok((tv, true)), Some(extra)),
+        (Ok(tv), _) => (Ok((tv, true)), None),
+        (Err(_), Some(Ok(tv))) => (Ok((tv, false)), None),
+        (Err(e), _) => (Err(e), None),
+    }
 }
 
 /// Protocols of `tv` that are not open.
@@ -1854,12 +2173,41 @@ fn siri_unavailable(entity_id: String, session_id: u32, message: &str) -> Assist
     }
 }
 
-/// Wait until a running connect has ended, at most [`CONNECT_WAIT`].
-async fn connect_ended(status: Option<watch::Receiver<DeviceStatus>>) {
-    if let Some(mut status) = status {
-        let ended = status.wait_for(|s| *s != DeviceStatus::Connecting);
-        let _ = tokio::time::timeout(CONNECT_WAIT, ended).await;
-    }
+/// How long to wait for the MRP join.
+#[derive(Clone, Copy)]
+enum JoinWait {
+    /// Until the end of the join wait, see [`MRP_JOIN_WAIT`].
+    Deadline,
+    /// Until the join ends.
+    Full,
+}
+
+/// Wait until a running connect has ended and then for the MRP join. The whole wait is at most
+/// [`CONNECT_WAIT`].
+async fn connect_ended(wait: Option<ConnectWait>, join_wait: JoinWait) {
+    let Some(ConnectWait {
+        mut status,
+        mut mrp_join,
+    }) = wait
+    else {
+        return;
+    };
+    let ended = async {
+        let _ = status.wait_for(|s| *s != DeviceStatus::Connecting).await;
+        let Some(until) = *mrp_join.borrow_and_update() else {
+            return;
+        };
+        let joined = mrp_join.wait_for(Option::is_none);
+        match join_wait {
+            JoinWait::Full => {
+                let _ = joined.await;
+            }
+            JoinWait::Deadline => {
+                let _ = tokio::time::timeout_at(until, joined).await;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(CONNECT_WAIT, ended).await;
 }
 
 /// `true` if a list fetched at `last` is old enough to fetch again. `None` means not fetched yet.
@@ -1933,7 +2281,7 @@ impl Handler<CompanionEvent> for AppleTvActor {
     fn handle(&mut self, msg: CompanionEvent, ctx: &mut Self::Context) {
         // An event can wait in the mailbox while Companion closes. It must not undo the reset in
         // `protocol_lost`.
-        if msg.generation != self.generation
+        if msg.companion_gen != self.companion_gen
             || !self
                 .tv
                 .as_ref()
@@ -2090,7 +2438,7 @@ impl AppleTvActor {
         // Plan after the command before has ended, so toggles see its result.
         let lock = self.cmd_lock.clone();
         let fut = async move {
-            connect_ended(connecting).await;
+            connect_ended(connecting, JoinWait::Deadline).await;
             lock.lock_owned().await
         }
         .into_actor(self)
@@ -2184,6 +2532,8 @@ impl AppleTvActor {
         epoch: Option<u64>,
     ) -> impl ActorFuture<Self, Output = ()> + use<> {
         let generation = self.generation;
+        // The power state comes from Companion, so an MRP join keeps the expected power.
+        let companion_gen = self.companion_gen;
         let stop = self.stop.subscribe();
         // Plan only when connected: the plan changes the seek state.
         let prepared = self
@@ -2251,9 +2601,9 @@ impl AppleTvActor {
                 if mute.is_some() {
                     act.expected_mute = mute.filter(|_| ok);
                 }
-                if power.is_some() {
-                    act.expected_power = power.filter(|_| ok);
-                }
+            }
+            if act.companion_gen == companion_gen && power.is_some() {
+                act.expected_power = power.filter(|_| ok);
             }
             if !ok {
                 return;
@@ -2421,6 +2771,183 @@ mod tests {
         tx.send_modify(|n| *n += 1);
         assert!(wait(Some(0)).await.is_ok(), "stop after the epoch");
         assert!(wait(None).await.is_err(), "a short run cannot be stopped");
+    }
+
+    type ConnectOutcome = Result<&'static str, &'static str>;
+    const LONG: Duration = Duration::from_secs(3600);
+
+    /// MRP connect that notes its start and returns `result`.
+    fn mrp(
+        started: &std::cell::Cell<bool>,
+        result: ConnectOutcome,
+    ) -> impl FnOnce() -> std::future::Ready<ConnectOutcome> + '_ {
+        move || {
+            started.set(true);
+            std::future::ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn companion_first_without_mrp() {
+        let started = std::cell::Cell::new(false);
+        let r = companion_first(async { Ok("c") }, mrp(&started, Ok("m")), LONG, |_| true).await;
+        assert_eq!(r, (Ok(("c", true)), None));
+        assert!(!started.get(), "Companion connected: MRP is joined later");
+
+        let r = companion_first(async { Err("net") }, mrp(&started, Ok("m")), LONG, |_| {
+            false
+        })
+        .await;
+        assert_eq!(r, (Err("net"), None));
+        assert!(!started.get(), "MRP fails the same way");
+    }
+
+    #[tokio::test]
+    async fn companion_error_tries_mrp() {
+        let started = std::cell::Cell::new(false);
+        let r = companion_first(async { Err("c") }, mrp(&started, Ok("m")), LONG, |_| true).await;
+        assert_eq!(r, (Ok(("m", false)), None));
+        assert!(started.get());
+        started.set(false);
+        let r = companion_first(async { Err("c") }, mrp(&started, Err("m")), LONG, |_| true).await;
+        assert_eq!(r, (Err("c"), None), "the Companion error comes first");
+        assert!(started.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_companion_runs_with_mrp() {
+        use tokio::sync::oneshot;
+        let head = Duration::from_millis(1);
+        // Companion ends only after MRP started.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || {
+            let _ = tx.send(Ok("c"));
+            std::future::pending::<ConnectOutcome>()
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| true).await;
+        assert_eq!(r, (Ok(("c", true)), None), "Companion wins, MRP is stopped");
+
+        // MRP ends first: Companion still wins, the MRP handle is returned to close.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || async move {
+            let _ = tx.send(Ok("c"));
+            Ok("m")
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| true).await;
+        assert_eq!(r, (Ok(("c", true)), Some("m")));
+
+        // Companion fails after MRP connected.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || async move {
+            let _ = tx.send(Err("c"));
+            Ok("m")
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| true).await;
+        assert_eq!(r, (Ok(("m", false)), None));
+
+        // MRP connected first: it is used also after a Companion error that MRP would have too.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || async move {
+            let _ = tx.send(Err("net"));
+            Ok("m")
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| false).await;
+        assert_eq!(r, (Ok(("m", false)), None));
+
+        // Companion fails first: MRP is waited for.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let (mtx, mrx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || {
+            let _ = tx.send(Err("c"));
+            async move {
+                tokio::task::yield_now().await;
+                let _ = mtx.send(Ok("m"));
+                Ok("m")
+            }
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| true).await;
+        assert_eq!(r, (Ok(("m", false)), None));
+        assert_eq!(mrx.await, Ok(Ok("m")));
+
+        // Companion fails with an error that MRP has too: MRP is stopped.
+        let (tx, rx) = oneshot::channel::<ConnectOutcome>();
+        let mrp = move || {
+            let _ = tx.send(Err("net"));
+            std::future::pending::<ConnectOutcome>()
+        };
+        let r = companion_first(async { rx.await.unwrap() }, mrp, head, |_| false).await;
+        assert_eq!(r, (Err("net"), None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_waits_for_mrp_join() {
+        use tokio::time::Instant as TokioInstant;
+        let status = watch::Sender::new(DeviceStatus::Connecting);
+        let join = watch::Sender::new(None);
+        let wait = || {
+            Some(ConnectWait {
+                status: status.subscribe(),
+                mrp_join: join.subscribe(),
+            })
+        };
+        let spawn = |join_wait| tokio::spawn(connect_ended(wait(), join_wait));
+        // Lets the spawned waiter run without moving the paused time.
+        let settle = || async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let task = spawn(JoinWait::Deadline);
+        settle().await;
+        assert!(!task.is_finished(), "connect runs");
+        status.send_replace(DeviceStatus::Connected);
+        settle().await;
+        assert!(task.is_finished(), "connected with both protocols");
+
+        join.send_replace(Some(TokioInstant::now() + LONG));
+        let task = spawn(JoinWait::Deadline);
+        settle().await;
+        assert!(!task.is_finished(), "MRP join runs");
+        join.send_replace(None);
+        settle().await;
+        assert!(task.is_finished(), "MRP joined");
+
+        // A stalled join holds commands until one end time, not a full wait per command.
+        let until = TokioInstant::now() + MRP_JOIN_WAIT;
+        join.send_replace(Some(until));
+        let first = spawn(JoinWait::Deadline);
+        tokio::time::sleep(MRP_JOIN_WAIT / 2).await;
+        let second = spawn(JoinWait::Deadline);
+        settle().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        tokio::time::sleep_until(until).await;
+        settle().await;
+        assert!(first.is_finished() && second.is_finished(), "same end time");
+
+        // Siri over MRP waits for the end of the join, past the end time.
+        let full = spawn(JoinWait::Full);
+        tokio::time::sleep(MRP_JOIN_WAIT).await;
+        settle().await;
+        assert!(!full.is_finished(), "Siri over MRP waits for the join");
+        join.send_replace(None);
+        settle().await;
+        assert!(full.is_finished(), "join ended");
+
+        // A join that does not end holds Siri over MRP at most `CONNECT_WAIT`.
+        join.send_replace(Some(TokioInstant::now()));
+        let full = spawn(JoinWait::Full);
+        tokio::time::sleep(CONNECT_WAIT.saturating_sub(Duration::from_millis(1))).await;
+        settle().await;
+        assert!(!full.is_finished());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        settle().await;
+        assert!(full.is_finished(), "capped by CONNECT_WAIT");
+        join.send_replace(None);
+
+        let none = tokio::spawn(connect_ended(None, JoinWait::Full));
+        settle().await;
+        assert!(none.is_finished(), "nothing to wait for");
     }
 
     #[test]

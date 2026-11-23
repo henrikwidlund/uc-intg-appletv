@@ -38,6 +38,7 @@ One pairing with one PIN covers all features.
   Remote starts, it tries again every 50 ms for up to 3 seconds. A connect step without an answer in
   0.5 seconds is started again once.
 - A command that comes while the driver connects waits for the connection. It does not fail.
+  The driver connects Companion first. Commands wait at most 0.5 seconds for MRP.
 - If 3 commands time out within 60 seconds, the driver connects again.
 
 ## Requirements

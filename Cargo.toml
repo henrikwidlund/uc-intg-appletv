@@ -48,6 +48,10 @@ env_logger = "0.11"
 log = "0.4"
 mdns-sd = { version = "0.22", optional = true }
 
+[dev-dependencies]
+# Paused time in tests.
+tokio = { version = "1.54", features = ["rt", "test-util"] }
+
 [build-dependencies]
 built = { version = "0.9", features = ["cargo-lock"] }
 
