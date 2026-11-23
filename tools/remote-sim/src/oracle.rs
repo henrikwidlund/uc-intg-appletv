@@ -11,7 +11,7 @@ use crate::Fail;
 use ratv::companion::{App, AttentionState};
 use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
 use ratv::mrp::{NowPlaying, PlaybackState, Volume};
-use ratv::{AppleTv, ClientOptions, Credentials, Endpoints, ExposeSecret, PairOptions};
+use ratv::{AppleTv, ClientOptions, Credentials, Endpoints, ExposeSecret, PairOptions, Protocol};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -110,6 +110,45 @@ impl Oracle {
     /// Playback rate, without a copy of now playing.
     pub fn rate(&self) -> Option<f32> {
         self.tv.now_playing().and_then(|rx| rx.borrow().rate)
+    }
+
+    /// True if now playing has an item: item metadata, an artwork id, an artwork URL or image
+    /// data. `None` without now playing or without MRP: Companion alone can have no title while
+    /// an item plays. It does not copy now playing. The artwork rule of the driver uses fewer
+    /// fields: it has no radio station, content id, artwork URL or image data.
+    pub fn has_item(&self) -> Option<bool> {
+        if !self.tv.is_open(Protocol::Mrp) {
+            return None;
+        }
+        let rx = self.tv.now_playing()?;
+        let np = rx.borrow();
+        let text = |v: &Option<String>| v.as_deref().is_some_and(|t| !t.is_empty());
+        let item = [
+            &np.title,
+            &np.subtitle,
+            &np.artist,
+            &np.album,
+            &np.series_name,
+            &np.radio_station,
+            &np.content_identifier,
+        ]
+        .into_iter()
+        .any(text)
+            || np.artwork_id.is_some()
+            || np.artwork_url.is_some()
+            || np.artwork_data.is_some();
+        Some(item)
+    }
+
+    /// Number of audio and subtitle languages. It does not copy now playing. `None` without
+    /// MRP: Companion has no languages.
+    pub fn language_counts(&self) -> Option<(usize, usize)> {
+        if !self.tv.is_open(Protocol::Mrp) {
+            return None;
+        }
+        let rx = self.tv.now_playing()?;
+        let np = rx.borrow();
+        Some((np.audio_languages.len(), np.subtitle_languages.len()))
     }
 
     /// True if the Apple TV sets the live flag. This is only the device flag, not the rule of

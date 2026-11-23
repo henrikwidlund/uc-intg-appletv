@@ -632,7 +632,7 @@ impl AppleTvActor {
             dirty |= self.update_volume();
         }
         if mrp_open && self.artwork_after_mrp {
-            self.update_artwork(ctx);
+            dirty |= self.update_artwork(ctx);
         }
         ctx.run_later(FIRST_STATE_WAIT, move |act, ctx| {
             if act.generation == generation {
@@ -1221,12 +1221,24 @@ impl AppleTvActor {
                 self.cfg.name
             );
         }
+        let (state, rate) = (self.s.state, self.s.rate);
         let dirty = if self.joining() {
             self.s.update_companion_now_playing(&rx.borrow())
         } else {
             self.s.update_now_playing(&rx.borrow())
         };
+        self.log_playback(state, rate);
         self.apply_now_playing(dirty, ctx)
+    }
+
+    /// Log a change of the playback state or rate. `state` and `rate` are the values before.
+    fn log_playback(&self, state: Option<PlaybackState>, rate: Option<f32>) {
+        if state != self.s.state || rate != self.s.rate {
+            debug!(
+                "[{}] playback: {state:?} at rate {rate:?} -> {:?} at rate {:?}",
+                self.cfg.name, self.s.state, self.s.rate
+            );
+        }
     }
 
     fn apply_now_playing(&mut self, dirty: Dirty, ctx: &mut Context<Self>) -> Dirty {
@@ -1251,6 +1263,7 @@ impl AppleTvActor {
             );
         }
         if dirty.any(Dirty::ARTWORK) {
+            // `dirty` already has the flag that `update_artwork` returns.
             self.update_artwork(ctx);
         }
         if dirty.any(Dirty::CHAPTERS | Dirty::POSITION | Dirty::PLAYBACK) {
@@ -1288,7 +1301,9 @@ impl AppleTvActor {
                 act.cfg.name, act.s.state, act.s.rate
             );
             act.home_since = Some(Instant::now());
+            let (state, rate) = (act.s.state, act.s.rate);
             let dirty = act.s.update_now_playing(&NowPlaying::default());
+            act.log_playback(state, rate);
             let dirty = act.apply_now_playing(dirty, ctx);
             act.emit(dirty);
         }));
@@ -1348,8 +1363,11 @@ impl AppleTvActor {
     /// fetched over MRP.
     ///
     /// The image is also fetched without an artwork id: some apps send none, but the Apple TV
-    /// has the image.
-    fn update_artwork(&mut self, ctx: &mut Context<Self>) {
+    /// has the image. It is not fetched for an item without title, subtitle, artist, album,
+    /// series name and artwork id.
+    ///
+    /// Returns [`Dirty::ARTWORK`] if the shown image was cleared here.
+    fn update_artwork(&mut self, ctx: &mut Context<Self>) -> Dirty {
         self.artwork_seq += 1;
         self.artwork_after_mrp = false;
         // No URL means no file is shown: the file before must not pass to this item.
@@ -1362,21 +1380,32 @@ impl AppleTvActor {
                 // A CDN URL is not a file.
                 self.shown_file = None;
             }
-            return;
+            return Dirty::NONE;
         }
         let Some(tv) = self.tv.clone().filter(|_| self.s.state.is_some()) else {
             debug!("[{}] no artwork: nothing plays", self.cfg.name);
-            return;
+            return Dirty::NONE;
         };
         let id = self.s.artwork_id.clone();
         let seq = self.artwork_seq;
         let item = self.s.item_seq;
         let item_key = self.s.item_key();
+        // Items without title, artist and album share one key: no image from the cache.
+        let keyed = self.s.has_item_key();
         if let Some(data) = self.s.artwork_data.clone() {
             debug!("[{}] artwork {id:?} from Companion", self.cfg.name);
             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&data)));
             self.save_artwork(&id, None, data, (item, item_key));
-            return;
+            return Dirty::NONE;
+        }
+        // A fetch fails while the app has no player. The image of the item before must not stay.
+        if self.s.item_has_no_artwork() {
+            debug!(
+                "[{}] no artwork: no item metadata and no artwork id",
+                self.cfg.name
+            );
+            self.shown_file = None;
+            return self.s.clear_artwork_url();
         }
         if !tv.is_open(Protocol::Mrp) {
             debug!(
@@ -1384,7 +1413,7 @@ impl AppleTvActor {
                 self.cfg.name
             );
             self.artwork_after_mrp = true;
-            return;
+            return Dirty::NONE;
         }
         debug!("[{}] fetching artwork {id:?}", self.cfg.name);
         let generation = self.generation;
@@ -1408,7 +1437,7 @@ impl AppleTvActor {
                             );
                         }
                         // Some apps drop the image of the same item. Keep it until the item changes.
-                        Ok(None) if act.s.artwork_item == item => {
+                        Ok(None) if act.s.artwork_item == item && act.s.artwork_url.is_some() => {
                             debug!(
                                 "[{}] no artwork, keeping the image of this item",
                                 act.cfg.name
@@ -1426,7 +1455,7 @@ impl AppleTvActor {
                             }
                         }
                         Ok(None) => {
-                            if let Some(name) = act.cached_art(item_key) {
+                            if keyed && let Some(name) = act.cached_art(item_key) {
                                 debug!("[{}] no artwork, using the image seen before for this item", act.cfg.name);
                                 act.show_file(name, item);
                                 return;
@@ -1436,7 +1465,7 @@ impl AppleTvActor {
                                 act.cfg.name, act.s.prev_item_lasted
                             );
                             act.shown_file = None;
-                            if act.s.artwork_url.take().is_some() {
+                            if act.s.clear_artwork_url().any(Dirty::ARTWORK) {
                                 act.emit(Dirty::ARTWORK);
                             }
                         }
@@ -1444,6 +1473,7 @@ impl AppleTvActor {
                     }
                 }),
         );
+        Dirty::NONE
     }
 
     /// Keep the image and show it. `item` is the item sequence and the item key at fetch time.

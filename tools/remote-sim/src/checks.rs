@@ -4,7 +4,7 @@
 //! The checks. They follow the steps of `tools/manual_test.sh` that need no person.
 
 use crate::oracle::{self, Oracle};
-use crate::ws::{field_ids, field_value};
+use crate::ws::{Client, field_ids, field_value};
 use crate::{Check, Ctx, Fail};
 use ratv::mrp::PlaybackState;
 use serde_json::{Value, json};
@@ -1011,7 +1011,11 @@ fn home_clear_active(ctx: &Ctx) -> bool {
 /// `standby` is true if the driver state was STANDBY or OFF at the start of the check.
 ///
 /// The Home Screen skip needs STANDBY or OFF at the start and a clear that had not ended before
-/// the app was opened and is still active at the time limit. A clear after the app was opened is a FAIL.
+/// the app was opened and is still active at the time limit. A clear after the app was opened
+/// is a FAIL.
+///
+/// When the Apple TV has no item, it skips if the driver shows no title and no image. A title
+/// or image on the driver after 3 seconds is a FAIL.
 async fn bring_to_front(ctx: &mut Ctx, standby: bool) -> Result<String, Fail> {
     let mp = ctx.mp();
     let device_app = ctx
@@ -1116,6 +1120,39 @@ async fn bring_to_front(ctx: &mut Ctx, standby: bool) -> Result<String, Fail> {
                 }
             }
             _ => return Err(Fail::new(format!("{app} in front: state {state:?}"))),
+        }
+    }
+    // Some apps close a paused player when opened: the state stays, the item is gone. Only the
+    // second connection tells this apart. An empty title on the driver can also be an app that
+    // sends no title, or a driver error that this check must find.
+    if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
+        // The driver must clear the title and the image. It sends "" for both.
+        let empty = |v: Option<&Value>| v.is_none_or(|v| v.is_null() || v.as_str() == Some(""));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // The Apple TV can send the item again: then check it as usual.
+            if ctx.oracle.as_ref().and_then(Oracle::has_item) != Some(false) {
+                break;
+            }
+            let no_title = empty(ctx.client.attr(&mp, "media_title"));
+            let no_image = empty(ctx.client.attr(&mp, "media_image_url"));
+            if no_title && no_image {
+                return Err(Fail::skip(if title.is_empty() {
+                    format!("{app} has no item")
+                } else {
+                    format!("{app} closed the player when opened")
+                }));
+            }
+            if Instant::now() >= deadline {
+                if !no_title {
+                    let shown = ctx.client.text(&mp, "media_title");
+                    return Err(Fail::new(format!(
+                        "driver shows {shown:?}, Apple TV has no item"
+                    )));
+                }
+                return Err(Fail::new("driver shows an image, Apple TV has no item"));
+            }
+            ctx.client.listen_ms(200).await?;
         }
     }
     let now = ctx.client.text(&mp, "media_title");
@@ -1442,22 +1479,93 @@ async fn sweep(ctx: &mut Ctx, kind: &str) -> Result<usize, Fail> {
 
 pub async fn languages(ctx: &mut Ctx) -> Check {
     need_playback(ctx, PlaybackSeen::Driver)?;
-    let audio = sweep(ctx, "audio_language").await?;
+    let swept_audio = sweep(ctx, "audio_language").await?;
     let subtitles = sweep(ctx, "subtitles").await?;
-    let sensor = ctx.client.text(&ctx.sensor("subtitles"), "value");
-    let select = ctx.client.text(&ctx.select("subtitles"), "current_option");
-    ensure!(
-        sensor == select,
-        "subtitles sensor {sensor:?}, select {select:?}"
-    );
-    if audio + subtitles == 0 {
-        return Err(Fail::skip(
-            "the video has one audio language and no subtitles",
-        ));
+    // The driver sends each entity in its own message, the select first. The sensor can be one
+    // message behind, so wait for it.
+    let sensor_id = ctx.sensor("subtitles");
+    let subtitles_id = ctx.select("subtitles");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let sensor = ctx.client.text(&sensor_id, "value");
+        let select = ctx.client.text(&subtitles_id, "current_option");
+        if sensor == select {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "subtitles sensor {sensor:?}, select {select:?}"
+        );
+        ctx.client.listen_ms(200).await?;
     }
+    // The driver has one audio option for each audio language of the Apple TV. The subtitles
+    // select has no options without subtitles, else "Off" and one option for each subtitle (the
+    // Auto entry is renamed, not added). A driver that is behind shows other counts for a short
+    // time, so wait until the counts match.
+    let audio_id = ctx.select("audio_language");
+    let count = |c: &Client, id: &str| {
+        c.attr(id, "options")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let expected_subtitles = |n: usize| if n == 0 { 0 } else { n + 1 };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (device, audio, shown_subtitles) = loop {
+        let device = ctx.oracle.as_ref().and_then(Oracle::language_counts);
+        let audio = count(&ctx.client, &audio_id);
+        let shown_subtitles = count(&ctx.client, &subtitles_id);
+        let ok = device.is_none_or(|(a, s)| audio == a && shown_subtitles == expected_subtitles(s));
+        if ok || Instant::now() >= deadline {
+            break (device, audio, shown_subtitles);
+        }
+        ctx.client.listen_ms(200).await?;
+    };
+    if let Some((device_audio, device_subtitles)) = device {
+        let s = plural(device_audio);
+        ensure!(
+            device_audio == audio,
+            "Apple TV has {device_audio} audio language{s}, driver {audio} options"
+        );
+        let expected = expected_subtitles(device_subtitles);
+        let s = plural(device_subtitles);
+        ensure!(
+            shown_subtitles == expected,
+            "Apple TV has {device_subtitles} subtitle language{s}, driver {shown_subtitles} \
+             options, expected {expected}"
+        );
+    }
+    // Languages that came after the sweep were not tested.
+    if subtitles == 0 && shown_subtitles > 0 {
+        return Err(Fail::skip("subtitles came after the sweep"));
+    }
+    if swept_audio < 2 && audio >= 2 {
+        return Err(Fail::skip("audio languages came after the sweep"));
+    }
+    // Use the sweep result (0 or at least 2), also when the item changed after the sweep.
+    if swept_audio == 0 && subtitles == 0 {
+        let no_item = match ctx.oracle.as_ref().and_then(Oracle::has_item) {
+            Some(item) => !item,
+            None => ctx.client.text(&ctx.mp(), "media_title").is_empty(),
+        };
+        return Err(Fail::skip(if audio == 1 {
+            "the video has one audio language and no subtitles"
+        } else if no_item {
+            "no item plays"
+        } else {
+            "no audio or subtitle languages"
+        }));
+    }
+    // The sweep gives 0 for a single option, so show the option count then.
+    let tested = if swept_audio >= 2 { swept_audio } else { audio };
+    let s = plural(tested);
     Ok(format!(
-        "{audio} audio languages, {subtitles} subtitle options"
+        "{tested} audio language{s}, {subtitles} subtitle options"
     ))
+}
+
+/// "s" for a count other than 1.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Read a URL of the driver. Returns the status line and the headers.

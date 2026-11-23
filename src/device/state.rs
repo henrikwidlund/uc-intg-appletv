@@ -234,6 +234,7 @@ impl Snapshot {
     /// Copy the changed fields of a now playing update.
     pub fn update_now_playing(&mut self, np: &NowPlaying) -> Dirty {
         let mut d = Dirty::NONE;
+        let no_artwork = self.item_has_no_artwork();
         let item_changed =
             self.title != np.title || self.artist != np.artist || self.album != np.album;
         if item_changed {
@@ -323,7 +324,13 @@ impl Snapshot {
         self.skip_forward_interval = np.skip_forward_interval;
         self.skip_backward_interval = np.skip_backward_interval;
 
-        d | self.update_artwork(np, item_changed)
+        let artwork = self.update_artwork(np, item_changed);
+        if artwork.is_empty() && no_artwork != self.item_has_no_artwork() {
+            // For example only the subtitle came or went: fetch the image, or clear it.
+            self.set_artwork(np);
+            return d | Dirty::ARTWORK;
+        }
+        d | artwork
     }
 
     /// Copy only the fields that Companion gives, while MRP connects. The other fields keep
@@ -659,6 +666,39 @@ impl Snapshot {
         let mut h = DefaultHasher::new();
         (&self.title, &self.artist, &self.album).hash(&mut h);
         h.finish()
+    }
+
+    /// True if the item has no title, subtitle, artist, album, series name and artwork id.
+    /// The Apple TV then has no image to fetch, for example after an app closed its player.
+    /// Checks only the metadata and the artwork id, not a CDN URL.
+    pub fn item_has_no_artwork(&self) -> bool {
+        let empty = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
+        [
+            &self.title,
+            &self.subtitle,
+            &self.artist,
+            &self.album,
+            &self.series_name,
+        ]
+        .into_iter()
+        .all(empty)
+            && self.artwork_id.is_none()
+    }
+
+    /// True if title, artist or album is set: [`Self::item_key`] then belongs to this item only.
+    pub fn has_item_key(&self) -> bool {
+        [&self.title, &self.artist, &self.album]
+            .into_iter()
+            .any(|v| v.as_deref().is_some_and(|t| !t.is_empty()))
+    }
+
+    /// Stop showing the image. Returns [`Dirty::ARTWORK`] if an image was shown.
+    pub fn clear_artwork_url(&mut self) -> Dirty {
+        if self.artwork_url.take().is_some() {
+            Dirty::ARTWORK
+        } else {
+            Dirty::NONE
+        }
     }
 
     /// True if the item without an image may keep the image of the item before. Some apps
@@ -1043,6 +1083,124 @@ mod tests {
         np.title = Some("Other channel".into());
         assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
         assert_ne!(item, s.item_seq);
+    }
+
+    #[test]
+    fn empty_item_has_no_artwork() {
+        let mut s = Snapshot::default();
+        assert!(s.item_has_no_artwork());
+        s.title = Some(String::new());
+        assert!(s.item_has_no_artwork());
+        s.artwork_id = Some("a".into());
+        assert!(!s.item_has_no_artwork());
+        s.artwork_id = None;
+        s.title = Some("Show".into());
+        assert!(!s.item_has_no_artwork());
+        // Artist or album alone is an item too, as for `item_key`.
+        s.title = None;
+        s.artist = Some("Artist".into());
+        assert!(!s.item_has_no_artwork());
+        s.artist = Some(String::new());
+        s.album = Some("Album".into());
+        assert!(!s.item_has_no_artwork());
+        s.album = None;
+        assert!(s.item_has_no_artwork());
+        s.subtitle = Some("Episode".into());
+        assert!(!s.item_has_no_artwork());
+        s.subtitle = None;
+        s.series_name = Some("Series".into());
+        assert!(!s.item_has_no_artwork());
+        s.series_name = Some(String::new());
+        assert!(s.item_has_no_artwork());
+    }
+
+    #[test]
+    fn artwork_when_only_the_subtitle_comes_and_goes() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.state = Some(PlaybackState::Paused);
+        s.update_now_playing(&np);
+        // Title, artist and album do not change, so the item stays the same.
+        let item = s.item_seq;
+
+        np.subtitle = Some("Episode".into());
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(!s.item_has_no_artwork());
+        assert!(s.artwork_fetch);
+        assert_eq!(item, s.item_seq);
+        s.artwork_url = Some("file".into());
+
+        np.subtitle = None;
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(s.item_has_no_artwork());
+        assert_eq!(item, s.item_seq);
+        assert_eq!(Dirty::ARTWORK, s.clear_artwork_url());
+
+        np.subtitle = Some("Episode".into());
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(s.artwork_fetch);
+        assert_eq!(item, s.item_seq);
+        assert_eq!(Dirty::NONE, s.update_now_playing(&np));
+    }
+
+    #[test]
+    fn cdn_artwork_when_only_the_subtitle_comes_and_goes() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.state = Some(PlaybackState::Paused);
+        s.update_now_playing(&np);
+
+        np.subtitle = Some("Episode".into());
+        np.artwork_url = Some("http://cdn/a.jpg".into());
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert_eq!(Some("http://cdn/a.jpg"), s.artwork_url.as_deref());
+        assert!(!s.artwork_fetch);
+
+        // Without the item, the actor clears the image: it is not a CDN image any more.
+        np.subtitle = None;
+        np.artwork_url = None;
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(s.item_has_no_artwork());
+        assert!(s.artwork_fetch);
+    }
+
+    #[test]
+    fn item_key_needs_title_artist_or_album() {
+        let mut s = Snapshot::default();
+        assert!(!s.has_item_key());
+        s.subtitle = Some("Episode".into());
+        s.title = Some(String::new());
+        assert!(!s.has_item_key());
+        s.album = Some("Album".into());
+        assert!(s.has_item_key());
+    }
+
+    #[test]
+    fn empty_item_clears_the_image_and_a_new_item_shows_one() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.state = Some(PlaybackState::Paused);
+        np.title = Some("Movie".into());
+        np.artwork_id = Some("a".into());
+        s.update_now_playing(&np);
+        s.artwork_url = Some("file".into());
+        s.artwork_item = s.item_seq;
+
+        // The app closed its player: the state stays, the item is gone.
+        np.title = None;
+        np.artwork_id = None;
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(s.item_has_no_artwork());
+        assert_eq!(Dirty::ARTWORK, s.clear_artwork_url());
+        assert_eq!(Dirty::NONE, s.clear_artwork_url());
+
+        // A new item does not keep an image of the item before and asks for its own.
+        np.title = Some("Other".into());
+        np.artwork_id = Some("b".into());
+        assert!(s.update_now_playing(&np).any(Dirty::ARTWORK));
+        assert!(!s.item_has_no_artwork());
+        assert!(s.artwork_fetch);
+        assert!(!s.keep_artwork(s.item_seq));
     }
 
     #[test]
