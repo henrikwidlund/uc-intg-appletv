@@ -727,4 +727,105 @@ mod tests {
         assert!(is_backup_message(r#"{"settings":[{"id":"backup_data"}]}"#));
         assert!(!is_backup_message(r#"{"input_values":{"pin":"1234"}}"#));
     }
+
+    /// A WebSocket client over a plain TCP stream, for the close handshake.
+    mod raw {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        pub fn connect(addr: SocketAddr) -> TcpStream {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            s.write_all(
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .expect("write");
+            let mut head = Vec::new();
+            let mut b = [0u8];
+            while !head.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut b).expect("read");
+                head.push(b[0]);
+            }
+            assert!(head.starts_with(b"HTTP/1.1 101"), "upgrade");
+            s
+        }
+
+        /// Read one frame from the server. Returns the opcode and the payload.
+        pub fn read(s: &mut TcpStream) -> (u8, Vec<u8>) {
+            let mut h = [0u8; 2];
+            s.read_exact(&mut h).expect("read");
+            let len = match h[1] & 0x7f {
+                126 => {
+                    let mut l = [0u8; 2];
+                    s.read_exact(&mut l).expect("read");
+                    usize::from(u16::from_be_bytes(l))
+                }
+                127 => panic!("frame too long"),
+                n => usize::from(n),
+            };
+            let mut payload = vec![0; len];
+            s.read_exact(&mut payload).expect("read");
+            (h[0] & 0x0f, payload)
+        }
+
+        /// Send a masked frame from the client, as the protocol requires.
+        pub fn send(s: &mut TcpStream, opcode: u8, payload: &[u8]) {
+            let mask = [1u8, 2, 3, 4];
+            let len = u8::try_from(payload.len()).expect("short");
+            assert!(len < 126);
+            let mut frame = vec![0x80 | opcode, 0x80 | len];
+            frame.extend_from_slice(&mask);
+            frame.extend(payload.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+            s.write_all(&frame).expect("write");
+        }
+    }
+
+    #[actix::test]
+    async fn close_is_answered_with_the_same_code_and_reason() {
+        use crate::server::{Authentication, ws_index};
+        use actix_web::{App, HttpServer, web};
+
+        let controller = web::Data::new(controller("ws-close"));
+        let heartbeat = web::Data::new(HeartbeatSettings::default());
+        let metadata = serde_json::from_value(serde_json::json!({})).expect("metadata");
+        let auth = web::Data::new(Authentication::new(&metadata));
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(heartbeat.clone())
+                .app_data(auth.clone())
+                .app_data(controller.clone())
+                .service(ws_index)
+        })
+        .workers(1)
+        .disable_signals()
+        .bind(("127.0.0.1", 0))
+        .expect("bind");
+        let addr = server.addrs()[0];
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let answer = tokio::task::spawn_blocking(move || {
+            let mut s = raw::connect(addr);
+            let mut close = 4000u16.to_be_bytes().to_vec();
+            close.extend_from_slice(b"bye");
+            raw::send(&mut s, 0x8, &close);
+            loop {
+                let (opcode, payload) = raw::read(&mut s);
+                if opcode == 0x8 {
+                    return payload;
+                }
+            }
+        })
+        .await
+        .expect("client");
+        let mut expected = 4000u16.to_be_bytes().to_vec();
+        expected.extend_from_slice(b"bye");
+        assert_eq!(expected, answer);
+        handle.stop(false).await;
+    }
 }

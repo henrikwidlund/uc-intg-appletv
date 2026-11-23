@@ -915,11 +915,7 @@ impl AppleTvActor {
 
     /// Connect again soon while the network is not ready. Returns `false` when the time for this is over.
     fn network_retry(&mut self, ctx: &mut Context<Self>) -> bool {
-        let now = Instant::now();
-        let end = *self
-            .network_retry_end
-            .get_or_insert(now + NETWORK_RETRY_TIMEOUT);
-        if now >= end {
+        if !retry_window_open(&mut self.network_retry_end, Instant::now()) {
             warn!("[{}] network not ready", self.cfg.name);
             return false;
         }
@@ -971,12 +967,7 @@ impl AppleTvActor {
             }
             self.attempts = 0;
             // A running fast network retry keeps its end, so key presses cannot extend it.
-            if self
-                .network_retry_end
-                .is_none_or(|end| Instant::now() >= end)
-            {
-                self.network_retry_end = None;
-            }
+            self.network_retry_end = running_window(self.network_retry_end, Instant::now());
             self.connect(ctx);
         }
     }
@@ -1125,11 +1116,7 @@ impl AppleTvActor {
     /// Try the missing protocols again soon while the network is not ready, for example right
     /// after wake-up. When the time for this is over, the next try comes from the interval.
     fn missing_network_retry(&mut self, ctx: &mut Context<Self>) {
-        let now = Instant::now();
-        let end = *self
-            .missing_network_end
-            .get_or_insert(now + NETWORK_RETRY_TIMEOUT);
-        if now >= end {
+        if !retry_window_open(&mut self.missing_network_end, Instant::now()) {
             debug!(
                 "[{}] network not ready, missing protocols are tried again in {} s",
                 self.cfg.name,
@@ -1598,23 +1585,12 @@ impl AppleTvActor {
 
     /// Base URL of the HTTP server, with an address on the network of the Apple TV.
     fn find_http_base(&self) -> Option<String> {
-        let ip = self.ctx.http_address.or_else(|| {
-            // No packet is sent: connect only selects the local address.
-            let device = self.cfg.address?;
-            // An IPv6 address only if the server listens on `::`.
-            let any = match device {
-                IpAddr::V6(_) if self.ctx.http_ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            };
-            let target = SocketAddr::new(device, 9);
-            let socket = UdpSocket::bind((any, 0)).ok()?;
-            socket.connect(target).ok()?;
-            Some(socket.local_addr().ok()?.ip())
-        })?;
-        Some(format!(
-            "http://{}",
-            SocketAddr::new(ip, self.ctx.http_port)
-        ))
+        http_base(
+            self.ctx.http_address,
+            self.cfg.address,
+            self.ctx.http_ipv6,
+            self.ctx.http_port,
+        )
     }
 
     /// Update the chapter select when the next chapter starts.
@@ -2794,6 +2770,38 @@ impl Handler<AudioChunk> for AppleTvActor {
     }
 }
 
+/// Start the retry window at the first call. Returns `false` when the window is over.
+fn retry_window_open(end: &mut Option<Instant>, now: Instant) -> bool {
+    now < *end.get_or_insert(now + NETWORK_RETRY_TIMEOUT)
+}
+
+/// The end of a window that still runs, else `None`.
+fn running_window(end: Option<Instant>, now: Instant) -> Option<Instant> {
+    end.filter(|end| now < *end)
+}
+
+/// Base URL of the HTTP server at `port`. Without `http_address`, the address is the local
+/// address on the network of `device`. No packet is sent: connect only selects it.
+fn http_base(
+    http_address: Option<IpAddr>,
+    device: Option<IpAddr>,
+    ipv6: bool,
+    port: u16,
+) -> Option<String> {
+    let ip = http_address.or_else(|| {
+        let device = device?;
+        // An IPv6 address only if the server listens on `::`.
+        let any = match device {
+            IpAddr::V6(_) if ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
+        let socket = UdpSocket::bind((any, 0)).ok()?;
+        socket.connect(SocketAddr::new(device, 9)).ok()?;
+        Some(socket.local_addr().ok()?.ip())
+    })?;
+    Some(format!("http://{}", SocketAddr::new(ip, port)))
+}
+
 /// Returns `true` for errors that come while the network of the Remote starts, for example after wake-up.
 fn network_not_ready(e: &ratv::Error) -> bool {
     use std::io::ErrorKind;
@@ -2809,7 +2817,210 @@ fn network_not_ready(e: &ratv::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_store::ConfigStore;
     use crate::entities::SensorKind;
+    use crate::server::ArtworkStore;
+    use std::sync::atomic::AtomicU8;
+
+    #[test]
+    fn retry_window() {
+        let t0 = Instant::now();
+        let mut end = None;
+        assert!(retry_window_open(&mut end, t0));
+        let first = t0 + NETWORK_RETRY_TIMEOUT;
+        assert_eq!(Some(first), end);
+        // A key press keeps a running window.
+        let press = t0 + Duration::from_millis(100);
+        assert_eq!(Some(first), running_window(end, press));
+        assert!(retry_window_open(&mut end, press));
+        assert!(!retry_window_open(&mut end, first), "window over");
+        assert_eq!(Some(first), end, "the end does not move");
+        // A key press after the end starts a new window.
+        let later = first + Duration::from_secs(1);
+        end = running_window(end, later);
+        assert_eq!(None, end);
+        assert!(retry_window_open(&mut end, later));
+        assert_eq!(Some(later + NETWORK_RETRY_TIMEOUT), end);
+    }
+
+    #[test]
+    fn http_base_address() {
+        let lo = IpAddr::from([127, 0, 0, 1]);
+        let fixed = IpAddr::from([192, 0, 2, 9]);
+        let base = |a, d, v6| http_base(a, d, v6, 8080);
+        assert_eq!(
+            Some("http://192.0.2.9:8080".into()),
+            base(Some(fixed), Some(lo), false)
+        );
+        assert_eq!(
+            Some("http://127.0.0.1:8080".into()),
+            base(None, Some(lo), false)
+        );
+        assert_eq!(None, base(None, None, false));
+        let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(None, base(None, Some(lo6), false), "server not on ::");
+        // Some test hosts have no IPv6.
+        if UdpSocket::bind((lo6, 0)).is_ok() {
+            assert_eq!(
+                Some("http://[::1]:8080".into()),
+                base(None, Some(lo6), true)
+            );
+        }
+    }
+
+    /// Drops all device events.
+    struct NoController;
+
+    impl Actor for NoController {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<DeviceEvent> for NoController {
+        type Result = ();
+        fn handle(&mut self, _: DeviceEvent, _: &mut Context<Self>) {}
+    }
+
+    /// An actor that is not connected. It does not connect until it gets `Connect`.
+    fn idle_actor(name: &str) -> Addr<AppleTvActor> {
+        let dir = std::env::temp_dir().join(format!(
+            "uc-intg-appletv-actor-{name}-{}",
+            std::process::id()
+        ));
+        let ctx = Arc::new(DeviceContext {
+            client_name: "test".into(),
+            http_address: None,
+            http_ipv6: false,
+            http_port: 0,
+            store: ConfigStore::new(&dir),
+            artwork: ArtworkStore::new(dir.join("artwork")),
+            siri_mode: AtomicU8::new(0),
+        });
+        let cfg = crate::config_store::tests::device();
+        AppleTvActor::new(
+            cfg.key.as_str().into(),
+            cfg,
+            DeviceCache::default(),
+            ctx,
+            NoController.start().recipient(),
+        )
+        .start()
+    }
+
+    /// Sets the flag when it is dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Where a test task is kept.
+    #[derive(Clone, Copy)]
+    enum Slot {
+        NowPlaying,
+        Missing,
+    }
+
+    /// Keeps a task that does not end in a slot. The flag is set when the task is stopped.
+    #[derive(Message)]
+    #[rtype(result = "()")]
+    struct Task(Slot, Arc<AtomicBool>);
+
+    impl Handler<Task> for AppleTvActor {
+        type Result = ();
+        fn handle(&mut self, msg: Task, ctx: &mut Context<Self>) {
+            let flag = DropFlag(msg.1);
+            match msg.0 {
+                Slot::NowPlaying => {
+                    let stream = futures::stream::poll_fn(move |_| {
+                        let _ = &flag;
+                        std::task::Poll::<Option<Connect>>::Pending
+                    });
+                    let h = spawn_stream(ctx, stream);
+                    replace_handle(ctx, &mut self.timers.now_playing, h);
+                }
+                Slot::Missing => {
+                    let task = async move {
+                        let _flag = flag;
+                        std::future::pending::<()>().await;
+                    };
+                    self.timers.missing = Some(ctx.spawn(task.into_actor(self)));
+                    self.missing_network_end = Some(Instant::now() + LONG);
+                }
+            }
+        }
+    }
+
+    /// Runs a step of the actor and returns `missing_network_end.is_some()`.
+    #[derive(Message)]
+    #[rtype(result = "bool")]
+    enum Step {
+        Close,
+        CancelTimers,
+        StopMissing,
+        Nothing,
+    }
+
+    impl Handler<Step> for AppleTvActor {
+        type Result = bool;
+        fn handle(&mut self, msg: Step, ctx: &mut Context<Self>) -> bool {
+            match msg {
+                Step::Close => self.close(ctx),
+                Step::CancelTimers => self.cancel_timers(ctx),
+                Step::StopMissing => self.stop_missing(&ratv::Error::NoEndpoints, false, ctx),
+                Step::Nothing => {}
+            }
+            self.missing_network_end.is_some()
+        }
+    }
+
+    /// Start a task in `slot`. Returns its flag.
+    async fn task(actor: &Addr<AppleTvActor>, slot: Slot) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        actor
+            .send(Task(slot, Arc::clone(&flag)))
+            .await
+            .expect("send");
+        flag
+    }
+
+    /// Run `step`, then let the actor drop the stopped tasks.
+    async fn step(actor: &Addr<AppleTvActor>, step: Step) -> bool {
+        let r = actor.send(step).await.expect("send");
+        actor.send(Step::Nothing).await.expect("send");
+        r
+    }
+
+    #[actix::test]
+    async fn streams_stop_on_replace_close_and_cancel() {
+        let actor = idle_actor("streams");
+        let old = task(&actor, Slot::NowPlaying).await;
+        let new = task(&actor, Slot::NowPlaying).await;
+        let _ = step(&actor, Step::Nothing).await;
+        assert!(old.load(Ordering::Relaxed), "replaced stream stopped");
+        assert!(!new.load(Ordering::Relaxed));
+        let _ = step(&actor, Step::Close).await;
+        assert!(new.load(Ordering::Relaxed), "close stops the stream");
+        let next = task(&actor, Slot::NowPlaying).await;
+        let _ = step(&actor, Step::CancelTimers).await;
+        assert!(
+            next.load(Ordering::Relaxed),
+            "cancel_timers stops the stream"
+        );
+    }
+
+    #[actix::test]
+    async fn stop_missing_ends_the_retries() {
+        let actor = idle_actor("stop-missing");
+        let retry = task(&actor, Slot::Missing).await;
+        assert!(!retry.load(Ordering::Relaxed));
+        assert!(
+            !step(&actor, Step::StopMissing).await,
+            "missing network end cleared"
+        );
+        assert!(retry.load(Ordering::Relaxed), "retry timer stopped");
+    }
 
     fn command(kind: EntityKind, cmd_id: &str, params: Value) -> Command {
         Command {

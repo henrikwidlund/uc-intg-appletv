@@ -17,7 +17,7 @@ use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
 use log::{debug, error, info, warn};
 use ratv::discovery::Device;
-use ratv::{Endpoints, PairOptions, PinPrompt};
+use ratv::{Credentials, Endpoints, PairOptions, PinPrompt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
@@ -932,63 +932,87 @@ impl Controller {
                             return;
                         }
                     };
-                    info!("[{ws_id}] paired with {}", found.name);
-                    let existing = match replace.as_deref() {
-                        Some(k) => act.devices.get(k).map(|d| &d.cfg),
-                        // A first setup or a reset keeps the key, id and name of a matching
-                        // configured device.
-                        None if act.setup_replace => {
-                            matching_config(act.devices.values().map(|d| &d.cfg), &found)
-                        }
-                        None => None,
-                    }
-                    .cloned();
-                    let cfg = match existing {
-                        Some(mut cfg) => {
-                            cfg.credentials = credentials;
-                            cfg.known_ids = found.known_ids;
-                            cfg.address = found.address;
-                            cfg.manual_address = manual_address;
-                            cfg.global_volume = global_volume;
-                            cfg
-                        }
-                        None => DeviceConfig {
-                            key: device_key(&found.id),
-                            id: found.id,
-                            name: found.name,
-                            known_ids: found.known_ids,
-                            address: found.address,
-                            manual_address,
-                            credentials,
-                            global_volume,
-                        },
-                    };
-                    let replace = act.setup_replace;
-                    let mut configs = if replace {
-                        Vec::new()
-                    } else {
-                        act.sorted_configs()
-                    };
-                    configs.retain(|c| c.key != cfg.key);
-                    configs.push(cfg.clone());
-                    sort_configs(&mut configs);
-                    let save = act.store.save_devices(&configs);
-                    act.apply_after_save(ws_id, save, ctx, move |act, ctx| {
-                        if replace {
-                            act.forget_other_devices(&cfg.key);
-                        }
-                        if let Some(device) = act.devices.get_mut(cfg.key.as_str()) {
-                            device.update_config(cfg);
-                        } else {
-                            // A new device starts with empty lists.
-                            act.add_device(cfg, DeviceCache::default(), ctx);
-                        }
-                    });
+                    act.save_pairing(
+                        ws_id,
+                        credentials,
+                        found,
+                        global_volume,
+                        manual_address,
+                        replace,
+                        ctx,
+                    );
                 }),
         );
         if let Some(old) = self.pairing.replace(handle) {
             ctx.cancel_future(old);
         }
+    }
+
+    /// Save the new pairing, then use it. `replace` is the key of the device that is paired
+    /// again. A first setup or a reset removes the other devices.
+    #[allow(clippy::too_many_arguments)]
+    fn save_pairing(
+        &self,
+        ws_id: String,
+        credentials: Credentials,
+        found: Found,
+        global_volume: bool,
+        manual_address: bool,
+        replace: Option<String>,
+        ctx: &mut Context<Self>,
+    ) {
+        info!("[{ws_id}] paired with {}", found.name);
+        let existing = match replace.as_deref() {
+            Some(k) => self.devices.get(k).map(|d| &d.cfg),
+            // A first setup or a reset keeps the key, id and name of a matching
+            // configured device.
+            None if self.setup_replace => {
+                matching_config(self.devices.values().map(|d| &d.cfg), &found)
+            }
+            None => None,
+        }
+        .cloned();
+        let cfg = match existing {
+            Some(mut cfg) => {
+                cfg.credentials = credentials;
+                cfg.known_ids = found.known_ids;
+                cfg.address = found.address;
+                cfg.manual_address = manual_address;
+                cfg.global_volume = global_volume;
+                cfg
+            }
+            None => DeviceConfig {
+                key: device_key(&found.id),
+                id: found.id,
+                name: found.name,
+                known_ids: found.known_ids,
+                address: found.address,
+                manual_address,
+                credentials,
+                global_volume,
+            },
+        };
+        let replace_all = self.setup_replace;
+        let mut configs = if replace_all {
+            Vec::new()
+        } else {
+            self.sorted_configs()
+        };
+        configs.retain(|c| c.key != cfg.key);
+        configs.push(cfg.clone());
+        sort_configs(&mut configs);
+        let save = self.store.save_devices(&configs);
+        self.apply_after_save(ws_id, save, ctx, move |act, ctx| {
+            if replace_all {
+                act.forget_other_devices(&cfg.key);
+            }
+            if let Some(device) = act.devices.get_mut(cfg.key.as_str()) {
+                device.update_config(cfg);
+            } else {
+                // A new device starts with empty lists.
+                act.add_device(cfg, DeviceCache::default(), ctx);
+            }
+        });
     }
 
     /// Show a setup page.
@@ -1437,16 +1461,22 @@ mod tests {
         use crate::config_store::tests::device;
         use crate::config_store::{ConfigStore, DeviceConfig, backup_json, device_key};
         use crate::controller::handler::AbortDriverSetup;
+        use crate::controller::handler::setup::{Found, SetupState};
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
+        use crate::controller::operation_mode::{self, State};
         use crate::controller::test_util::{
-            DeviceAddr, connect, controller, test_dir, wait_stopped,
+            DeviceAddr, FlushStore, connect, controller, settle, test_dir, wait_stopped,
         };
         use crate::controller::{Controller, R2RequestMsg, R2SessionDisconnect};
+        use crate::device::DeviceEvent;
         use crate::entities::EntityKind;
-        use actix::{Addr, Context, Handler, Message};
+        use actix::{Addr, AsyncContext, Context, Handler, Message, MessageResult, WrapFuture};
+        use ratv::Endpoints;
         use serde_json::{Value, json};
+        use std::net::IpAddr;
         use std::path::Path;
-        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
         use uc_api::intg::ws::R2Request;
@@ -1951,6 +1981,385 @@ mod tests {
                 last(&events)["require_user_action"]["input"]["settings"][0]["field"]["dropdown"]["value"]
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Returns the state of the driver state machine.
+        #[derive(Message)]
+        #[rtype(result = "State")]
+        struct MachineState;
+
+        impl Handler<MachineState> for Controller {
+            type Result = MessageResult<MachineState>;
+            fn handle(&mut self, _: MachineState, _: &mut Context<Self>) -> Self::Result {
+                MessageResult(self.machine.state().clone())
+            }
+        }
+
+        /// Stops the config writer until the returned sender is dropped.
+        #[derive(Message)]
+        #[rtype(result = "mpsc::Sender<()>")]
+        struct HoldWrites;
+
+        impl Handler<HoldWrites> for Controller {
+            type Result = MessageResult<HoldWrites>;
+            fn handle(&mut self, _: HoldWrites, _: &mut Context<Self>) -> Self::Result {
+                MessageResult(self.store.hold())
+            }
+        }
+
+        /// Returns the key that the controller keeps, the configuration and the config version
+        /// of a device.
+        #[derive(Message)]
+        #[rtype(result = "Option<(Arc<str>, DeviceConfig, u64)>")]
+        struct DeviceCfg(String);
+
+        impl Handler<DeviceCfg> for Controller {
+            type Result = Option<(Arc<str>, DeviceConfig, u64)>;
+            fn handle(&mut self, msg: DeviceCfg, _: &mut Context<Self>) -> Self::Result {
+                let (key, d) = self.devices.get_key_value(msg.0.as_str())?;
+                Some((Arc::clone(key), d.cfg.clone(), d.cfg_version))
+            }
+        }
+
+        /// Shows the options page of a device, without a scan.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct ShowConfigure(String);
+
+        impl Handler<ShowConfigure> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: ShowConfigure, _: &mut Context<Self>) {
+                self.setup = Some(SetupState::Configure {
+                    key: msg.0,
+                    found: Vec::new(),
+                });
+            }
+        }
+
+        /// The Apple TV accepted the PIN: like the PIN page input, then the pairing result.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct Paired(&'static str, Found, Option<String>);
+
+        impl Handler<Paired> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: Paired, ctx: &mut Context<Self>) {
+                let _ = self.sm_consume(msg.0, &operation_mode::Input::SetupUserData, ctx);
+                self.setup = None;
+                let credentials = device().credentials;
+                self.save_pairing(msg.0.into(), credentials, msg.1, false, false, msg.2, ctx);
+            }
+        }
+
+        /// Sets the flag when it is dropped.
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        /// Starts a pairing step that does not end. The flag is set when it is stopped.
+        #[derive(Message)]
+        #[rtype(result = "()")]
+        struct PendingPairing(Arc<AtomicBool>);
+
+        impl Handler<PendingPairing> for Controller {
+            type Result = ();
+            fn handle(&mut self, msg: PendingPairing, ctx: &mut Context<Self>) {
+                let flag = DropFlag(msg.0);
+                let handle = ctx.spawn(
+                    async move {
+                        let _flag = flag;
+                        std::future::pending::<()>().await;
+                    }
+                    .into_actor(self),
+                );
+                self.pairing = Some(handle);
+            }
+        }
+
+        /// An Apple TV that is not configured.
+        fn new_found() -> Found {
+            Found {
+                id: "02:00:00:00:00:02".into(),
+                name: "Bedroom".into(),
+                model: String::new(),
+                address: Some(IpAddr::from([192, 0, 2, 8])),
+                endpoints: Endpoints::default(),
+                known_ids: vec!["02:00:00:00:00:02".into()],
+            }
+        }
+
+        /// Number of setup end events.
+        fn stop_events(events: &Mutex<Vec<Value>>) -> usize {
+            events
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|m| {
+                    m["msg"] == "driver_setup_change" && m["msg_data"]["event_type"] == "STOP"
+                })
+                .count()
+        }
+
+        /// Returns `true` if the controller has the device.
+        async fn has_device(controller: &Addr<Controller>, key: &str) -> bool {
+            controller
+                .send(DeviceAddr(key.into()))
+                .await
+                .expect("send")
+                .is_some()
+        }
+
+        #[actix::test]
+        async fn failing_pairing_write_changes_nothing() {
+            let name = "pair-error";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            // A first setup replaces the devices when the pairing is saved.
+            start_setup(&controller, &events, "a", false).await;
+            break_writes(&dir);
+            let found = new_found();
+            let new_key = device_key(&found.id);
+            controller
+                .send(Paired("a", found, None))
+                .await
+                .expect("send");
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("ERROR"), event["state"]);
+            assert_eq!(json!("OTHER"), event["error"]);
+            assert!(has_device(&controller, &cfg.key).await, "kept");
+            assert!(!has_device(&controller, &new_key).await, "not added");
+            assert_eq!(
+                State::Running,
+                controller.send(MachineState).await.expect("send")
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn pairing_changes_the_devices_after_the_write() {
+            let name = "pair-write";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            start_setup(&controller, &events, "a", false).await;
+            let hold = controller.send(HoldWrites).await.expect("send");
+            let found = new_found();
+            let new_key = device_key(&found.id);
+            controller
+                .send(Paired("a", found, None))
+                .await
+                .expect("send");
+            settle(&controller, &[&events]).await;
+            assert!(
+                has_device(&controller, &cfg.key).await,
+                "no change before the write"
+            );
+            assert!(!has_device(&controller, &new_key).await);
+            drop(hold);
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("OK"), event["state"]);
+            assert!(!has_device(&controller, &cfg.key).await, "replaced");
+            assert!(has_device(&controller, &new_key).await);
+            controller.send(FlushStore).await.expect("send");
+            let saved = ConfigStore::new(&dir).load_devices();
+            assert_eq!(
+                vec![new_key],
+                saved.iter().map(|c| c.key.clone()).collect::<Vec<_>>()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn pairing_again_keeps_the_key_and_name() {
+            let name = "pair-again";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            let saved = || ConfigStore::new(&dir).load_devices();
+            let mut found = new_found();
+            found.known_ids = vec!["NEW-ID".into()];
+            let other_id = found.id.clone();
+            for step in 0..3 {
+                let (reconfigure, replace) = match step {
+                    // "pair" on the configuration page: the device is found with new ids.
+                    0 => (true, Some(cfg.key.clone())),
+                    1 => {
+                        // A first setup finds a configured device by its id.
+                        found.id.clone_from(&cfg.id);
+                        // Not in the configuration now: only the id can match.
+                        found.known_ids = vec![cfg.known_ids[1].clone()];
+                        (false, None)
+                    }
+                    _ => {
+                        // A first setup finds a configured device by an id that step 1 saved.
+                        found.id.clone_from(&other_id);
+                        found.known_ids = vec![cfg.known_ids[1].clone()];
+                        (false, None)
+                    }
+                };
+                start_setup(&controller, &events, "a", reconfigure).await;
+                controller
+                    .send(Paired("a", found.clone(), replace))
+                    .await
+                    .expect("send");
+                let event = wait_stop(&events).await;
+                assert_eq!(json!("OK"), event["state"]);
+                let (_, now, _) = controller
+                    .send(DeviceCfg(cfg.key.clone()))
+                    .await
+                    .expect("send")
+                    .unwrap_or_else(|| panic!("step {step}: same key"));
+                assert_eq!(cfg.name, now.name, "step {step}");
+                assert_eq!(cfg.id, now.id, "step {step}");
+                assert_eq!(found.known_ids, now.known_ids, "step {step}");
+                assert_eq!(found.address, now.address, "step {step}");
+                assert!(!now.global_volume, "step {step}");
+                if found.id != cfg.id {
+                    assert!(
+                        !has_device(&controller, &device_key(&found.id)).await,
+                        "no new key"
+                    );
+                }
+                controller.send(FlushStore).await.expect("send");
+                assert_eq!(vec![now], saved());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn configure_keeps_device_changes_from_during_the_write() {
+            let name = "configure-write";
+            let cfg = device();
+            let dir = config_dir(name, &cfg).await;
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            start_setup(&controller, &events, "a", true).await;
+            controller
+                .send(ShowConfigure(cfg.key.clone()))
+                .await
+                .expect("send");
+            let hold = controller.send(HoldWrites).await.expect("send");
+            controller
+                .send(values("a", &[("global_volume", "false")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            // The device finds a new name and address while the write waits.
+            let (key, mut changed, version) = controller
+                .send(DeviceCfg(cfg.key.clone()))
+                .await
+                .expect("send")
+                .expect("device");
+            assert!(changed.global_volume, "no change before the write");
+            changed.name = "Den".into();
+            changed.address = Some(IpAddr::from([192, 0, 2, 7]));
+            controller
+                .send(DeviceEvent::Config {
+                    key,
+                    cfg: changed,
+                    version,
+                })
+                .await
+                .expect("send");
+            drop(hold);
+            let event = wait_stop(&events).await;
+            assert_eq!(json!("OK"), event["state"]);
+            let check = |c: &DeviceConfig| {
+                assert_eq!("Den", c.name);
+                assert_eq!(Some(IpAddr::from([192, 0, 2, 7])), c.address);
+                assert!(!c.global_volume);
+            };
+            let (_, now, _) = controller
+                .send(DeviceCfg(cfg.key.clone()))
+                .await
+                .expect("send")
+                .expect("device");
+            check(&now);
+            controller.send(FlushStore).await.expect("send");
+            let saved = ConfigStore::new(&dir).load_devices();
+            assert_eq!(1, saved.len());
+            check(&saved[0]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn abort_during_the_write_still_uses_the_devices() {
+            let name = "abort-write";
+            let dir = test_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let cfg = device();
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            start_setup(&controller, &events, "a", false).await;
+            let before = setup_events(&events);
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, before).await;
+            let hold = controller.send(HoldWrites).await.expect("send");
+            let backup = backup_json(std::slice::from_ref(&cfg)).expect("backup");
+            controller
+                .send(values("a", &[("restore_data", &backup)]))
+                .await
+                .expect("send")
+                .expect("ok");
+            controller
+                .send(AbortDriverSetup {
+                    ws_id: "a".into(),
+                    timeout: false,
+                })
+                .await
+                .expect("send");
+            let state = || controller.send(MachineState);
+            assert_eq!(State::RequireSetup, state().await.expect("send"));
+            drop(hold);
+            for _ in 0..100 {
+                if has_device(&controller, &cfg.key).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(has_device(&controller, &cfg.key).await, "restored");
+            assert_eq!(State::Running, state().await.expect("send"));
+            // The aborted flow sends no end event.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(0, stop_events(&events));
+            assert_eq!(1, config_len(name));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
+        async fn abort_stops_the_pairing() {
+            let controller = controller("pair-abort");
+            let events = connect(&controller, "a").await;
+            for timeout in [false, true] {
+                start_setup(&controller, &events, "a", false).await;
+                let stopped = Arc::new(AtomicBool::new(false));
+                controller
+                    .send(PendingPairing(Arc::clone(&stopped)))
+                    .await
+                    .expect("send");
+                controller
+                    .send(AbortDriverSetup {
+                        ws_id: "a".into(),
+                        timeout,
+                    })
+                    .await
+                    .expect("send");
+                settle(&controller, &[&events]).await;
+                assert!(stopped.load(Ordering::Relaxed), "timeout: {timeout}");
+            }
         }
 
         #[actix::test]

@@ -63,7 +63,7 @@ impl Handler<DeviceAddr> for Controller {
 /// Answer when the store has done all queued file jobs.
 #[derive(Message)]
 #[rtype(result = "()")]
-struct FlushStore;
+pub(crate) struct FlushStore;
 
 impl Handler<FlushStore> for Controller {
     type Result = ();

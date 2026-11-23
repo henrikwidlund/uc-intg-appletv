@@ -306,6 +306,15 @@ impl ConfigStore {
         self.writer.flush();
     }
 
+    /// Stop the writer thread until the returned sender sends or is dropped. Later jobs wait.
+    /// A flush or the drop of the last store blocks until then. Needs the writer thread.
+    #[cfg(test)]
+    pub fn hold(&self) -> mpsc::Sender<()> {
+        let (tx, rx) = mpsc::channel();
+        self.writer.send(Job::Hold(rx));
+        tx
+    }
+
     fn cache_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("cache_{key}.json"))
     }
@@ -359,6 +368,9 @@ enum Job {
     Remove(PathBuf),
     /// Answer when all earlier jobs are done.
     Flush(mpsc::SyncSender<()>),
+    /// Wait until the sender sends or is dropped.
+    #[cfg(test)]
+    Hold(mpsc::Receiver<()>),
 }
 
 impl Job {
@@ -389,6 +401,10 @@ impl Job {
             }
             Self::Flush(done) => {
                 let _ = done.send(());
+            }
+            #[cfg(test)]
+            Self::Hold(rx) => {
+                let _ = rx.recv();
             }
         }
     }
