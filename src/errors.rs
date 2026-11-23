@@ -51,9 +51,23 @@ impl From<std::io::Error> for ServiceError {
     }
 }
 
+/// For a message to a device actor, use [`ServiceError::from_device_mailbox`].
 impl From<MailboxError> for ServiceError {
     fn from(e: MailboxError) -> Self {
         Self::InternalServerError(format!("Internal message error: {e}"))
+    }
+}
+
+impl ServiceError {
+    /// Error for a message to a device actor that was not handled.
+    pub fn from_device_mailbox(e: MailboxError) -> Self {
+        match e {
+            // The device actor is stopped: the device was removed or replaced.
+            MailboxError::Closed => {
+                Self::NotFound("The Apple TV was removed or reconfigured".into())
+            }
+            MailboxError::Timeout => Self::Timeout,
+        }
     }
 }
 
@@ -77,14 +91,84 @@ impl From<ratv::Error> for ServiceError {
             ratv::Error::Timeout | ratv::Error::NoAnswer(_) => Self::Timeout,
             ratv::Error::InvalidArgument(a) => Self::BadRequest(a.into()),
             ratv::Error::NoTextField | ratv::Error::NoChapter => Self::BadRequest(e.to_string()),
+            // Refusals, or no volume control on the device. Mapped to `NotSupported`, which is
+            // logged at info.
             ratv::Error::VolumeNotAvailable => {
-                Self::ServiceUnavailable("Volume control is not available on this Apple TV".into())
+                Self::NotSupported("Volume control is not available on this Apple TV".into())
             }
             ratv::Error::CommandFailed { .. } => {
                 Self::NotSupported("The app did not run the command".into())
             }
-            ratv::Error::Io(io) => io.into(),
+            e if e.is_rejected() => {
+                Self::NotSupported(format!("The Apple TV refused the command: {e}"))
+            }
+            // From a call: nothing was sent, the input is too large for one message.
+            e if e.is_too_large() => {
+                Self::BadRequest("The input is too large to send to the Apple TV".into())
+            }
+            // Only connect and pair return `Io`. Never a bad request.
+            ratv::Error::Io(io) if io.kind() == ErrorKind::TimedOut => Self::Timeout,
+            ratv::Error::Io(io) => Self::ServiceUnavailable(io.to_string()),
             e => Self::ServiceUnavailable(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io(kind: ErrorKind) -> ratv::Error {
+        ratv::Error::Io(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn ratv_io_is_timeout_or_unavailable() {
+        assert_eq!(ServiceError::Timeout, io(ErrorKind::TimedOut).into());
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(io(kind).into(), ServiceError::ServiceUnavailable(_)),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_errors() {
+        assert!(matches!(
+            ServiceError::from(MailboxError::Closed),
+            ServiceError::InternalServerError(_)
+        ));
+        assert_eq!(
+            ServiceError::NotFound("The Apple TV was removed or reconfigured".into()),
+            ServiceError::from_device_mailbox(MailboxError::Closed)
+        );
+        assert_eq!(
+            ServiceError::Timeout,
+            ServiceError::from_device_mailbox(MailboxError::Timeout)
+        );
+    }
+
+    #[test]
+    fn refusals_are_not_supported() {
+        assert!(matches!(
+            ServiceError::from(ratv::Error::VolumeNotAvailable),
+            ServiceError::NotSupported(_)
+        ));
+        let failed = ratv::Error::CommandFailed {
+            send_error: 0,
+            handler_status: 404,
+        };
+        assert!(failed.is_rejected());
+        assert_eq!(
+            ServiceError::NotSupported("The app did not run the command".into()),
+            failed.into()
+        );
     }
 }

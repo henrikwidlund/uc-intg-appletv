@@ -110,9 +110,34 @@ struct CompanionEvent {
 struct SiriSession {
     session_id: u32,
     audio: mpsc::Sender<Bytes>,
-    /// Set when a newer session replaces this one.
-    replaced: Arc<AtomicBool>,
+    /// Shared with the future that runs the session.
+    flags: Arc<SiriFlags>,
+    /// Audio came from the Remote.
+    got_audio: bool,
 }
+
+/// State of a Siri session that the actor sets and the session future reads.
+#[derive(Default)]
+struct SiriFlags {
+    /// Set when a newer session replaces this one.
+    replaced: AtomicBool,
+    /// Set when the end marker came before any audio. Siri is then not started.
+    aborted: AtomicBool,
+}
+
+impl SiriSession {
+    /// Notes a chunk from the Remote. An end marker before any audio aborts the session.
+    fn note_chunk(&mut self, end: bool) {
+        if !end {
+            self.got_audio = true;
+        } else if !self.got_audio {
+            self.flags.aborted.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Text for a command or Siri session while the pairing is not valid.
+const PAIRING_INVALID: &str = "Pairing is not valid, pair the Apple TV again";
 
 #[derive(Default)]
 struct Timers {
@@ -1484,6 +1509,45 @@ impl AppleTvActor {
         Ok(calls)
     }
 
+    /// Assistant event for the end of a Siri session. See [`siri_event`].
+    fn siri_end_event(
+        &self,
+        entity_id: String,
+        session_id: u32,
+        chunks: Result<Option<u32>, ratv::Error>,
+        replaced: bool,
+    ) -> AssistantEvent {
+        let text = auth_error_text(self.status, &chunks);
+        let mut event = siri_event(&self.cfg.name, entity_id, session_id, chunks, replaced);
+        if let Some(text) = text
+            && let AssistantEvent::Error { data, .. } = &mut event
+        {
+            data.message = text.into();
+        }
+        event
+    }
+
+    /// Replaces the Siri session. Returns its audio queue and flags.
+    fn new_siri_session(&mut self, session_id: u32) -> (mpsc::Receiver<Bytes>, Arc<SiriFlags>) {
+        if let Some(old) = self.siri.take() {
+            info!(
+                "[{}] Siri session {} replaced by {session_id}",
+                self.cfg.name, old.session_id
+            );
+            old.flags.replaced.store(true, Ordering::Relaxed);
+        }
+        let (audio, rx) = mpsc::channel::<Bytes>(SIRI_QUEUE);
+        let flags = Arc::new(SiriFlags::default());
+        self.siri = Some(SiriSession {
+            session_id,
+            audio,
+            flags: flags.clone(),
+            got_audio: false,
+        });
+        (rx, flags)
+    }
+
+    /// Starts a Siri session.
     fn voice_start(
         &mut self,
         params: Option<&Map<String, Value>>,
@@ -1497,27 +1561,14 @@ impl AppleTvActor {
         // The voice button can wake the Remote. Siri then starts when the connect has ended.
         let connecting = self.running_connect();
         if connecting.is_none() {
-            let tv = self.tv.as_ref().ok_or(ServiceError::NotConnected)?;
+            let tv = self.tv.as_ref().ok_or_else(|| not_connected(self.status))?;
             if !siri_available(tv, self.ctx.siri_mode()) {
                 return Err(ServiceError::ServiceUnavailable(
                     "Siri needs Companion or MRP".into(),
                 ));
             }
         }
-        if let Some(old) = self.siri.take() {
-            info!(
-                "[{}] Siri session {} replaced by {session_id}",
-                self.cfg.name, old.session_id
-            );
-            old.replaced.store(true, Ordering::Relaxed);
-        }
-        let (audio, mut rx) = mpsc::channel::<Bytes>(SIRI_QUEUE);
-        let replaced = Arc::new(AtomicBool::new(false));
-        self.siri = Some(SiriSession {
-            session_id,
-            audio,
-            replaced: replaced.clone(),
-        });
+        let (mut rx, flags) = self.new_siri_session(session_id);
 
         let mode = self.ctx.siri_mode();
         debug!(
@@ -1529,17 +1580,24 @@ impl AppleTvActor {
         let controller = self.controller.clone();
         let ready_id = entity_id.clone();
         let lock = self.siri_lock.clone();
-        let ended = replaced.clone();
+        let ended = flags.clone();
         // Returns the number of audio chunks sent to the Apple TV.
         let fut = move |tv: Option<AppleTv>| async move {
             let tv = tv.ok_or(ratv::Error::NotConnected("Apple TV"))?;
+            // Ended without audio: do not start Siri. No chunks gives the "no audio" error.
+            if flags.aborted.load(Ordering::Relaxed) {
+                return Ok(Some(0));
+            }
             // ratv allows one session. The session before ends after its audio is sent.
             let _active = tokio::time::timeout(SIRI_WAIT, lock.lock_owned())
                 .await
                 .map_err(|_| ratv::Error::SiriActive)?;
             // Replaced while it waited: do not start it.
-            if replaced.load(Ordering::Relaxed) {
+            if flags.replaced.load(Ordering::Relaxed) {
                 return Ok(None);
+            }
+            if flags.aborted.load(Ordering::Relaxed) {
+                return Ok(Some(0));
             }
             let mut siri = start_siri(&tv, mode).await?;
             controller.do_send(DeviceEvent::Assistant(AssistantEvent::Ready {
@@ -1578,7 +1636,7 @@ impl AppleTvActor {
             .then(move |(), act, _| fut(act.tv.clone()).into_actor(act));
         ctx.spawn(start.map(move |result, act, _| {
             // Compare the session, not the id: the Remote can use the same id again.
-            let current = act.siri.as_ref().map(|s| &s.replaced);
+            let current = act.siri.as_ref().map(|s| &s.flags);
             if current.is_some_and(|r| Arc::ptr_eq(r, &ended)) {
                 act.siri = None;
             } else if act
@@ -1589,8 +1647,8 @@ impl AppleTvActor {
                 // The new session with this id sends the end event.
                 return;
             }
-            let replaced = ended.load(Ordering::Relaxed);
-            let event = siri_event(&act.cfg.name, entity_id, session_id, result, replaced);
+            let replaced = ended.replaced.load(Ordering::Relaxed);
+            let event = act.siri_end_event(entity_id, session_id, result, replaced);
             act.controller.do_send(DeviceEvent::Assistant(event));
         }));
         Ok(())
@@ -1957,22 +2015,37 @@ impl Handler<UpdateConfig> for AppleTvActor {
 }
 
 impl Handler<Command> for AppleTvActor {
-    type Result = ResponseActFuture<Self, Result<(), ServiceError>>;
+    // Answered inside `handle`. A future answer can be lost when a `Stop` comes in the same
+    // mailbox run.
+    type Result = Result<(), ServiceError>;
 
-    fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, mut msg: Command, ctx: &mut Self::Context) -> Self::Result {
+        let reply = msg.reply.take();
+        let result = self.command(msg, ctx);
+        // The futures that the command spawned run only after `handle` returns, so this comes
+        // before any event of the command. The controller handles both in order.
+        if result.is_ok()
+            && let Some(reply) = reply
+        {
+            self.controller.do_send(DeviceEvent::Accepted(reply));
+        }
+        result
+    }
+}
+
+impl AppleTvActor {
+    /// Checks and starts an entity command. Most commands run in the background.
+    fn command(&mut self, msg: Command, ctx: &mut Context<Self>) -> Result<(), ServiceError> {
         // `stop_send` and invalid parameters need no connection.
         if msg.kind == EntityKind::Remote && msg.cmd_id == IntgRemoteCommand::StopSend.as_ref() {
             self.stop.send_modify(|n| *n = n.wrapping_add(1));
             debug!("[{}] stop_send: commands stopped", self.cfg.name);
-            return Box::pin(fut::ready(Ok(())));
+            return Ok(());
         }
         let run = if msg.kind == EntityKind::VoiceAssistant {
             None
         } else {
-            match Self::parse(&msg) {
-                Ok(run) => Some(run),
-                Err(e) => return Box::pin(fut::ready(Err(e))),
-            }
+            Some(Self::parse(&msg)?)
         };
         // The core can send a command before `exit_standby`.
         if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
@@ -1980,16 +2053,15 @@ impl Handler<Command> for AppleTvActor {
             self.start_connect(ctx);
         }
         let Some(run) = run else {
-            let result = match msg.cmd_id.as_str() {
+            return match msg.cmd_id.as_str() {
                 "voice_start" => self.voice_start(msg.params.as_ref(), ctx),
                 _ => Err(ServiceError::NotSupported(msg.cmd_id)),
             };
-            return Box::pin(fut::ready(result));
         };
         // A command can come right after the Remote wakes up, while the connect still runs.
         let connecting = self.running_connect();
         if self.tv.is_none() && connecting.is_none() {
-            return Box::pin(fut::ready(Err(ServiceError::NotConnected)));
+            return Err(not_connected(self.status));
         }
         // The Remote core waits at most 10 s for the answer, so the command runs in the
         // background. Later errors are only logged.
@@ -2018,7 +2090,26 @@ impl Handler<Command> for AppleTvActor {
             act.run_command(&msg, &run, guard, epoch).boxed_local()
         });
         ctx.spawn(fut);
-        Box::pin(fut::ready(Ok(())))
+        Ok(())
+    }
+}
+
+/// Error text for a Siri session whose connect failed on the pairing. `None` keeps the text of
+/// [`siri_event`].
+fn auth_error_text(
+    status: DeviceStatus,
+    chunks: &Result<Option<u32>, ratv::Error>,
+) -> Option<&'static str> {
+    (status == DeviceStatus::AuthError && matches!(chunks, Err(ratv::Error::NotConnected(_))))
+        .then_some(PAIRING_INVALID)
+}
+
+/// Error for a command without a connection.
+fn not_connected(status: DeviceStatus) -> ServiceError {
+    if status == DeviceStatus::AuthError {
+        ServiceError::ServiceUnavailable(PAIRING_INVALID.into())
+    } else {
+        ServiceError::NotConnected
     }
 }
 
@@ -2079,7 +2170,7 @@ impl AppleTvActor {
         let prepared = self
             .tv
             .clone()
-            .map_or(Err(ServiceError::NotConnected), |tv| {
+            .map_or(Err(not_connected(self.status)), |tv| {
                 self.plan(run).map(|calls| (tv, calls))
             });
         let Expect {
@@ -2117,9 +2208,11 @@ impl AppleTvActor {
                 }
                 Err(e) => {
                     match &e {
-                        // The device refused it in its current state. The user cannot fix it
-                        // on the Remote.
-                        ServiceError::NotSupported(_) | ServiceError::BadRequest(_) => {
+                        // The device refused it in its current state, or the item is gone,
+                        // for example from Up Next. The user cannot fix it on the Remote.
+                        ServiceError::NotSupported(_)
+                        | ServiceError::BadRequest(_)
+                        | ServiceError::NotFound(_) => {
                             info!("[{}] {cmd_id} not run: {e}", act.cfg.name);
                         }
                         _ => warn!("[{}] {cmd_id} failed: {e}", act.cfg.name),
@@ -2171,7 +2264,7 @@ impl Handler<AudioChunk> for AppleTvActor {
     type Result = ();
 
     fn handle(&mut self, msg: AudioChunk, _: &mut Self::Context) {
-        let Some(siri) = &self.siri else {
+        let Some(siri) = &mut self.siri else {
             debug!(
                 "[{}] audio for unknown session {}",
                 self.cfg.name, msg.session_id
@@ -2186,6 +2279,7 @@ impl Handler<AudioChunk> for AppleTvActor {
             return;
         }
         let end = msg.data.is_empty();
+        siri.note_chunk(end);
         if siri.audio.try_send(msg.data).is_err() {
             warn!("[{}] Siri audio queue full, chunk dropped", self.cfg.name);
         }
@@ -2218,7 +2312,58 @@ mod tests {
             kind,
             cmd_id: cmd_id.into(),
             params: params.as_object().cloned(),
+            reply: None,
         }
+    }
+
+    #[test]
+    fn siri_text_after_auth_error() {
+        let not_connected = || Err(ratv::Error::NotConnected("Apple TV"));
+        assert_eq!(
+            Some(PAIRING_INVALID),
+            auth_error_text(DeviceStatus::AuthError, &not_connected())
+        );
+        assert_eq!(
+            None,
+            auth_error_text(DeviceStatus::Disconnected, &not_connected())
+        );
+        assert_eq!(None, auth_error_text(DeviceStatus::AuthError, &Ok(Some(0))));
+        assert_eq!(
+            None,
+            auth_error_text(DeviceStatus::AuthError, &Err(ratv::Error::Timeout))
+        );
+    }
+
+    #[test]
+    fn end_before_audio_aborts_siri() {
+        let session = |got_audio| SiriSession {
+            session_id: 1,
+            audio: mpsc::channel(1).0,
+            flags: Arc::default(),
+            got_audio,
+        };
+        let mut s = session(false);
+        s.note_chunk(true);
+        assert!(s.flags.aborted.load(Ordering::Relaxed));
+
+        let mut s = session(false);
+        s.note_chunk(false);
+        s.note_chunk(true);
+        assert!(!s.flags.aborted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn not_connected_tells_to_pair_after_auth_error() {
+        assert_eq!(
+            ServiceError::ServiceUnavailable(
+                "Pairing is not valid, pair the Apple TV again".into()
+            ),
+            not_connected(DeviceStatus::AuthError)
+        );
+        assert_eq!(
+            ServiceError::NotConnected,
+            not_connected(DeviceStatus::Disconnected)
+        );
     }
 
     #[test]

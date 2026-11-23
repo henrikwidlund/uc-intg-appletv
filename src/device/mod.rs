@@ -83,6 +83,8 @@ pub enum DeviceEvent {
         status: DeviceStatus,
     },
     Assistant(AssistantEvent),
+    /// A command with a [`Reply`] started. Sent before the events of the command.
+    Accepted(Reply),
 }
 
 /// Connect, and stay connected.
@@ -112,6 +114,16 @@ pub struct Command {
     pub kind: EntityKind,
     pub cmd_id: String,
     pub params: Option<Map<String, Value>>,
+    /// The request to answer with [`DeviceEvent::Accepted`] when the command started. Set for
+    /// voice assistant commands: the answer must come before their assistant events.
+    pub reply: Option<Reply>,
+}
+
+/// Remote request of a command.
+#[derive(Debug)]
+pub struct Reply {
+    pub ws_id: Arc<str>,
+    pub req_id: u32,
 }
 
 /// Browse the apps and the Up Next queue.

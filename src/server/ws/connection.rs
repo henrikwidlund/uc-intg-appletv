@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use uc_api::intg::proto::{
-    AudioFormat, IntegrationMessage, SampleFormat, integration_message::Message as ProtoMsg,
+    AudioConfiguration, AudioFormat, IntegrationMessage, SampleFormat,
+    integration_message::Message as ProtoMsg,
 };
 use uc_api::ws::{WsMessage, WsResultMsgData};
 
@@ -205,9 +206,13 @@ impl WsConn {
                         debug!("[{}] -> {text}", self.id);
                     }
                 }
-                self.handle_text_message(&text, sender)
+                self.handle_text_message(&text, sender);
+                Ok(())
             }
-            AggregatedMessage::Binary(data) => self.handle_binary_message(data),
+            AggregatedMessage::Binary(data) => {
+                self.handle_binary_message(data);
+                Ok(())
+            }
             AggregatedMessage::Ping(bytes) => {
                 if timeout(SEND_TIMEOUT, session.pong(&bytes)).await.is_err() {
                     info!("[{}] Closing connection: Remote does not read", self.id);
@@ -223,22 +228,17 @@ impl WsConn {
         }
     }
 
-    fn handle_text_message(
-        &self,
-        text: &str,
-        sender: &Addr<WsSender>,
-    ) -> Result<(), Option<CloseReason>> {
+    /// Handle a JSON text message. A message that cannot be parsed is skipped. The connection
+    /// stays open. A request with a readable id gets an error response.
+    fn handle_text_message(&self, text: &str, sender: &Addr<WsSender>) {
         match serde_json::from_str::<WsMessage>(text) {
-            Ok(msg) => {
-                self.process_intg_api_message(msg, sender);
-                Ok(())
-            }
+            Ok(msg) => self.process_intg_api_message(msg, sender),
             Err(e) => {
-                warn!("[{}] Invalid JSON message: {e}", self.id);
-                Err(Some(CloseReason {
-                    code: CloseCode::Unsupported,
-                    description: Some("Invalid JSON message".into()),
-                }))
+                // The error text has no part of `msg_data`, where PINs are.
+                warn!("[{}] Invalid JSON message, skipped: {e}", self.id);
+                if let Some(response) = invalid_message_response(&self.id, text, &e) {
+                    sender.do_send(SendWsMessage::Msg(response));
+                }
             }
         }
     }
@@ -246,15 +246,14 @@ impl WsConn {
     /// Process a received Integration-API request, response or event message.
     ///
     /// A request runs in its own task, so a slow request does not stop reading the next
-    /// messages. The responses are sent with `sender` and can come in a different order.
+    /// messages. The responses are sent with `sender`, or by the controller
+    /// for responses it sends itself. They can come in a different order.
     fn process_intg_api_message(&self, mut msg: WsMessage, sender: &Addr<WsSender>) {
-        let req_id = msg.id.unwrap_or_default();
-
-        match msg.kind.as_deref() {
-            Some("req") => {
+        match route(&msg) {
+            Route::Request(req_id) => {
                 let id = Arc::clone(&self.id);
                 let sender = sender.clone();
-                let request = Self::on_request(&id, &mut msg, &self.controller_addr);
+                let request = Self::on_request(&id, req_id, &mut msg, &self.controller_addr);
                 actix_web::rt::spawn(async move {
                     let result = match request {
                         Ok(request) => request.await.unwrap_or_else(|e| Err(e.into())),
@@ -273,38 +272,52 @@ impl WsConn {
                     }
                 });
             }
-            Some("resp") => {
+            Route::Response => {
                 if let Err(e) = Self::on_response(&self.id, msg, &self.controller_addr) {
                     warn!("[{}] Error processing response: {e}", self.id);
                 }
             }
-            Some("event") => {
+            Route::Event => {
                 if let Err(e) = Self::on_event(&self.id, msg, &self.controller_addr) {
                     warn!("[{}] Error processing event: {e}", self.id);
                 }
             }
-            Some(other) => {
-                warn!("[{}] Unsupported message kind: {other}", self.id);
-                let e = ServiceError::BadRequest(format!("Unsupported message kind: {other}"));
-                send_error_response(&self.id, req_id, e, sender);
+            Route::RequestWithoutId => warn!("[{}] Request without id, skipped", self.id),
+            Route::UnknownKind { kind, req_id } => {
+                warn!("[{}] Unsupported message kind: {kind}", self.id);
+                if let Some(req_id) = req_id {
+                    let e = ServiceError::BadRequest(format!("Unsupported message kind: {kind}"));
+                    send_error_response(&self.id, req_id, e, sender);
+                }
             }
-            None => {
-                let e = ServiceError::BadRequest("Missing property: kind".into());
-                send_error_response(&self.id, req_id, e, sender);
+            Route::MissingKind { req_id } => {
+                warn!("[{}] Message without kind", self.id);
+                if let Some(req_id) = req_id {
+                    let e = ServiceError::BadRequest("Missing property: kind".into());
+                    send_error_response(&self.id, req_id, e, sender);
+                }
             }
         }
     }
 
     /// Handle a binary protobuf message. Only voice audio is supported.
-    fn handle_binary_message(&mut self, data: Bytes) -> Result<(), Option<CloseReason>> {
-        let msg = IntegrationMessage::decode(data).map_err(|e| {
-            error!("[{}] Invalid binary message: {e:?}", self.id);
-            None
-        })?;
-        let msg = msg.message.ok_or_else(|| {
-            error!("[{}] Unable to decode binary message", self.id);
-            None
-        })?;
+    ///
+    /// A message that cannot be decoded is skipped. The connection stays open.
+    fn handle_binary_message(&mut self, data: Bytes) {
+        let msg = match IntegrationMessage::decode(data) {
+            Ok(IntegrationMessage { message: Some(msg) }) => msg,
+            Ok(IntegrationMessage { message: None }) => {
+                warn!(
+                    "[{}] Binary message without known content, skipped",
+                    self.id
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("[{}] Invalid binary message, skipped: {e}", self.id);
+                return;
+            }
+        };
 
         match msg {
             ProtoMsg::VoiceBegin(begin) => {
@@ -317,22 +330,15 @@ impl WsConn {
                         "[{}] => voice_begin({}): {cfg:?}",
                         self.id, begin.session_id
                     );
-                    // Siri needs 16 kHz mono signed 16 bit PCM. Any other format is rejected.
-                    if cfg.format != AudioFormat::Pcm as i32
-                        || cfg.sample_format != SampleFormat::I16 as i32
-                        || cfg.sample_rate != VOICE_SAMPLE_RATE
-                        || cfg.channels != 1
-                    {
-                        self.controller_addr
-                            .do_send(R2AudioChunkMsg::end(begin.session_id));
-                        error!(
-                            "[{}] Invalid audio format, closing connection: {cfg:?}",
-                            self.id
+                    // Only this voice session ends. Without audio, the Siri session sends an
+                    // error event to the Remote.
+                    if !supported(&cfg) {
+                        self.voice.rejected = true;
+                        self.audio.do_send(R2AudioChunkMsg::end(begin.session_id));
+                        warn!(
+                            "[{}] Unsupported audio format, voice session {} ended: {cfg:?}",
+                            self.id, begin.session_id
                         );
-                        return Err(Some(CloseReason {
-                            code: CloseCode::Unsupported,
-                            description: Some("Invalid audio format".into()),
-                        }));
                     }
                 } else {
                     warn!(
@@ -342,16 +348,25 @@ impl WsConn {
                 }
             }
             ProtoMsg::VoiceData(data) => {
+                // Empty data is the end marker for the controller. Only `VoiceEnd` or an
+                // unsupported format ends a session.
+                if data.samples.is_empty() {
+                    debug!("[{}] Empty voice data skipped", self.id);
+                    return;
+                }
                 if self.voice.session_id != data.session_id {
                     self.voice = VoiceCount {
                         session_id: data.session_id,
                         ..VoiceCount::default()
                     };
                 }
+                if self.voice.rejected {
+                    return;
+                }
                 self.voice.chunks += 1;
                 self.voice.bytes += data.samples.len() as u64;
                 // No reply needed: the read loop does not wait for the controller.
-                self.controller_addr.do_send(R2AudioChunkMsg {
+                self.audio.do_send(R2AudioChunkMsg {
                     session_id: data.session_id,
                     data: data.samples,
                 });
@@ -363,11 +378,11 @@ impl WsConn {
                     VoiceCount::default()
                 };
                 log_voice_end(&self.id, end.session_id, count);
-                self.controller_addr
-                    .do_send(R2AudioChunkMsg::end(end.session_id));
+                // Also sent for a rejected session: the first end marker can come before the
+                // controller knows the session.
+                self.audio.do_send(R2AudioChunkMsg::end(end.session_id));
             }
         }
-        Ok(())
     }
 
     /// Send a message to the WebSocket session. Returns `Err` if the session is closed.
@@ -397,6 +412,58 @@ impl WsConn {
             }
         }
     }
+}
+
+/// How to handle a parsed message. Only a message with an id can get a response.
+#[derive(Debug, PartialEq, Eq)]
+enum Route<'a> {
+    Request(u32),
+    Response,
+    Event,
+    RequestWithoutId,
+    /// Answered with an error if `req_id` is set.
+    UnknownKind {
+        kind: &'a str,
+        req_id: Option<u32>,
+    },
+    /// Answered with an error if `req_id` is set.
+    MissingKind {
+        req_id: Option<u32>,
+    },
+}
+
+fn route(msg: &WsMessage) -> Route<'_> {
+    match (msg.kind.as_deref(), msg.id) {
+        (Some("req"), Some(req_id)) => Route::Request(req_id),
+        (Some("req"), None) => Route::RequestWithoutId,
+        (Some("resp"), _) => Route::Response,
+        (Some("event"), _) => Route::Event,
+        (Some(kind), req_id) => Route::UnknownKind { kind, req_id },
+        (None, req_id) => Route::MissingKind { req_id },
+    }
+}
+
+/// Error response for a message that `WsMessage` cannot parse. Only a request with a readable id
+/// gets one.
+fn invalid_message_response(id: &str, text: &str, e: &serde_json::Error) -> Option<WsMessage> {
+    match serde_json::from_str(text) {
+        Ok(RequestId {
+            kind: Some("req"),
+            id: Some(req_id),
+        }) => {
+            let e = ServiceError::BadRequest(format!("Invalid message: {e}"));
+            Some(service_error_to_ws_message(id, req_id, e))
+        }
+        _ => None,
+    }
+}
+
+/// The fields of a request that are needed for an error response.
+#[derive(serde::Deserialize)]
+struct RequestId<'a> {
+    #[serde(borrow)]
+    kind: Option<&'a str>,
+    id: Option<u32>,
 }
 
 /// Returns `true` for a setup message with backup data. It contains the pairing credentials.
@@ -443,6 +510,15 @@ fn service_error_to_ws_message(id: &str, req_id: u32, error: ServiceError) -> Ws
     WsMessage::error(req_id, code, ws_err)
 }
 
+/// Returns `true` for the audio format that Siri needs: 16 kHz mono signed 16 bit PCM.
+/// An unset `format` or `channels` (0) means the default: PCM and 1 channel.
+const fn supported(cfg: &AudioConfiguration) -> bool {
+    (cfg.format == AudioFormat::Unknown as i32 || cfg.format == AudioFormat::Pcm as i32)
+        && cfg.sample_format == SampleFormat::I16 as i32
+        && cfg.sample_rate == VOICE_SAMPLE_RATE
+        && cfg.channels <= 1
+}
+
 /// Logs the audio received in one voice session.
 fn log_voice_end(id: &str, session_id: u32, count: VoiceCount) {
     // 16 bit mono samples.
@@ -454,7 +530,193 @@ fn log_voice_end(id: &str, session_id: u32, count: VoiceCount) {
 }
 #[cfg(test)]
 mod tests {
-    use super::is_backup_message;
+    use super::{RequestId, Route, invalid_message_response, is_backup_message, route, supported};
+    use crate::configuration::HeartbeatSettings;
+    use crate::controller::R2AudioChunkMsg;
+    use crate::controller::test_util::controller;
+    use crate::server::ws::WsConn;
+    use actix::{Actor, Handler, MessageResult};
+    use prost::Message;
+    use uc_api::intg::proto::{
+        AudioConfiguration, AudioFormat, IntegrationMessage, RemoteVoiceBegin, RemoteVoiceData,
+        RemoteVoiceEnd, SampleFormat, integration_message::Message as ProtoMsg,
+    };
+    use uc_api::ws::WsMessage;
+
+    fn config(
+        channels: u32,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+        format: i32,
+    ) -> AudioConfiguration {
+        AudioConfiguration {
+            channels,
+            sample_rate,
+            sample_format: sample_format as i32,
+            format,
+        }
+    }
+
+    #[test]
+    fn supported_audio_format() {
+        let pcm = AudioFormat::Pcm as i32;
+        let unset = AudioFormat::Unknown as i32;
+        assert!(supported(&config(1, 16_000, SampleFormat::I16, pcm)));
+        assert!(supported(&config(0, 16_000, SampleFormat::I16, pcm)));
+        assert!(supported(&config(1, 16_000, SampleFormat::I16, unset)));
+        assert!(!supported(&config(2, 16_000, SampleFormat::I16, pcm)));
+        assert!(!supported(&config(1, 16_000, SampleFormat::I16, 7)));
+        assert!(!supported(&config(1, 16_000, SampleFormat::I32, pcm)));
+        assert!(!supported(&config(1, 16_000, SampleFormat::Unknown, pcm)));
+        assert!(!supported(&config(1, 8_000, SampleFormat::I16, pcm)));
+        assert!(!supported(&config(1, 0, SampleFormat::I16, pcm)));
+    }
+
+    fn encode(msg: ProtoMsg) -> bytes::Bytes {
+        IntegrationMessage { message: Some(msg) }
+            .encode_to_vec()
+            .into()
+    }
+
+    /// Collects the session id and size of each audio chunk.
+    #[derive(Default)]
+    struct AudioProbe(Vec<(u32, usize)>);
+
+    impl Actor for AudioProbe {
+        type Context = actix::Context<Self>;
+    }
+
+    impl Handler<R2AudioChunkMsg> for AudioProbe {
+        type Result = ();
+        fn handle(&mut self, msg: R2AudioChunkMsg, _: &mut Self::Context) {
+            self.0.push((msg.session_id, msg.data.len()));
+        }
+    }
+
+    /// Returns the chunks received so far. Comes after all chunks sent before it.
+    #[derive(actix::Message)]
+    #[rtype(result = "Vec<(u32, usize)>")]
+    struct Take;
+
+    impl Handler<Take> for AudioProbe {
+        type Result = MessageResult<Take>;
+        fn handle(&mut self, _: Take, _: &mut Self::Context) -> Self::Result {
+            MessageResult(std::mem::take(&mut self.0))
+        }
+    }
+
+    #[actix::test]
+    async fn bad_voice_format_ends_only_the_voice_session() {
+        let mut conn = WsConn::new(
+            "test".into(),
+            controller("ws-voice"),
+            HeartbeatSettings::default(),
+        );
+        let probe = AudioProbe::default().start();
+        conn.audio = probe.clone().recipient();
+        let pcm = AudioFormat::Pcm as i32;
+        // Not a valid protobuf message: skipped.
+        conn.handle_binary_message(bytes::Bytes::from_static(&[0xff, 0xff, 0xff]));
+        // An empty message has no content: skipped.
+        assert!(
+            IntegrationMessage::decode(bytes::Bytes::new())
+                .expect("decode")
+                .message
+                .is_none()
+        );
+        conn.handle_binary_message(bytes::Bytes::new());
+
+        conn.handle_binary_message(encode(ProtoMsg::VoiceBegin(RemoteVoiceBegin {
+            session_id: 7,
+            configuration: Some(config(2, 16_000, SampleFormat::I16, pcm)),
+        })));
+        conn.handle_binary_message(encode(ProtoMsg::VoiceData(RemoteVoiceData {
+            session_id: 7,
+            samples: vec![0; 64].into(),
+        })));
+        conn.handle_binary_message(encode(ProtoMsg::VoiceEnd(RemoteVoiceEnd { session_id: 7 })));
+        // End marker at the bad begin, no audio, end marker at the end.
+        assert_eq!(vec![(7, 0), (7, 0)], probe.send(Take).await.expect("probe"));
+
+        // The next session works again.
+        conn.handle_binary_message(encode(ProtoMsg::VoiceBegin(RemoteVoiceBegin {
+            session_id: 8,
+            configuration: Some(config(1, 16_000, SampleFormat::I16, pcm)),
+        })));
+        conn.handle_binary_message(encode(ProtoMsg::VoiceData(RemoteVoiceData {
+            session_id: 8,
+            samples: vec![0; 64].into(),
+        })));
+        // Empty data does not end the session.
+        conn.handle_binary_message(encode(ProtoMsg::VoiceData(RemoteVoiceData {
+            session_id: 8,
+            samples: bytes::Bytes::new(),
+        })));
+        assert_eq!(vec![(8, 64)], probe.send(Take).await.expect("probe"));
+        assert_eq!(1, conn.voice.chunks);
+        assert_eq!(64, conn.voice.bytes);
+    }
+
+    #[test]
+    fn route_needs_id_for_a_response() {
+        let msg = |text: &str| serde_json::from_str::<WsMessage>(text).expect("json");
+        let req = msg(r#"{"kind":"req","id":5,"msg":"get_version"}"#);
+        assert_eq!(Route::Request(5), route(&req));
+        let req = msg(r#"{"kind":"req","msg":"get_version"}"#);
+        assert_eq!(Route::RequestWithoutId, route(&req));
+        assert_eq!(
+            Route::Response,
+            route(&msg(r#"{"kind":"resp","req_id":1}"#))
+        );
+        assert_eq!(Route::Event, route(&msg(r#"{"kind":"event","msg":"x"}"#)));
+        let other = msg(r#"{"kind":"foo","id":3}"#);
+        assert_eq!(
+            Route::UnknownKind {
+                kind: "foo",
+                req_id: Some(3)
+            },
+            route(&other)
+        );
+        let none = msg(r#"{"msg":"x"}"#);
+        assert_eq!(Route::MissingKind { req_id: None }, route(&none));
+        let unknown = msg(r#"{"kind":"foo"}"#);
+        assert_eq!(
+            Route::UnknownKind {
+                kind: "foo",
+                req_id: None
+            },
+            route(&unknown)
+        );
+        let missing = msg(r#"{"id":4,"msg":"x"}"#);
+        assert_eq!(Route::MissingKind { req_id: Some(4) }, route(&missing));
+    }
+
+    #[test]
+    fn invalid_message_response_only_for_requests_with_id() {
+        let response = |text: &str| {
+            let e = serde_json::from_str::<WsMessage>(text).expect_err("invalid");
+            invalid_message_response("test", text, &e)
+                .map(|m| serde_json::to_value(m).expect("json"))
+        };
+        let resp =
+            response(r#"{"kind":"req","id":5,"msg":"get_version","cat":"x"}"#).expect("response");
+        assert_eq!(5, resp["req_id"]);
+        assert_eq!(400, resp["code"]);
+        assert_eq!("BAD_REQUEST", resp["msg_data"]["code"]);
+        assert!(response(r#"{"kind":"event","id":5,"cat":"x"}"#).is_none());
+        assert!(response(r#"{"kind":"req","cat":"x"}"#).is_none());
+        assert!(response("{not json").is_none());
+    }
+
+    #[test]
+    fn request_id_of_invalid_message() {
+        // `cat` is not a valid event category, so `WsMessage` cannot parse it.
+        let text = r#"{"kind":"req","id":5,"msg":"get_version","cat":"x"}"#;
+        assert!(serde_json::from_str::<WsMessage>(text).is_err());
+        let id: RequestId<'_> = serde_json::from_str(text).expect("id");
+        assert_eq!((Some("req"), Some(5)), (id.kind, id.id));
+        assert!(serde_json::from_str::<RequestId<'_>>("{not json").is_err());
+    }
 
     #[test]
     fn backup_messages_are_found() {

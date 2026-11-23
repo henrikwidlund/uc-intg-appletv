@@ -16,7 +16,7 @@ mdns-sd = ["dep:mdns-sd"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "3867c1eefd3505c3d7128b86aab7d2ea79436acb", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "469817b64bc68ac51128460e44aaa438f09ed492", features = ["opus"] }
 
 # WebSocket server
 actix = "0.13"

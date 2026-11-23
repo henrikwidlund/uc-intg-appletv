@@ -53,8 +53,8 @@ One pairing with one PIN covers all features.
 ## Known limits
 
 - Volume control works only if the Apple TV can change the volume of the TV or receiver (HDMI CEC).
-  Otherwise the volume controls stay on the Remote, but they return an error, and the _Volume control_
-  sensor shows off.
+  Otherwise the volume controls stay on the Remote, but they do nothing. For set volume and mute,
+  the driver logs it. The _Volume control_ sensor shows off.
 - The Apple TV does not report the app in front. The app select shows the app opened through the driver or
   the app that plays media.
 - The Apple TV does not report the current account. The account select shows the last account chosen

@@ -8,7 +8,7 @@ mod devices;
 mod handler;
 mod messages;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 pub use messages::*;
 
@@ -428,11 +428,13 @@ mod tests {
         use crate::controller::devices::Device;
         use crate::controller::test_util::{TestRemote, connect, controller, settle};
         use crate::controller::{Controller, R2EventMsg, R2RequestMsg};
-        use crate::device::{AppleTvActor, DeviceEvent, DeviceStatus};
+        use crate::device::{AppleTvActor, DeviceEvent, DeviceStatus, Reply};
         use crate::entities::EntityKind;
+        use crate::errors::ServiceError;
         use actix::{Addr, AsyncContext, Context, Handler, Message};
         use serde_json::{Map, Value, json};
         use std::sync::{Arc, Mutex};
+        use uc_api::intg::AssistantEvent;
         use uc_api::intg::ws::{R2Event, R2Request};
 
         /// Adds a device to the controller without a running device actor, so that nothing
@@ -550,6 +552,69 @@ mod tests {
 
         fn position(messages: &Mutex<Vec<Value>>, f: impl Fn(&Value) -> bool) -> Option<usize> {
             messages.lock().expect("lock").iter().position(f)
+        }
+
+        /// Returns `true` if the controller knows the voice session.
+        #[derive(Message)]
+        #[rtype(result = "bool")]
+        struct HasVoiceSession(u32);
+
+        impl Handler<HasVoiceSession> for Controller {
+            type Result = bool;
+            fn handle(&mut self, msg: HasVoiceSession, _: &mut Context<Self>) -> bool {
+                self.voice_sessions.contains_key(&msg.0)
+            }
+        }
+
+        #[actix::test]
+        async fn voice_start_for_a_stopped_device_ends_the_session() {
+            let (controller, key, a) = single("voice-stopped").await;
+            settle(&controller, &[&a]).await;
+            let before = a.lock().expect("lock").len();
+            let result = controller
+                .send(R2RequestMsg {
+                    ws_id: "a".into(),
+                    req_id: 3,
+                    request: R2Request::EntityCommand,
+                    msg_data: Some(json!({
+                        "entity_type": "voice_assistant",
+                        "entity_id": EntityKind::VoiceAssistant.entity_id(&key),
+                        "cmd_id": "voice_start",
+                        "params": { "session_id": 9 },
+                    })),
+                })
+                .await
+                .expect("send");
+            assert_eq!(
+                Err(ServiceError::NotFound(
+                    "The Apple TV was removed or reconfigured".into()
+                )),
+                result.map(|_| ())
+            );
+            settle(&controller, &[&a]).await;
+            assert_eq!(before, a.lock().expect("lock").len(), "no message");
+            assert!(!controller.send(HasVoiceSession(9)).await.expect("send"));
+        }
+
+        #[actix::test]
+        async fn voice_reply_comes_before_assistant_events() {
+            let controller = controller("voice-reply");
+            let a = connect(&controller, "a").await;
+            // The device sends these in this order: the reply when Siri started, then the
+            // events of the session.
+            controller.do_send(DeviceEvent::Accepted(Reply {
+                ws_id: "a".into(),
+                req_id: 7,
+            }));
+            controller.do_send(DeviceEvent::Assistant(AssistantEvent::Finished {
+                entity_id: "voice_assistant.x".into(),
+                session_id: 1,
+            }));
+            settle(&controller, &[&a]).await;
+            let reply = position(&a, |m| m["req_id"] == 7 && m["code"] == 200);
+            let event = position(&a, |m| m["msg"] == "assistant_event");
+            assert!(reply.is_some());
+            assert!(reply < event, "reply first");
         }
 
         #[actix::test]

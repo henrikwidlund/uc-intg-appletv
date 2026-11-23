@@ -5,8 +5,8 @@
 //! WebSocket server for the Remote Two integration API.
 
 use crate::configuration::{ENV_API_MSG_TRACING, HeartbeatSettings};
-use crate::controller::Controller;
-use actix::Addr;
+use crate::controller::{Controller, R2AudioChunkMsg};
+use actix::{Addr, Recipient};
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use log::debug;
 use std::env;
@@ -33,6 +33,8 @@ struct WsConn {
     msg_tracing_out: bool,
     /// Audio received in the last voice session.
     voice: VoiceCount,
+    /// Receives the voice audio chunks.
+    audio: Recipient<R2AudioChunkMsg>,
 }
 
 /// Audio received from the Remote in one voice session.
@@ -41,6 +43,8 @@ struct VoiceCount {
     session_id: u32,
     chunks: u32,
     bytes: u64,
+    /// The audio format is not supported. The audio of this session is dropped.
+    rejected: bool,
 }
 
 impl WsConn {
@@ -53,11 +57,12 @@ impl WsConn {
         Self {
             id: client_id.into(),
             hb: Instant::now(),
-            controller_addr,
             heartbeat,
             msg_tracing_in: msg_tracing == "all" || msg_tracing == "in",
             msg_tracing_out: msg_tracing == "all" || msg_tracing == "out",
             voice: VoiceCount::default(),
+            audio: controller_addr.clone().recipient(),
+            controller_addr,
         }
     }
 }

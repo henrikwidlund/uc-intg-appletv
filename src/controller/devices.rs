@@ -7,7 +7,7 @@ use crate::config_store::{DeviceConfig, SaveWait};
 use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg, SendWsMessage};
 use crate::device::{
     AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceCache, DeviceEvent, DeviceStatus,
-    Disconnect, Stop,
+    Disconnect, Reply, Stop,
 };
 use crate::entities::{self, EntityKind, media_player};
 use crate::errors::ServiceError;
@@ -378,6 +378,7 @@ impl Controller {
         ctx: &Context<Self>,
     ) -> ResponseFuture<Result<Option<WsMessage>, ServiceError>> {
         let req_id = msg.req_id;
+        let ws_id = Arc::clone(&msg.ws_id);
         let command: EntityCommand = match msg.deserialize() {
             Ok(c) => c,
             Err(e) => return_fut_err!(e.into()),
@@ -405,25 +406,35 @@ impl Controller {
         }
         let voice_session = self.voice_session(&command);
         let controller = ctx.address();
+        // The device answers a voice command through the controller, so the answer comes
+        // before the assistant events of the session.
+        let reply = (kind == EntityKind::VoiceAssistant).then_some(Reply { ws_id, req_id });
+        let answered = reply.is_some();
         // Queued now, so a `voice_start` reaches the device before the audio that follows it.
+        // `addr` is a new clone, and a new address never waits: `send` queues the command at
+        // once, also when the mailbox is full.
         let request = addr.send(Command {
             kind,
             cmd_id: command.cmd_id,
             params: command.params,
+            reply,
         });
         Box::pin(async move {
-            let result = request.await.unwrap_or_else(|e| Err(e.into()));
+            let result = request
+                .await
+                .unwrap_or_else(|e| Err(ServiceError::from_device_mailbox(e)));
             if let Err(e) = result {
                 if let Some(session_id) = voice_session {
                     controller.do_send(EndVoiceSession(session_id));
                 }
                 return Err(e);
             }
-            Ok(Some(WsMessage::response(
-                req_id,
-                "result",
-                WsResultMsgData::new("OK", "Command sent"),
-            )))
+            if answered {
+                return Ok(None);
+            }
+            // The device answers before the command runs. Errors after this reply are only
+            // logged.
+            Ok(Some(command_sent(req_id)))
         })
     }
 
@@ -452,7 +463,8 @@ impl Controller {
                     media_id: data.media_id,
                     paging: data.paging.unwrap_or_default(),
                 })
-                .await??;
+                .await
+                .map_err(ServiceError::from_device_mailbox)??;
             Ok(Some(WsMessage::response(req_id, resp_msg, result)))
         })
     }
@@ -654,6 +666,11 @@ fn entity_change<'a>(
     })
 }
 
+/// Answer to an entity command that started.
+fn command_sent(req_id: u32) -> WsMessage {
+    WsMessage::response(req_id, "result", WsResultMsgData::new("OK", "Command sent"))
+}
+
 impl Handler<DeviceEvent> for Controller {
     type Result = ();
 
@@ -697,6 +714,9 @@ impl Handler<DeviceEvent> for Controller {
                     self.update_device_state();
                 }
             }
+            DeviceEvent::Accepted(Reply { ws_id, req_id }) => {
+                self.send_r2_response(&ws_id, SendWsMessage::Msg(command_sent(req_id)));
+            }
             DeviceEvent::Assistant(event) => {
                 if let AssistantEvent::Finished { session_id, .. }
                 | AssistantEvent::Error { session_id, .. } = &event
@@ -721,7 +741,12 @@ impl Handler<R2AudioChunkMsg> for Controller {
             .get(&msg.session_id)
             .and_then(|key| self.devices.get(key));
         let Some(device) = device else {
-            warn!("Audio for unknown voice session {}", msg.session_id);
+            // An end marker can come again after the session has ended.
+            if msg.data.is_empty() {
+                debug!("End of unknown voice session {}", msg.session_id);
+            } else {
+                warn!("Audio for unknown voice session {}", msg.session_id);
+            }
             return;
         };
         device.addr.do_send(AudioChunk {
