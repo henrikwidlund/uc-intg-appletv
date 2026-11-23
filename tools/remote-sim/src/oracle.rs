@@ -10,7 +10,7 @@
 use crate::Fail;
 use ratv::companion::{App, AttentionState};
 use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
-use ratv::mrp::{NowPlaying, Volume};
+use ratv::mrp::{NowPlaying, PlaybackState, Volume};
 use ratv::{AppleTv, ClientOptions, Credentials, Endpoints, ExposeSecret, PairOptions};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -100,6 +100,31 @@ impl Oracle {
 
     pub fn now_playing(&self) -> Option<NowPlaying> {
         self.tv.now_playing().map(|rx| rx.borrow().clone())
+    }
+
+    /// Playback state, without a copy of now playing.
+    pub fn playback_state(&self) -> Option<PlaybackState> {
+        self.tv.now_playing().and_then(|rx| rx.borrow().state)
+    }
+
+    /// Playback rate, without a copy of now playing.
+    pub fn rate(&self) -> Option<f32> {
+        self.tv.now_playing().and_then(|rx| rx.borrow().rate)
+    }
+
+    /// True if the Apple TV sets the live flag. This is only the device flag, not the rule of
+    /// the `is_live` sensor of the driver.
+    pub fn is_live(&self) -> bool {
+        self.tv
+            .now_playing()
+            .is_some_and(|rx| rx.borrow().is_live == Some(true))
+    }
+
+    /// Name of the app that plays, without a copy of now playing.
+    pub fn playing_app(&self) -> Option<&str> {
+        let rx = self.tv.now_playing()?;
+        let np = rx.borrow();
+        self.app_name(np.app.as_deref()?)
     }
 
     pub fn volume(&self) -> Option<Volume> {

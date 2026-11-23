@@ -17,6 +17,8 @@ pub struct Driver {
     pub port: u16,
     pub log: PathBuf,
     child: Option<Child>,
+    /// Log size when the driver was last started.
+    log_start: usize,
 }
 
 impl Driver {
@@ -27,6 +29,7 @@ impl Driver {
             port,
             log: dir.join("driver.log"),
             child: None,
+            log_start: 0,
         }
     }
 
@@ -40,6 +43,7 @@ impl Driver {
             .await?
             .into_std()
             .await;
+        self.log_start = self.log_len();
         let child = Command::new(&self.bin)
             .env("UC_CONFIG_HOME", &self.dir)
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")
@@ -88,6 +92,11 @@ impl Driver {
 
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Log size when the driver was last started: a mark for [`Self::log_since`].
+    pub const fn log_start(&self) -> usize {
+        self.log_start
     }
 
     /// Current size of the log in bytes: a mark for [`Self::log_since`].

@@ -803,7 +803,12 @@ impl AppleTvActor {
         self.attention = None;
         self.seek = None;
         self.siri = None;
-        self.home_since = None;
+        if self.home_since.take().is_some() {
+            debug!(
+                "[{}] Home Screen clear ended: connection closed",
+                self.cfg.name
+            );
+        }
         self.media_flags = None;
         self.http_base = None;
         self.expected_mute = None;
@@ -1278,7 +1283,10 @@ impl AppleTvActor {
             {
                 return;
             }
-            debug!("[{}] Home Screen: clearing now playing", act.cfg.name);
+            debug!(
+                "[{}] Home Screen: clearing now playing (state {:?}, rate {:?})",
+                act.cfg.name, act.s.state, act.s.rate
+            );
             act.home_since = Some(Instant::now());
             let dirty = act.s.update_now_playing(&NowPlaying::default());
             let dirty = act.apply_now_playing(dirty, ctx);
@@ -2298,7 +2306,15 @@ impl Handler<CompanionEvent> for AppleTvActor {
                     if enabled { "on" } else { "off" }
                 );
             }
-            Some(Event::ScreenChanged { .. }) => self.screen_changed(ctx),
+            Some(Event::ScreenChanged {
+                guide_supported, ..
+            }) => {
+                debug!(
+                    "[{}] screen changed, guide supported: {guide_supported}",
+                    self.cfg.name
+                );
+                self.screen_changed(ctx);
+            }
             Some(Event::MediaControl(flags)) => {
                 self.media_flags = Some(flags.0);
                 if flags.0 != 0 {
