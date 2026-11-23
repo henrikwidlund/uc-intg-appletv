@@ -1420,7 +1420,7 @@ impl AppleTvActor {
         );
     }
 
-    /// Stop showing the image of an older item while the fetch waits for MRP.
+    /// Stop showing the image of an older item, unless `Snapshot::keep_artwork` keeps it.
     fn clear_older_artwork(&mut self) -> Dirty {
         let dirty = self.s.clear_older_artwork_url();
         if self.s.artwork_url.is_none() {
@@ -1465,8 +1465,7 @@ impl AppleTvActor {
         if let Some(data) = self.s.artwork_data.clone() {
             debug!("[{}] artwork {id:?} from Companion", self.cfg.name);
             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&data)));
-            self.save_artwork(&id, None, data, (item, item_key));
-            return Dirty::NONE;
+            return self.save_artwork(&id, None, data, (item, item_key));
         }
         // A fetch fails while the app has no player. The image of the item before must not stay.
         if self.s.item_has_no_artwork() {
@@ -1482,8 +1481,7 @@ impl AppleTvActor {
                 "[{}] artwork {id:?} is fetched when MRP connects",
                 self.cfg.name
             );
-            self.artwork_after_mrp = true;
-            return self.clear_older_artwork();
+            return self.wait_for_mrp_artwork(keyed, item, item_key);
         }
         debug!("[{}] fetching artwork {id:?}", self.cfg.name);
         let generation = self.generation;
@@ -1499,12 +1497,13 @@ impl AppleTvActor {
                         Ok(Some(art)) => {
                             // Without an artwork id, the image data gives a stable file name.
                             let id = id.unwrap_or_else(|| format!("{:016x}", fnv1a(&art.data)));
-                            act.save_artwork(
+                            let dirty = act.save_artwork(
                                 &id,
                                 art.mime_type.as_deref(),
                                 art.data,
                                 (item, item_key),
                             );
+                            act.emit(dirty);
                         }
                         // Some apps drop the image of the same item. Keep it until the item changes.
                         Ok(None) if act.s.artwork_item == item && act.s.artwork_url.is_some() => {
@@ -1525,9 +1524,11 @@ impl AppleTvActor {
                             }
                         }
                         Ok(None) => {
-                            if keyed && let Some(name) = act.cached_art(item_key) {
+                            if keyed
+                                && let Some(name) = act.cached_art(item_key)
+                                && act.show_file(name, item)
+                            {
                                 debug!("[{}] no artwork, using the image seen before for this item", act.cfg.name);
-                                act.show_file(name, item);
                                 return;
                             }
                             debug!(
@@ -1546,27 +1547,56 @@ impl AppleTvActor {
         Dirty::NONE
     }
 
+    /// Fetch the artwork when MRP connects. Until then, show the image seen before for this
+    /// item, else stop showing the image of an older item. `item` and `item_key` are the item
+    /// sequence and the item key. Items without key get no image from the cache. The image of
+    /// this item comes before the image of a short item before (see `Snapshot::keep_artwork`).
+    /// Returns [`Dirty::ARTWORK`] if the image was cleared here.
+    fn wait_for_mrp_artwork(&mut self, keyed: bool, item: u32, item_key: u64) -> Dirty {
+        self.artwork_after_mrp = true;
+        let shown = self.s.artwork_item == item && self.s.artwork_url.is_some();
+        if keyed
+            && !shown
+            && let Some(name) = self.cached_art(item_key)
+            && self.show_file(name, item)
+        {
+            debug!(
+                "[{}] showing the image seen before for this item",
+                self.cfg.name
+            );
+            return Dirty::NONE;
+        }
+        self.clear_older_artwork()
+    }
+
     /// Keep the image and show it. `item` is the item sequence and the item key at fetch time.
+    /// Without a URL for the file, the image of an older item is not shown any more. Returns
+    /// [`Dirty::ARTWORK`] if it was cleared here.
     fn save_artwork(
         &mut self,
         id: &str,
         mime_type: Option<&str>,
         data: Bytes,
         (item, item_key): (u32, u64),
-    ) {
+    ) -> Dirty {
         let name = self.ctx.artwork.save(&self.key, id, mime_type, data);
         self.item_art.remember(item_key, name.clone());
-        self.show_file(name, item);
+        if self.show_file(name, item) {
+            Dirty::NONE
+        } else {
+            self.clear_older_artwork()
+        }
     }
 
-    /// Show a kept artwork file.
-    fn show_file(&mut self, name: Box<str>, item: u32) {
+    /// Show a kept artwork file. Returns `false` if there is no local address for the URL.
+    #[must_use]
+    fn show_file(&mut self, name: Box<str>, item: u32) -> bool {
         if self.http_base.is_none() {
             self.http_base = self.find_http_base();
         }
         let Some(base) = &self.http_base else {
             warn!("[{}] no local address for the artwork URL", self.cfg.name);
-            return;
+            return false;
         };
         let url = format!("{base}/artwork/{}/{name}", self.key);
         debug!("[{}] artwork file: {url}", self.cfg.name);
@@ -1575,6 +1605,7 @@ impl AppleTvActor {
         self.s.artwork_kept = false;
         self.shown_file = Some(name);
         self.emit(Dirty::ARTWORK);
+        true
     }
 
     /// The file seen before for the item, if it is still kept.
@@ -2881,14 +2912,14 @@ mod tests {
     }
 
     /// An actor that is not connected. It does not connect until it gets `Connect`.
-    fn idle_actor(name: &str) -> Addr<AppleTvActor> {
+    fn idle_actor(name: &str, http_address: Option<IpAddr>) -> Addr<AppleTvActor> {
         let dir = std::env::temp_dir().join(format!(
             "uc-intg-appletv-actor-{name}-{}",
             std::process::id()
         ));
         let ctx = Arc::new(DeviceContext {
             client_name: "test".into(),
-            http_address: None,
+            http_address,
             http_ipv6: false,
             http_port: 0,
             store: ConfigStore::new(&dir),
@@ -2994,7 +3025,7 @@ mod tests {
 
     #[actix::test]
     async fn streams_stop_on_replace_close_and_cancel() {
-        let actor = idle_actor("streams");
+        let actor = idle_actor("streams", None);
         let old = task(&actor, Slot::NowPlaying).await;
         let new = task(&actor, Slot::NowPlaying).await;
         let _ = step(&actor, Step::Nothing).await;
@@ -3010,9 +3041,134 @@ mod tests {
         );
     }
 
+    /// Runs the function on the actor and returns its result.
+    struct Run<F>(F);
+
+    impl<F, R> Message for Run<F>
+    where
+        F: FnOnce(&mut AppleTvActor) -> R,
+        R: 'static,
+    {
+        type Result = R;
+    }
+
+    impl<F, R> Handler<Run<F>> for AppleTvActor
+    where
+        F: FnOnce(&mut Self) -> R,
+        R: 'static,
+    {
+        type Result = MessageResult<Run<F>>;
+        fn handle(&mut self, msg: Run<F>, _: &mut Context<Self>) -> Self::Result {
+            MessageResult(msg.0(self))
+        }
+    }
+
+    #[actix::test]
+    async fn cached_image_is_shown_until_mrp_connects() {
+        let actor = idle_actor("art-wait", Some(IpAddr::from([127, 0, 0, 1])));
+        let url = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.s.title = Some("Movie".into());
+                act.s.item_seq = 2;
+                let key = act.s.item_key();
+                let name = act
+                    .ctx
+                    .artwork
+                    .save(&act.key, "art", Some("image/png"), Bytes::new());
+                act.item_art.remember(key, name);
+                // The image of a short item before is shown. The image of this item comes first.
+                act.s.artwork_url = Some("http://old".into());
+                act.s.artwork_item = 1;
+                act.s.prev_item_lasted = Some(Duration::from_millis(500));
+                assert!(act.s.keep_artwork(2));
+                assert_eq!(Dirty::NONE, act.wait_for_mrp_artwork(true, 2, key));
+                assert!(act.artwork_after_mrp);
+                assert_eq!(2, act.s.artwork_item);
+                assert!(!act.s.artwork_kept);
+                assert!(act.shown_file.is_some());
+                act.s.artwork_url.clone()
+            }))
+            .await
+            .expect("send");
+        let url = url.expect("cached image");
+        assert!(url.starts_with("http://127.0.0.1:0/artwork/"), "{url}");
+
+        let (no_key, not_kept, shown) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let key = act.s.item_key();
+                let mut run = |keyed, item_key, url: &str, artwork_item| {
+                    act.s.artwork_url = Some(url.into());
+                    act.s.artwork_item = artwork_item;
+                    act.s.item_seq = 3;
+                    let dirty = act.wait_for_mrp_artwork(keyed, 3, item_key);
+                    assert!(act.artwork_after_mrp);
+                    (dirty, act.s.artwork_url.clone())
+                };
+                (
+                    // An item without key gets no image from the cache.
+                    run(false, key, "http://old", 1),
+                    // No image is kept for the item.
+                    run(true, key ^ 1, "http://old", 1),
+                    // The item shows an image already.
+                    run(true, key, "http://this", 3),
+                )
+            }))
+            .await
+            .expect("send");
+        assert_eq!((Dirty::ARTWORK, None), no_key);
+        assert_eq!((Dirty::ARTWORK, None), not_kept);
+        assert_eq!((Dirty::NONE, Some("http://this".into())), shown);
+    }
+
+    #[actix::test]
+    async fn cached_image_without_url_clears_the_older_image() {
+        let actor = idle_actor("art-no-url", None);
+        let (dirty, url) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                // No local address for the artwork URL.
+                act.cfg.address = None;
+                act.s.title = Some("Movie".into());
+                act.s.item_seq = 2;
+                let key = act.s.item_key();
+                let name = act
+                    .ctx
+                    .artwork
+                    .save(&act.key, "art", Some("image/png"), Bytes::new());
+                act.item_art.remember(key, name);
+                act.s.artwork_url = Some("http://old".into());
+                act.s.artwork_item = 1;
+                let dirty = act.wait_for_mrp_artwork(true, 2, key);
+                assert!(act.artwork_after_mrp);
+                (dirty, act.s.artwork_url.clone())
+            }))
+            .await
+            .expect("send");
+        assert_eq!((Dirty::ARTWORK, None), (dirty, url));
+
+        let (older, current) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let mut run = |url: &str, artwork_item| {
+                    act.s.artwork_url = Some(url.into());
+                    act.s.artwork_item = artwork_item;
+                    let dirty = act.save_artwork("art", None, Bytes::new(), (2, 7));
+                    (dirty, act.s.artwork_url.clone())
+                };
+                (
+                    // An image of an older item is cleared.
+                    run("http://old", 1),
+                    // A CDN URL of this item stays.
+                    run("https://cdn", 2),
+                )
+            }))
+            .await
+            .expect("send");
+        assert_eq!((Dirty::ARTWORK, None), older);
+        assert_eq!((Dirty::NONE, Some("https://cdn".into())), current);
+    }
+
     #[actix::test]
     async fn stop_missing_ends_the_retries() {
-        let actor = idle_actor("stop-missing");
+        let actor = idle_actor("stop-missing", None);
         let retry = task(&actor, Slot::Missing).await;
         assert!(!retry.load(Ordering::Relaxed));
         assert!(
