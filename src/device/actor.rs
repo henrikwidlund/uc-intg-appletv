@@ -10,7 +10,7 @@ use crate::device::state::{
 };
 use crate::device::{
     AudioChunk, Browse, Command, Connect, DeviceContext, DeviceEvent, DeviceStatus, Disconnect,
-    Stop, UpdateConfig, browse, discovery, now,
+    SiriModeChanged, Stop, UpdateConfig, browse, discovery, now,
 };
 use crate::entities::{self, EntityKind, media_player, remote, select};
 use crate::errors::ServiceError;
@@ -91,8 +91,9 @@ const CHAPTER_TIMER_MARGIN: Duration = Duration::from_millis(250);
 /// Screen changes in this time after an app launch come from the launch.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
 
-/// Lists that are kept between restarts.
+/// Lists that are kept between restarts. A missing list is empty.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeviceCache {
     apps: Vec<AppInfo>,
     airplay_devices: Vec<(String, String)>,
@@ -604,7 +605,6 @@ impl AppleTvActor {
         }
 
         self.s.connected = true;
-        self.s.mrp = tv.is_open(Protocol::Mrp);
         // Companion is open, so only the MRP mode can need the join.
         self.s.siri = siri_available(&tv, self.ctx.siri_mode()) || join_mrp;
         if !join_mrp {
@@ -781,7 +781,6 @@ impl AppleTvActor {
     fn clear_protocol_state(&mut self, protocol: Protocol) -> Dirty {
         match protocol {
             Protocol::Mrp => {
-                self.s.mrp = false;
                 self.expected_mute = None;
                 // A running fast forward or rewind would block the retry of MRP.
                 self.seek = None;
@@ -2479,6 +2478,20 @@ impl Handler<Disconnect> for AppleTvActor {
     }
 }
 
+impl Handler<SiriModeChanged> for AppleTvActor {
+    type Result = ();
+
+    fn handle(&mut self, _: SiriModeChanged, _: &mut Self::Context) {
+        let Some(tv) = &self.tv else { return };
+        // Like at connect: in MRP mode also true while MRP joins.
+        let siri = siri_available(tv, self.ctx.siri_mode()) || self.joining();
+        if self.s.siri != siri {
+            self.s.siri = siri;
+            self.emit(Dirty::CONNECTION);
+        }
+    }
+}
+
 impl Handler<Stop> for AppleTvActor {
     type Result = ();
 
@@ -2854,6 +2867,17 @@ mod tests {
     use std::sync::atomic::AtomicU8;
 
     #[test]
+    fn cache_with_a_missing_list_loads() {
+        let cache: DeviceCache =
+            serde_json::from_str(r#"{"apps":[{"bundle_id":"com.example","name":"App"}]}"#)
+                .expect("cache");
+        assert_eq!(1, cache.apps.len());
+        assert_eq!(0, cache.airplay_devices.len());
+        let empty: DeviceCache = serde_json::from_str("{}").expect("cache");
+        assert_eq!(0, empty.apps.len());
+    }
+
+    #[test]
     fn retry_window() {
         let t0 = Instant::now();
         let mut end = None;
@@ -3164,6 +3188,17 @@ mod tests {
             .expect("send");
         assert_eq!((Dirty::ARTWORK, None), older);
         assert_eq!((Dirty::NONE, Some("https://cdn".into())), current);
+    }
+
+    #[actix::test]
+    async fn siri_mode_change_without_connection_changes_nothing() {
+        let actor = idle_actor("siri-mode", None);
+        // Without a connection, a new computation would give false.
+        let set = actor.send(Run(|act: &mut AppleTvActor| act.s.siri = true));
+        set.await.expect("send");
+        actor.send(SiriModeChanged).await.expect("send");
+        let siri = actor.send(Run(|act: &mut AppleTvActor| act.s.siri));
+        assert!(siri.await.expect("send"), "not changed");
     }
 
     #[actix::test]

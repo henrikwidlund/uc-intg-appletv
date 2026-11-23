@@ -131,10 +131,9 @@ pub struct OutputCombo {
 #[allow(clippy::struct_excessive_bools)]
 pub struct Snapshot {
     pub connected: bool,
-    /// MRP is connected: needed for volume and the full now playing.
-    pub mrp: bool,
     /// Siri can be used with the connected protocols and the Siri mode. In MRP mode also true
-    /// while MRP joins. Set at connect, when a protocol closes and when the MRP join fails.
+    /// while MRP joins. Set at connect, when a protocol closes, when the MRP join fails and when
+    /// the Siri mode changes.
     pub siri: bool,
     pub power: Power,
     pub name: String,
@@ -597,7 +596,6 @@ impl Snapshot {
     /// info until the device sends new values after the reconnect.
     pub const fn disconnected(&mut self) -> Dirty {
         self.connected = false;
-        self.mrp = false;
         self.siri = false;
         Dirty::ALL
     }

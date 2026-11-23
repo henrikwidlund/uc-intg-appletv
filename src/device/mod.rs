@@ -101,6 +101,11 @@ pub struct Connect;
 #[rtype(result = "()")]
 pub struct Disconnect;
 
+/// The Siri mode in [`DeviceContext`] changed.
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct SiriModeChanged;
+
 /// Disconnect and stop the actor.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]

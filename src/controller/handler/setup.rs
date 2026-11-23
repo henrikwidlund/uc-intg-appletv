@@ -10,7 +10,7 @@ use crate::config_store::{
 use crate::controller::devices::{Trigger, sort_configs};
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, SendWsMessage, operation_mode, response_text};
-use crate::device::{DeviceCache, discovery};
+use crate::device::{DeviceCache, SiriModeChanged, discovery};
 use crate::entities::EntityKind;
 use crate::errors::ServiceError;
 use crate::logging;
@@ -719,6 +719,9 @@ impl Controller {
         }
         self.driver_settings.siri_mode = mode;
         self.device_ctx.set_siri_mode(mode);
+        for device in self.devices.values() {
+            device.addr.do_send(SiriModeChanged);
+        }
         info!("[{ws_id}] Siri mode: {}", mode.label());
         if let Err(e) = self.store.save_settings(self.driver_settings) {
             warn!("[{ws_id}] saving the settings failed: {e}");

@@ -20,7 +20,7 @@ use crate::controller::handler::{AbortDriverSetup, SetupState};
 use crate::device::DeviceContext;
 use crate::errors::ServiceError;
 use crate::server::ArtworkStore;
-use actix::prelude::{Actor, Context, Recipient};
+use actix::prelude::{Actor, Context, Recipient, SendError};
 use actix::{AsyncContext, SpawnHandle};
 use bytestring::ByteString;
 use log::{debug, error, info, warn};
@@ -244,8 +244,15 @@ impl Controller {
             }
             return;
         }
-        if let Err(e) = session.recipient.try_send(message) {
-            error!("[{ws_id}] Internal message send error: {e}");
+        match session.recipient.try_send(message) {
+            Ok(()) => {}
+            // The sender actor of the Remote stopped, for example at shutdown.
+            Err(SendError::Closed(_)) => {
+                debug!("[{ws_id}] Remote sender stopped, message dropped");
+            }
+            Err(SendError::Full(_)) => {
+                error!("[{ws_id}] Remote mailbox full, message dropped");
+            }
         }
     }
 
