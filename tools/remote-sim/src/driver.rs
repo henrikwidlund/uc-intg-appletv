@@ -49,7 +49,7 @@ impl Driver {
             .env("UC_INTEGRATION_INTERFACE", "127.0.0.1")
             .env("UC_INTEGRATION_HTTP_PORT", self.port.to_string())
             .env("UC_DISABLE_MDNS_PUBLISH", "true")
-            .env("RUST_LOG", "info,uc_intg_appletv=debug")
+            .env("RUST_LOG", log_filter())
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -118,5 +118,16 @@ impl Driver {
             }
         }
         text
+    }
+}
+
+/// Log filter of the driver. Checks read its info and debug lines. A `RUST_LOG` of the caller
+/// is added after the default, for example `ratv::mrp=trace`. A target in it replaces the same
+/// target of the default.
+fn log_filter() -> String {
+    const DEFAULT: &str = "info,uc_intg_appletv=debug";
+    match std::env::var("RUST_LOG") {
+        Ok(caller) if !caller.is_empty() => format!("{DEFAULT},{caller}"),
+        _ => DEFAULT.to_owned(),
     }
 }
