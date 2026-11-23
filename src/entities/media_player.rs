@@ -138,13 +138,14 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
     // Media attributes are empty while off. They are kept while disconnected.
     let off = s.power == Power::Off;
 
+    // Unknown values are sent as null, so the Remote does not keep an old value.
     if dirty.any(Dirty::VOLUME | Dirty::CONNECTION) {
-        if let Some(v) = s.volume_percent() {
-            set(out, Attr::Volume, v.into());
-        }
-        if let Some(m) = s.muted {
-            set(out, Attr::Muted, m.into());
-        }
+        set(
+            out,
+            Attr::Volume,
+            s.volume_percent().map_or(Value::Null, Value::from),
+        );
+        set(out, Attr::Muted, s.muted.map_or(Value::Null, Value::from));
     }
     if dirty.any(Dirty::METADATA | Dirty::POWER | Dirty::CONNECTION) {
         metadata_attributes(s, off, out);
@@ -694,5 +695,26 @@ mod tests {
         attributes(&s, Dirty::ALL, 0.0, &mut attrs);
         assert_eq!(Some(&json!("")), attrs.get("media_title"));
         assert_eq!(Some(&json!("OFF")), attrs.get("state"));
+    }
+
+    #[test]
+    fn unknown_volume_is_null() {
+        let mut s = Snapshot {
+            connected: true,
+            volume_level: Some(0.5),
+            muted: Some(true),
+            ..Snapshot::default()
+        };
+        let mut attrs = Map::new();
+        attributes(&s, Dirty::VOLUME, 0.0, &mut attrs);
+        assert_eq!(Some(&json!(50)), attrs.get("volume"));
+        assert_eq!(Some(&json!(true)), attrs.get("muted"));
+
+        s.volume_level = None;
+        s.muted = None;
+        attrs.clear();
+        attributes(&s, Dirty::VOLUME, 0.0, &mut attrs);
+        assert_eq!(Some(&Value::Null), attrs.get("volume"));
+        assert_eq!(Some(&Value::Null), attrs.get("muted"));
     }
 }

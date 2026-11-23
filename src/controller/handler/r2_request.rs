@@ -6,7 +6,9 @@
 
 use crate::controller::devices::Trigger;
 use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-use crate::controller::{Controller, R2RequestMsg};
+use crate::controller::{
+    Controller, R2RequestMsg, SendWsMessage, device_state_event, response_text,
+};
 use crate::errors::ServiceError;
 use crate::util::{DeserializeMsgData, return_fut_err, return_fut_ok};
 use crate::{APP_VERSION, built_info};
@@ -33,20 +35,28 @@ impl Handler<R2RequestMsg> for Controller {
     fn handle(&mut self, msg: R2RequestMsg, ctx: &mut Self::Context) -> Self::Result {
         debug!("R2RequestMsg: {:?}", msg.request);
         // A Remote that sends a request is awake: not in standby and not after `disconnect`.
-        let Some(session) = self.sessions.get_mut(&msg.ws_id) else {
+        if !self.sessions.contains_key(&msg.ws_id) {
             return_fut_err!(ServiceError::NotFound("No session found".into()));
-        };
-        let woke = !session.awake();
-        session.standby = false;
-        session.devices_off = false;
+        }
+        let woke = self.wake(&msg.ws_id);
         if woke {
             self.update_connections(Trigger::Wake);
         }
 
         let req_id = msg.req_id;
-        // Answered with an event, so it has no response message.
+        // Answered with an event, so it has no response message. Sent from here, so that a later
+        // `device_state` event cannot be sent first. Missed states come after it, as at
+        // `exit_standby`.
         if msg.request == R2Request::GetDeviceState {
-            return_fut_ok!(Some(super::super::device_state_event(self.device_state)));
+            self.send_r2_response(&msg.ws_id, device_state_event(self.device_state));
+            if woke {
+                self.send_missed_states(&msg.ws_id);
+            }
+            return_fut_ok!(None);
+        }
+        // The answer of `get_entity_states` holds the missed states.
+        if woke && msg.request != R2Request::GetEntityStates {
+            self.send_missed_states(&msg.ws_id);
         }
         let Some(resp_msg) = msg.request.get_message() else {
             return_fut_err!(ServiceError::InternalServerError(format!(
@@ -121,7 +131,13 @@ impl Handler<R2RequestMsg> for Controller {
             R2Request::GetEntityStates => {
                 self.mark_states_read(&msg.ws_id);
                 let states = self.entity_states(&msg.ws_id);
-                return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, states)));
+                // Sent from here, so that a later `entity_change` event cannot be sent first.
+                let text = match response_text(req_id, resp_msg, &states) {
+                    Ok(text) => text,
+                    Err(e) => return_fut_err!(e),
+                };
+                self.send_r2_response(&msg.ws_id, SendWsMessage::Text(text));
+                return_fut_ok!(None);
             }
             R2Request::SubscribeEvents => {
                 let ws_id = msg.ws_id.clone();

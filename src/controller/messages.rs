@@ -51,7 +51,7 @@ pub struct R2SessionDisconnect {
 
 /// Request message from a Remote.
 ///
-/// The controller returns the response, or `None` if it sends the response later.
+/// The controller returns the response, or `None` if it sends the response itself.
 #[derive(Debug, Message)]
 #[rtype(result = "Result<Option<WsMessage>, ServiceError>")]
 pub struct R2RequestMsg {

@@ -20,7 +20,7 @@ impl WsConn {
     /// The message is in the controller queue when this returns, so it keeps its order with
     /// later events. The returned request gives the result:
     /// - A [`ServiceError`] is sent back as an error response.
-    /// - `Ok(None)` means the controller sends the response later.
+    /// - `Ok(None)` means the controller sends the response itself.
     ///
     /// `msg_data` is taken from the request.
     pub(crate) fn on_request(

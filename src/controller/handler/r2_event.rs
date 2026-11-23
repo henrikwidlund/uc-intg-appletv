@@ -23,12 +23,12 @@ impl Handler<R2EventMsg> for Controller {
         // Connections stay while another awake Remote uses the device.
         match msg.event {
             // A Remote that asks for connections is awake.
-            R2Event::Connect => {
-                session.devices_off = false;
-                session.standby = false;
+            R2Event::Connect | R2Event::ExitStandby => {
+                self.wake(&msg.ws_id);
                 self.update_connections(Trigger::Wake);
                 // The Remote might be out of sync.
                 self.send_device_state(&msg.ws_id);
+                self.send_missed_states(&msg.ws_id);
             }
             R2Event::Disconnect => {
                 session.devices_off = true;
@@ -37,12 +37,6 @@ impl Handler<R2EventMsg> for Controller {
             R2Event::EnterStandby => {
                 session.standby = true;
                 self.update_connections(Trigger::Sleep);
-            }
-            R2Event::ExitStandby => {
-                session.standby = false;
-                session.devices_off = false;
-                self.update_connections(Trigger::Wake);
-                self.send_device_state(&msg.ws_id);
             }
             R2Event::AbortDriverSetup => {
                 ctx.notify(AbortDriverSetup {

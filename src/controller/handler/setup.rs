@@ -966,8 +966,8 @@ impl Controller {
             event["error_message"] = json!({ "en": message });
         }
         self.send_r2_msg(
-            WsMessage::event("driver_setup_change", EventCategory::Device, event),
             ws_id,
+            WsMessage::event("driver_setup_change", EventCategory::Device, event),
         );
     }
 
@@ -1008,8 +1008,8 @@ impl Controller {
             require_user_action: None,
         }) {
             Ok(event) => self.send_r2_msg(
-                WsMessage::event("driver_setup_change", EventCategory::Device, event),
                 ws_id,
+                WsMessage::event("driver_setup_change", EventCategory::Device, event),
             ),
             Err(e) => warn!("driver_setup_change serialize error: {e}"),
         }
@@ -1327,75 +1327,16 @@ mod tests {
     }
 
     mod flow {
+        use crate::config_store::ConfigStore;
         use crate::config_store::tests::device;
-        use crate::config_store::{ConfigStore, DriverSettings};
-        use crate::configuration::{HeartbeatSettings, Settings};
+        use crate::controller::R2SessionDisconnect;
         use crate::controller::handler::AbortDriverSetup;
         use crate::controller::handler::setup::{SetDriverUserDataMsg, SetupDriverMsg};
-        use crate::controller::{Controller, NewR2Session, R2SessionDisconnect, SendWsMessage};
-        use crate::server::ArtworkStore;
-        use actix::{Actor, Addr, Context, Handler};
+        use crate::controller::test_util::{connect, controller, test_dir};
         use serde_json::{Value, json};
-        use std::path::PathBuf;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Mutex;
         use std::time::Duration;
         use uc_api::intg::IntegrationSetup;
-
-        /// Collects the events sent to a Remote.
-        struct Remote(Arc<Mutex<Vec<Value>>>);
-
-        impl Actor for Remote {
-            type Context = Context<Self>;
-        }
-
-        impl Handler<SendWsMessage> for Remote {
-            type Result = ();
-            fn handle(&mut self, msg: SendWsMessage, _: &mut Context<Self>) {
-                let SendWsMessage::Msg(msg) = msg else { return };
-                if let (Some("driver_setup_change"), Some(data)) =
-                    (msg.msg.as_deref(), msg.msg_data)
-                    && let Ok(mut events) = self.0.lock()
-                {
-                    events.push(data);
-                }
-            }
-        }
-
-        fn test_dir(name: &str) -> PathBuf {
-            std::env::temp_dir().join(format!("uc-intg-appletv-{name}-{}", std::process::id()))
-        }
-
-        fn controller(name: &str) -> Addr<Controller> {
-            let dir = test_dir(name);
-            let settings = Settings {
-                interface: "127.0.0.1".into(),
-                http_port: 0,
-                config_home: dir.clone(),
-                client_name: "test".into(),
-                heartbeat: HeartbeatSettings::default(),
-            };
-            let metadata = serde_json::from_value(json!({})).expect("metadata");
-            Controller::new(
-                settings,
-                DriverSettings::default(),
-                metadata,
-                ArtworkStore::new(dir.join("artwork")),
-            )
-            .start()
-        }
-
-        async fn connect(controller: &Addr<Controller>, id: &str) -> Arc<Mutex<Vec<Value>>> {
-            let events = Arc::default();
-            let addr = Remote(Arc::clone(&events)).start();
-            controller
-                .send(NewR2Session {
-                    addr: addr.recipient(),
-                    id: id.into(),
-                })
-                .await
-                .expect("send");
-            events
-        }
 
         fn input(ws_id: &str, address: &str) -> SetDriverUserDataMsg {
             values(ws_id, &[("address", address)])
@@ -1412,13 +1353,14 @@ mod tests {
             }
         }
 
+        /// `msg_data` of the last `driver_setup_change` event.
         fn last(events: &Mutex<Vec<Value>>) -> Value {
             events
                 .lock()
                 .expect("lock")
-                .last()
-                .cloned()
-                .unwrap_or_default()
+                .iter()
+                .rfind(|m| m["msg"] == "driver_setup_change")
+                .map_or_default(|m| m["msg_data"].clone())
         }
 
         #[actix::test]

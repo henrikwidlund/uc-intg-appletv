@@ -215,8 +215,8 @@ impl Controller {
         states
     }
 
-    /// The Remote reads the entity states now. Entities left out of the answer are marked
-    /// stale, so they are sent when subscribed.
+    /// The Remote reads the entity states now. Entities in the answer are not stale any more.
+    /// Entities left out of the answer are marked stale, so they are sent when subscribed.
     pub(super) fn mark_states_read(&mut self, ws_id: &str) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
@@ -226,6 +226,9 @@ impl Controller {
             session.stale.clear();
             return;
         }
+        session
+            .stale
+            .retain(|id| !session.subscribed_entities.contains(id));
         for id in self.entities.keys() {
             if !session.subscribed_entities.contains(id) && !session.stale.contains(id) {
                 session.stale.insert(id.clone());
@@ -263,12 +266,49 @@ impl Controller {
             }
             stale
         };
-        for id in &stale {
-            if let Some(change) = self.entities.get(id).and_then(|a| entity_change(id, a)) {
-                self.send_entity_change(ws_id, &change);
-            }
-        }
+        self.send_entities(ws_id, &stale);
         self.update_connections(Trigger::Change);
+    }
+
+    /// Send the subscribed entities that changed while the Remote was in standby. Each entity is
+    /// sent once, with its current state. Sending all entities at each wake-up can fill the
+    /// mailbox of the Remote core.
+    ///
+    /// Subscribed entities are stale only after a standby, so call it after
+    /// [`Controller::wake`] returned true or after a wake-up event.
+    pub(super) fn send_missed_states(&mut self, ws_id: &str) {
+        let Some(session) = self.sessions.get_mut(ws_id) else {
+            return;
+        };
+        if session.standby || session.stale.is_empty() {
+            return;
+        }
+        // Other stale entities stay for a later subscription.
+        let (all, subscribed) = (session.subscribe_all, &session.subscribed_entities);
+        let missed: Vec<String> = session
+            .stale
+            .extract_if(|id| all || subscribed.contains(id))
+            .collect();
+        self.send_entities(ws_id, &missed);
+    }
+
+    /// Send the current state of each entity in `ids`, in the order of [`Self::send_order`].
+    fn send_entities(&self, ws_id: &str, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut changes: Vec<EntityChangeRef<'_>> = ids
+            .iter()
+            .filter_map(|id| self.entities.get_key_value(id))
+            .filter_map(|(id, attrs)| entity_change(id, attrs))
+            .collect();
+        changes.sort_unstable_by(|a, b| {
+            self.send_order(a.entity_type, a.entity_id)
+                .cmp(&self.send_order(b.entity_type, b.entity_id))
+        });
+        for change in &changes {
+            self.send_entity_change(ws_id, change);
+        }
     }
 
     /// Unsubscribe entities. No ids means all entities.
@@ -425,14 +465,14 @@ impl Controller {
 
     fn send_entity_change(&self, ws_id: &str, change: &EntityChangeRef<'_>) {
         if let Some(text) = entity_change_text(change) {
-            self.send_r2_msg(SendWsMessage::Text(text), ws_id);
+            self.send_r2_msg(ws_id, SendWsMessage::Text(text));
         }
     }
 
     /// Send an event to all Remotes.
     fn broadcast(&self, msg_name: &str, category: EventCategory, data: &Value) {
         for ws_id in self.sessions.keys() {
-            self.send_r2_msg(WsMessage::event(msg_name, category, data.clone()), ws_id);
+            self.send_r2_msg(ws_id, WsMessage::event(msg_name, category, data.clone()));
         }
     }
 
@@ -446,19 +486,20 @@ impl Controller {
         for (kind, attrs) in updates {
             entity_id.clear();
             kind.write_entity_id(key, &mut entity_id);
-            let (mut subscribed, mut tracked) = (false, false);
+            let (mut send, mut tracked) = (false, false);
             for s in self.sessions.values() {
                 let wants = s.wants(&entity_id);
-                subscribed |= wants;
-                tracked |= s.states_read && !wants;
+                // A Remote in standby gets the entity when it wakes up, if it read the states.
+                send |= !s.standby && wants;
+                tracked |= s.keeps(wants);
             }
             // The attribute names are only needed to send them.
             let (any, changed) = if let Some(cache) = self.entities.get_mut(&entity_id) {
-                diff(cache, attrs, subscribed)
+                diff(cache, attrs, send)
             } else {
                 let mut attrs = attrs;
                 stamp_first_position(&mut attrs);
-                let changed = if subscribed {
+                let changed = if send {
                     attrs.keys().cloned().collect()
                 } else {
                     Vec::new()
@@ -477,19 +518,19 @@ impl Controller {
                     }
                 }
             }
-            if subscribed {
+            if send {
                 self.send_changes(kind, &entity_id, &changed);
             }
         }
     }
 
-    /// Send `entity_change` with the attributes of `keys` to the Remotes that subscribed the
+    /// Send `entity_change` with the attributes of `keys` to the awake Remotes that subscribed the
     /// entity. The message is serialized once.
     fn send_changes(&self, kind: EntityKind, entity_id: &str, keys: &[String]) {
         let mut targets = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.wants(entity_id))
+            .filter(|(_, s)| !s.standby && s.wants(entity_id))
             .map(|(ws_id, _)| &**ws_id)
             .peekable();
         let Some(cache) = self.entities.get(entity_id) else {
@@ -506,7 +547,7 @@ impl Controller {
             return;
         };
         for target in targets {
-            self.send_r2_msg(SendWsMessage::Text(text.clone()), target);
+            self.send_r2_msg(target, SendWsMessage::Text(text.clone()));
         }
     }
 
@@ -829,6 +870,22 @@ mod tests {
         assert_eq!(Vec::<String>::new(), changed);
         assert_eq!(vec!["media_position", POSITION_UPDATED_AT], keys(&cache));
         assert!(cache[POSITION_UPDATED_AT].is_string());
+    }
+
+    #[test]
+    fn response_text_matches_ws_message() {
+        let a = map(json!({ "state": "ON", "volume": null }));
+        let b = map(json!({ "state": "PLAYING" }));
+        let states: Vec<EntityChangeRef<'_>> = [("media_player.x", &a), ("remote.x", &b)]
+            .into_iter()
+            .filter_map(|(id, attrs)| entity_change(id, attrs))
+            .collect();
+        let text = crate::controller::response_text(3, "entity_states", &states).expect("text");
+        let own: Value = serde_json::from_str(&text).expect("json");
+        let expected =
+            serde_json::to_value(WsMessage::response(3, "entity_states", &states)).expect("json");
+        assert_eq!(expected, own);
+        assert_eq!(2, own["msg_data"].as_array().map_or(0, Vec::len));
     }
 
     #[test]
