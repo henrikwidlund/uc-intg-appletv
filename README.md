@@ -168,7 +168,7 @@ Name it `dhat_…`, gate it with the `dhat-heap` feature and mark it `#[ignore]`
 
 `tools/manual_test.sh` runs the tests that need a person, and the tests that `tools/remote-sim` does
 not have yet, with a real Apple TV and Remote, one step at a time.
-It saves the results to `manual-test-results-<time>.md`.
+It saves the results to `test-results/manual-test-results-<time>.md`.
 
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,
 connects to it like a Remote and runs the checks. It uses the driver pairing
@@ -212,9 +212,9 @@ runs `setup`, `entities` and `states`, because the other checks need them, and `
 and `log` at the end, unless `--skip` names them. Unknown step names are refused. If `setup`,
 `entities` or `states` fails, only `restore_power` and `log` run after it. With `--skip setup`,
 `entities` fails, because the driver has no device. `--no-power` keeps the Apple TV on. The
-results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to the driver log
-filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read debug lines
-of the driver, so a `RUST_LOG` must keep `uc_intg_appletv=debug`.
+results are saved to `test-results/remote-sim-results-<time>.md`. `RUST_LOG` is added to the
+driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read
+debug lines of the driver, so a `RUST_LOG` must keep `uc_intg_appletv=debug`.
 
 CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks
 against an Apple TV.

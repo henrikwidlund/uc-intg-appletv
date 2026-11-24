@@ -26,7 +26,8 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-RESULTS="$PWD/manual-test-results-$(date +%Y%m%d-%H%M%S).md"
+mkdir -p test-results
+RESULTS="$PWD/test-results/manual-test-results-$(date +%Y%m%d-%H%M%S).md"
 BIN="$PWD/target/release/uc-intg-appletv"
 DRIVER_PID=""
 SELECTION="$*"

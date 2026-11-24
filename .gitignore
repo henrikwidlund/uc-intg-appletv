@@ -1,6 +1,6 @@
 /target
 /test-config
-/manual-test-results-*.md
+/test-results/
 /.manual-test-setup
 /.config-backup-*/
 /config.json.before-link-test
@@ -11,4 +11,3 @@
 /driver.log
 /tools/remote-sim/target
 /remote-sim-credentials
-/remote-sim-results-*.md

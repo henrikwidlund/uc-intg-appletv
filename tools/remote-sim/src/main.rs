@@ -396,11 +396,12 @@ async fn main() {
     println!("\n{summary}");
     ctx.report.push(String::new());
     ctx.report.push(summary);
-    let file = format!("remote-sim-results-{stamp}.md");
-    if tokio::fs::write(&file, ctx.report.join("\n") + "\n")
-        .await
-        .is_ok()
-    {
+    let file = format!("test-results/remote-sim-results-{stamp}.md");
+    let written = async {
+        tokio::fs::create_dir_all("test-results").await?;
+        tokio::fs::write(&file, ctx.report.join("\n") + "\n").await
+    };
+    if written.await.is_ok() {
         println!("Results: {file}");
     }
     // Exit with 1 if a check failed.
