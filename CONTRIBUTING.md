@@ -66,7 +66,7 @@ Describe breaking changes in the PR and explain why they are needed.
 
 ## Testing with real devices
 
-Some changes need a real Apple TV and Remote. `tools/manual_test.sh` runs the manual tests step by step. In your PR, say which devices and software versions you tested with.
+Some changes need a real Apple TV and Remote. `tools/manual_test.sh` runs the manual tests step by step. Run `tools/remote-sim` for the checks that need no person. In your PR, say which devices and software versions you tested with.
 
 ## Commit Messages
 

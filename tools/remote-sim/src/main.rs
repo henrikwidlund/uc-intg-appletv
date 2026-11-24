@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Test program that acts as the Remote. It starts the driver, sets it up with a real Apple TV
-//! and runs the checks of the guided manual test that need no person over the WebSocket.
+//! and runs the checks that need no person over the WebSocket.
 //!
 //! The driver pairing comes from a `config.json` of the driver: the setup restores it as a
 //! backup. Values are compared with a second connection that has its own pairing, see

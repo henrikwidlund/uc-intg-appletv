@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Henrik Widlund
 // SPDX-License-Identifier: MPL-2.0
 
-//! The checks. They follow the steps of `tools/manual_test.sh` that need no person.
+//! The checks. They need no person. `tools/manual_test.sh` has the steps that need a person,
+//! and steps that are not checked here yet.
 
 use crate::oracle::{self, Oracle};
 use crate::ws::{Client, field_ids, field_value};

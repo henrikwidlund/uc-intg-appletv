@@ -165,7 +165,8 @@ cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1
 To add one, measure with `util::alloc_count::blocks` and set the limit to the measured count.
 Name it `dhat_…`, gate it with the `dhat-heap` feature and mark it `#[ignore]`.
 
-`tools/manual_test.sh` runs the tests with a real Apple TV and Remote, one step at a time.
+`tools/manual_test.sh` runs the tests that need a person, and the tests that `tools/remote-sim` does
+not have yet, with a real Apple TV and Remote, one step at a time.
 It saves the results to `manual-test-results-<time>.md`.
 
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,

@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Henrik Widlund
 # SPDX-License-Identifier: MPL-2.0
 #
-# Guided manual test with a real Remote and Apple TV.
+# Guided manual test with a real Remote and Apple TV. It has the steps that need a person, and the
+# steps that tools/remote-sim does not check yet. Run remote-sim for the rest.
 #
 # The script shows one numbered step at a time: what to prepare, what to do and what to watch
 # for. Enter runs the step command (if the step has one). You then type what happened. All
@@ -124,30 +125,6 @@ with open(path, "w") as f:
     json.dump(devices, f, indent=2)
 PY
     echo "Stored ids replaced. Backup: $CONFIG_DIR/config.json.before-link-test"
-    start_driver
-}
-
-break_config() {
-    # Make config.json invalid, start the driver, then put the file back.
-    if [[ "$IDE" = 1 ]]; then
-        read -r -p "Stop the driver in RustRover now, then press Enter: " _
-    else
-        stop_driver
-    fi
-    cp "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.before-broken-test"
-    printf '[{"broken": ' >"$CONFIG_DIR/config.json"
-    start_driver
-    sleep 3
-    recent_log 'Invalid|moved|WARN|ERROR'
-    ls -l "$CONFIG_DIR"/config.json*
-    if [[ "$IDE" = 1 ]]; then
-        read -r -p "Stop the driver in RustRover now, then press Enter: " _
-    else
-        stop_driver
-    fi
-    mv "$CONFIG_DIR/config.json.before-broken-test" "$CONFIG_DIR/config.json"
-    rm -f "$CONFIG_DIR"/config.json.bad-*
-    echo "config.json is back. The moved file was deleted."
     start_driver
 }
 
@@ -292,52 +269,46 @@ step "Find the driver on the Remote" \
 "The driver is listed. If it is not listed, the mDNS publish failed: check the log." \
 "recent_log 'mDNS|WARN|ERROR'"
 
-step "Setup: discovery" \
-"The Apple TV is on (not sleeping)." \
+step "Setup: discovery and pairing" \
+"The Apple TV is on (not sleeping). You can see the TV." \
 "Select 'Apple TV (Rust)' and start the setup. Press Next on the info page.
 On the page 'Restore': leave 'Restore from backup' unticked, keep 'Siri protocol' at Auto. Press Next.
-On the page 'Setup mode': leave the IP address empty. Press Next." \
-"The info page has no input field.
-The page 'Restore' has 'Restore from backup', 'Debug log' and 'Siri protocol'.
-A page 'Please choose your Apple TV' with the Apple TV in a dropdown: name and IP address." \
-"recent_log 'discovering|not found|WARN|ERROR'"
-
-step "Setup: pairing" \
-"Look at the TV." \
-"Select the Apple TV. Keep 'Change volume on all connected devices' on. Press Next.
+On the page 'Setup mode': leave the IP address empty. Press Next.
+Select the Apple TV. Keep 'Change volume on all connected devices' on. Press Next.
 Enter the PIN shown on the TV. Press Next." \
-"A PIN shows on the TV after Next.
+"A page 'Please choose your Apple TV' with the Apple TV in a dropdown: name and IP address.
+A PIN shows on the TV after Next.
 After the PIN, the setup ends with success.
 The log shows 'paired with' and then 'connected'." \
-"recent_log 'pairing|paired|connected|WARN|ERROR'"
+"recent_log 'discovering|not found|pairing|paired|connected|WARN|ERROR' 20"
 
 step "Add the entities" \
 "Setup is done." \
 "Add all entities of the Apple TV: media player, remote, Siri, selects and sensors.
 Open the media player and the remote on the Remote." \
-"All entities are available (not 'unavailable').
-The media player shows a state (for example On, Standby or Playing)." \
+"The entities show on the Remote pages. The media player shows a state (for example On,
+Standby or Playing)." \
 "recent_log 'missing|not connected|WARN|ERROR'"
 
-# ---------------------------------------------------------------- power and buttons
+# ---------------------------------------------------------------- buttons
 
-step "Power off and on" \
-"The Apple TV is on." \
-"Media player: press Off. Wait 5 s. Press On.
-Then remote entity: press the POWER button (toggle) two times." \
-"Off: the TV sleeps and the media player state is Off, media info is empty.
-On: the TV wakes and the state is not Off.
-POWER toggles each time."
-
-step "Power on before a command" \
-"Put the Apple TV to sleep." \
-"Press DPAD down on the Remote." \
-"The Apple TV wakes first, then the cursor moves."
-
-step "D-pad, OK, back and home" \
-"Apple TV on the Home Screen." \
-"Press up, down, left, right, the middle button (OK), BACK and HOME on the Remote." \
-"Each press moves once or selects. BACK goes back. HOME goes to the Home Screen."
+step "Buttons and commands on the TV" \
+"Apple TV on the Home Screen, an app icon selected. For the swipes: the focus in the middle of
+the app grid (3 rows down and 2 columns right). At the end of a list, a swipe moves a bit and then
+goes back: that is normal." \
+"Press up, down, left, right, the middle button (OK), BACK and HOME on the Remote.
+Press the MENU button on the Remote (context menu). Press BACK.
+Run the Control Center command from the remote entity page (or media player 'menu'). Press BACK.
+Remote entity, Main page: press App Switcher. Press BACK. Press Screensaver. Press BACK.
+Press Guide in an app with a guide (for example the TV app with live TV).
+Press HOME. Move the focus 3 rows down and 2 columns right in the app grid.
+Run SWIPE_UP, SWIPE_DOWN, SWIPE_LEFT and SWIPE_RIGHT (simple commands of the media player)." \
+"Each press moves once or selects. BACK goes back. HOME goes to the Home Screen.
+MENU opens the context menu of the app icon (like holding Select for 1 s).
+Control Center opens. App Switcher shows the open apps. The screensaver starts.
+Guide opens the guide in the app, or does nothing in apps without a guide.
+Each swipe moves the focus in its direction, and the focus stays there.
+All four directions move about the same distance."
 
 step "Held buttons and repeat" \
 "Apple TV on the Home Screen with many apps." \
@@ -345,43 +316,18 @@ step "Held buttons and repeat" \
 "The cursor moves step by step while the button is held.
 It does not jump 4 steps at a time."
 
-step "Context menu and Control Center" \
-"Apple TV on the Home Screen, an app icon selected." \
-"Press the MENU button on the Remote (context menu).
-Then run the Control Center command from the remote entity page (or media player 'menu')." \
-"MENU opens the context menu of the app icon (like holding Select for 1 s).
-Control Center opens on the TV."
-
-step "App switcher, screensaver and guide" \
-"Apple TV on the Home Screen." \
-"Remote entity, Main page: press App Switcher. Press BACK.
-Press Screensaver. Press BACK.
-Press Guide in an app with a guide (for example the TV app with live TV)." \
-"App Switcher shows the open apps.
-The screensaver starts.
-Guide opens the guide in the app, or does nothing in apps without a guide."
-
-step "Swipes" \
-"Open a long list or grid, with the focus in the middle (for example the app grid on the
-Home Screen, 3 rows down and 2 columns right). At the end of a list, a swipe moves a bit and then
-goes back: that is normal." \
-"Run SWIPE_UP, SWIPE_DOWN, SWIPE_LEFT and SWIPE_RIGHT (simple commands of the media player)." \
-"Each swipe moves the focus in its direction, and the focus stays there.
-All four directions move about the same distance."
-
 # ---------------------------------------------------------------- now playing
 
 step "Now playing: Music" \
 "Start a song in the Apple Music app." \
 "Look at the media player on the Remote for 30 s." \
-"Title, artist, album and cover art are shown.
-The position moves forward without jumps. Duration is correct.
-State is Playing. Source is 'Music'."
+"Artist, album and cover art are shown.
+The position moves forward without jumps. Duration is correct."
 
 step "Now playing: TV show" \
 "Start an episode of a TV show in the TV app. Then repeat with an episode in another app
 (for example Disney+ or HBO Max)." \
-"Look at the media player and these sensors (added in step 5):
+"Look at the media player and these sensors (added in step 'Add the entities'):
 '<device name> Episode' (sensor.<key>.episode), '<device name> Genre',
 '<device name> Content rating' and '<device name> Audio format'." \
 "Title is the episode, artist is the show name, media type is TV show.
@@ -415,10 +361,10 @@ Then play a movie: the Live sensor is off."
 
 # ---------------------------------------------------------------- playback
 
-step "Play, pause, next, previous, stop" \
+step "Next, previous and stop" \
 "Music is playing in Apple Music." \
-"Media player: play/pause two times, next, previous, stop." \
-"Each command works once. State follows (Paused, Playing).
+"Media player: next, previous, stop." \
+"Each command works once. Next and previous change the song.
 Stop stops or pauses playback."
 
 step "Play/pause from the screensaver" \
@@ -453,7 +399,7 @@ step "Seek" \
 "Play a video." \
 "Open the media player on the Remote. Drag the position bar to the middle.
 If the bar cannot be moved, also try with the Python Apple TV integration." \
-"The video moves to that position. The position on the Remote matches the TV.
+"The bar can be moved. The position on the Remote matches the TV.
 In the note: does the bar move at all, and does the Python integration allow it?" \
 "recent_log 'seek|WARN|ERROR'"
 
@@ -477,11 +423,9 @@ The volume shown is the average of the outputs."
 
 step "App select and source list" \
 "Apple TV on the Home Screen." \
-"App select: choose an app.
-Media player: open the source list (the 'Source' input of the media player) and choose another app.
+"Media player: open the source list (the 'Source' input of the media player) and choose an app.
 Use select next and select previous on the App select." \
-"Each choice opens the app. The App select, App sensor and media player source show it.
-When another app plays media, they show that app.
+"Each choice opens the app. The media player source shows it.
 Pause a video and press Home: after about 2 s the app, image and media info are empty.
 Open the same app again: the paused video shows again.
 Play music and press Home: music info stays.
@@ -489,13 +433,11 @@ Pause in an app, skip forward: nothing is cleared."
 
 step "Audio language and subtitles" \
 "Play a movie with more than one audio language and subtitles (for example in the TV app)." \
-"Audio language select: choose another language. Subtitles select: choose a language, then Off.
-Media player: run audio track and subtitle commands." \
-"The TV changes the audio and subtitles.
-The selects mark the current option, and the sensors show it.
+"Media player: run audio track and subtitle commands. Look at the Audio language sensor." \
+"The TV changes the audio and subtitles. The sensor shows the current audio language.
 The subtitle command goes through all subtitles, then Off.
 If the app has automatic subtitles, the Subtitles select has 'Auto' and marks it when it is on.
-If a select marks the wrong option: copy the 'audio:' log lines into the note." \
+If a select or the sensor shows the wrong option: copy the 'audio:' log lines into the note." \
 "recent_log 'audio:' 10"
 
 step "Chapters" \
@@ -509,13 +451,6 @@ step "Up Next and browse" \
 "Up Next select: choose an item. Then browse the media player: open Apps and Up Next,
 play an item from Up Next, and launch an app from Apps." \
 "The chosen item plays. Browse shows Apps and Up Next. Play works from browse."
-
-step "Playback speed" \
-"Play something in an app that has a speed setting on the Apple TV." \
-"Look at the Playback speed select. If it has options: choose 1.5x, then 1x." \
-"The select shows only speeds the app reports to the Apple TV. On tvOS 26.6, Podcasts,
-Music, YouTube and the TV app report none, so the select has no options. That is correct.
-If it has options: the speed changes and the Playback speed sensor shows it."
 
 step "Shuffle and repeat" \
 "Play an album in Apple Music." \
@@ -565,59 +500,37 @@ On tvOS 27 this can fail: Siri records but does not answer." \
 
 # ---------------------------------------------------------------- connection
 
-step "Remote standby" \
-"Media player state is shown." \
-"Let the Remote go to sleep. Wait 1 min. Wake it up and open the media player." \
-"After wake: entities are available in a few seconds, with the current state." \
-"recent_log 'connected|connection|disconnect|standby' 20"
-
-step "Apple TV restart" \
-"Media player state is shown." \
-"Restart the Apple TV (Settings > System > Restart, or unplug it)." \
+step "Apple TV restart and reconnect" \
+"Media player state is shown. The Apple TV is connected." \
+"Restart the Apple TV: Settings > System > Restart (or unplug it). Wait until it is on again
+(about 1 min). Then press Enter here to show the log." \
 "Entities become unavailable. They are available again within about 30 s after the Apple TV
-has started." \
-"recent_log 'connected|connection closed|reconnect|not found' 20"
-
-step "Driver restart" \
-"Media player state is shown." \
-"Press Enter to restart the driver." \
-"The Remote reconnects to the driver. The configuration is kept. The Apple TV connects again
-without new pairing." \
-"start_driver; sleep 10; recent_log 'configured|connected|WARN|ERROR'"
+has started.
+The log shows 'reconnect in' with longer waits while the Apple TV is off (2s, 4s, 6s ...),
+then 'connected'." \
+"recent_log 'reconnect in|connected|closed|not found|WARN|ERROR' 25"
 
 # ---------------------------------------------------------------- reconfigure
 
-step "Reconfigure: fixed IP and options" \
-"Know the IP address of the Apple TV." \
-"Start the setup of the integration again (reconfigure). Press Next on the info page.
-Choose the device and 'Configure selected device'. Press Next.
-'Apple TV on the network' shows this Apple TV. Enter the IP address, turn the volume option off.
-Press Next." \
-"Setup ends with success. If the IP address changed, the Apple TV reconnects and the log shows
-'configuration changed, reconnecting'. The volume option is used without a reconnect." \
-"recent_log 'configuration|connected|WARN|ERROR'"
-
 step "Reconfigure: pair again" \
 "Look at the TV." \
-"Reconfigure, choose the device and 'Pair selected device again'. Press Next. Enter the new PIN." \
-"A PIN shows on the TV. Setup ends with success. The entities keep their ids (activities still work).
+"Reconfigure, choose the device and 'Pair selected device again'. Press Next.
+When the PIN page shows, type one space as the PIN and press Next.
+Then enter the PIN from the TV and press Next.
+Then press Enter here to show the log." \
+"A PIN shows on the TV. The space (an empty PIN) shows the PIN page again with an error.
+The real PIN ends the setup with success. The log shows 'connected' after it.
+The entities keep their ids (activities still work).
 If no PIN shows: copy the log lines into the note." \
-"recent_log 'pairing|paired|not found|discovery|WARN|ERROR' 20"
+"recent_log 'pairing|paired|not found|discovery|invalid setup input|connected|WARN|ERROR' 20"
 
 step "Wrong credentials" \
 "On the Apple TV: Settings > Remotes and Devices > Remote App and Devices: remove this driver
 (the name shown is the host name of the Mac)." \
 "Restart the Apple TV or wait until the connection drops." \
 "The driver stops reconnecting. The log shows 'pairing is not valid anymore'.
-Pair again (previous step) to fix it." \
+Then pair again now (repeat step 'Reconfigure: pair again'). The next steps need the connection." \
 "recent_log 'pairing|auth|WARN|ERROR' 20"
-
-step "Check the log for errors" \
-"All other steps are done." \
-"Press Enter to show warnings and errors from the driver log." \
-"Each WARN or ERROR line is about a step above where something did not work.
-In the note: copy lines that you cannot connect to a step." \
-"recent_log 'WARN|ERROR' 40"
 
 # ---------------------------------------------------------------- identity
 
@@ -638,43 +551,7 @@ Then press Enter here to show the log." \
 The entities are available again with the same entity ids (activities still work)." \
 "recent_log 'linked to|configuration changed|connected|not found|WARN|ERROR' 20"
 
-# ---------------------------------------------------------------- error cases
-
-step "Setup: invalid IP address" \
-"The driver runs. The Apple TV is configured." \
-"Start the setup of the integration again (reconfigure). Choose 'Add a new device'. Press Next.
-In 'IP address', type: appletv.local . Press Next.
-Then press Enter here to show the log." \
-"The same page is shown again with an error. The setup does not hang.
-The log shows 'invalid setup input'.
-Then cancel the setup." \
-"recent_log 'invalid setup input|setup flow|WARN|ERROR'"
-
-step "Setup: empty PIN" \
-"The driver runs. The Apple TV is on." \
-"Start the setup again (reconfigure). Choose the device and 'Pair selected device again'. Press Next.
-When the PIN page shows, type one space as the PIN and press Next.
-Then enter the PIN from the TV and press Next.
-Then press Enter here to show the log." \
-"The space (an empty PIN) shows the PIN page again with an error.
-The real PIN ends the setup with success. The log shows 'connected' after it." \
-"recent_log 'invalid setup input|setup flow|connected|WARN|ERROR' 20"
-
-step "Commands after a canceled setup" \
-"The driver runs and the Apple TV is connected." \
-"Start the setup again (reconfigure). On the first page, cancel the setup.
-Then use the D-pad and Home of the Apple TV entity right away." \
-"The Apple TV reacts. No 'setup required' errors in the log." \
-"recent_log 'setup|WARN|ERROR'"
-
-step "Power pressed twice" \
-"The Apple TV is on." \
-"Press the power button of the media player entity. Wait 5 s.
-Press it again. Wait 10 s. Then press Enter here to show the log." \
-"The Apple TV goes to sleep, then wakes up again.
-The log shows 'off -> [TurnOff]' and then 'on -> [TurnOn]'.
-Known limit: the Apple TV ignores a wake that comes about 1 s after the sleep command." \
-"recent_log 'off ->|on ->|WARN|ERROR'"
+# ---------------------------------------------------------------- more
 
 step "Siri two times in a row" \
 "The Apple TV is on." \
@@ -692,35 +569,14 @@ Seek over a chapter start." \
 The chapter list stays the same." \
 "recent_log 'WARN|ERROR'"
 
-step "Reconnect backoff" \
-"The Apple TV is connected." \
-"Restart the Apple TV: Settings > System > Restart. Wait until it is on again (about 1 min).
-Then press Enter here to show the log." \
-"The log shows 'reconnect in' with longer waits while the Apple TV is off (2s, 4s, 6s ...),
-then 'connected'. The entities are available again." \
-"recent_log 'reconnect in|connected|closed|not found|WARN|ERROR' 25"
+# ---------------------------------------------------------------- end
 
-step "Configuration file after saving" \
-"Step 'Setup: empty PIN' ended with success. The real PIN saved the configuration." \
-"Press Enter to show the configuration files." \
-"config.json has the mode -rw------- (only the owner can read it).
-There is no config.json.tmp file left." \
-"ls -l \"$CONFIG_DIR\"/config.json* \"$CONFIG_DIR\"/*.tmp 2>/dev/null"
-
-step "Broken configuration file" \
-"The driver runs." \
-"Press Enter. The script stops the driver, makes config.json invalid and starts the driver.
-It then shows the log, puts the old config.json back and starts the driver again." \
-"The log shows 'Invalid ... The file was moved to ...config.json.bad-<time>'.
-The file list shows config.json.bad-<time>. The driver starts with no devices.
-After the restore, the Apple TV connects again (check that the entities are available)." \
-"break_config"
-
-step "Check the log for errors again" \
+step "Check the log for errors" \
 "The steps above are done." \
 "Press Enter to show warnings and errors from the driver log." \
 "Each WARN or ERROR line is about a step above where something did not work.
-The broken configuration step gives one expected ERROR line.
+Steps 'Apple TV restart and reconnect', 'Wrong credentials' and 'Siri off on the Apple TV' can
+cause WARN lines on purpose.
 In the note: copy lines that you cannot connect to a step." \
 "recent_log 'WARN|ERROR' 40"
 
