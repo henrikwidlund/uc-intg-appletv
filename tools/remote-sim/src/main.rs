@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Test program that acts as the Remote. It starts the driver, sets it up with a real Apple TV
-//! and runs the checks that need no person over the WebSocket.
+//! and runs the checks over the WebSocket. Some checks ask the owner on the terminal, for example
+//! to start the right video. Without a terminal they skip the question. `atv_restart` runs only
+//! with `--only atv_restart`.
 //!
 //! The driver pairing comes from a `config.json` of the driver: the setup restores it as a
 //! backup. Values are compared with a second connection that has its own pairing, see
@@ -13,7 +15,13 @@
 //! - `remote-sim pair-driver <address>`: pair the driver through its setup flow and save its
 //!   `config.json` as `--config`. An old file is kept as `<config>.old-<unix time>`.
 //! - `remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>]`
+//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-audio <file>]
+//!   [--siri-hold]`
+//!
+//! `--siri-hold` sends 1500 ms of silence after the speech instead of 300 ms, like a user who
+//! holds the button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri
+//! overlay on the Apple TV, which blocks navigation until Siri and then Back twice are pressed.
+//! It is for testing that.
 
 mod checks;
 mod driver;
@@ -28,7 +36,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 25] = [
+const STEPS: [&str; 32] = [
     "metadata",
     "setup_input",
     "setup",
@@ -45,6 +53,12 @@ const STEPS: [&str; 25] = [
     "playback",
     "languages",
     "artwork",
+    "wake_command",
+    "wake_artwork",
+    "speed",
+    "home_playing",
+    "siri_wake",
+    "siri_direct",
     "power",
     "abort_setup",
     "configure",
@@ -52,6 +66,7 @@ const STEPS: [&str; 25] = [
     "driver_restart",
     "config_file",
     "broken_config",
+    "atv_restart",
     "restore_power",
     "log",
 ];
@@ -60,21 +75,27 @@ const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
 /// Steps at the end that set the Apple TV back and check the driver log.
 const END_STEPS: [&str; 2] = ["restore_power", "log"];
 
+/// Steps that run only when `--only` names them.
+const OPT_IN_STEPS: [&str; 1] = ["atv_restart"];
+
 /// A step runs if `--only` is empty or names it, or if it is in [`BASE_STEPS`] or
-/// [`END_STEPS`]. `--skip` wins.
+/// [`END_STEPS`]. A step of [`OPT_IN_STEPS`] runs only if `--only` names it. `--skip` wins.
 fn selected(only: &[String], skip: &[String], name: &str) -> bool {
-    (only.is_empty()
-        || BASE_STEPS.contains(&name)
-        || END_STEPS.contains(&name)
-        || only.iter().any(|n| n == name))
-        && !skip.iter().any(|n| n == name)
+    let named = only.iter().any(|n| n == name);
+    let runs = if OPT_IN_STEPS.contains(&name) {
+        named
+    } else {
+        only.is_empty() || BASE_STEPS.contains(&name) || END_STEPS.contains(&name) || named
+    };
+    runs && !skip.iter().any(|n| n == name)
 }
 
 const USAGE: &str = "Usage:
   remote-sim pair <address> [--credentials <path>]
   remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--port <port>]
   remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-             [--only a,b] [--skip a,b] [--no-power] [--port <port>]";
+             [--only a,b] [--skip a,b] [--no-power] [--port <port>]
+             [--siri-audio <file>] [--siri-hold]";
 
 /// A failed or skipped check.
 pub struct Fail {
@@ -125,6 +146,12 @@ pub struct Options {
     pub only: Vec<String>,
     pub skip: Vec<String>,
     pub no_power: bool,
+    /// Recorded Siri question, in a format that `afconvert` reads. Else `say` makes it.
+    pub siri_audio: Option<PathBuf>,
+    /// 1500 ms of silence after the speech instead of 300 ms. On tvOS 27.2.1 this leaves the
+    /// dimmed Siri overlay on the Apple TV, which blocks navigation until Siri and then Back
+    /// twice are pressed. It is for testing that.
+    pub siri_hold: bool,
     pub port: u16,
 }
 
@@ -138,6 +165,19 @@ pub struct Ctx {
     pub key: String,
     /// The Apple TV was on at the start.
     pub was_on: bool,
+    /// Questions to the owner in the current step and the answers, for the report.
+    pub answers: Vec<String>,
+    /// Speech for the Siri checks, 16 kHz mono 16 bit PCM with the silence. Made once.
+    pub siri_pcm: Option<Vec<u8>>,
+    /// Lines of the terminal, from [`checks::stdin_lines`].
+    pub stdin: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// The least content that was not started: the owner skipped, or there was no terminal to
+    /// ask. With the reason. Checks that need it or more skip without asking.
+    pub declined: Option<(oracle::Content, String)>,
+    /// The app that last had the state Playing (or a paused movie that a check accepted), seen when
+    /// the second connection started or when a check found its content. A check opens it again
+    /// when nothing plays or the item has no title.
+    pub played_app: Option<String>,
     report: Vec<String>,
     failed: usize,
     skipped: usize,
@@ -193,11 +233,17 @@ impl Ctx {
                 ("FAIL", f.msg)
             }
         };
-        let line = if note.is_empty() {
+        let mut line = if note.is_empty() {
             format!("{tag}  {name} ({ms} ms)")
         } else {
             format!("{tag}  {name} ({ms} ms): {note}")
         };
+        if !self.answers.is_empty() {
+            line.push_str(" [owner: ");
+            line.push_str(&self.answers.join("; "));
+            line.push(']');
+            self.answers.clear();
+        }
         println!("{line}");
         self.report.push(line);
         tag != "FAIL"
@@ -205,7 +251,12 @@ impl Ctx {
 }
 
 fn parse() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1).peekable();
+    parse_from(std::env::args().skip(1))
+}
+
+/// Parses the arguments without the program name.
+fn parse_from(args: impl Iterator<Item = String>) -> Result<Options, String> {
+    let mut args = args.peekable();
     let mut opt = Options {
         pair: false,
         pair_driver: false,
@@ -216,6 +267,8 @@ fn parse() -> Result<Options, String> {
         only: Vec::new(),
         skip: Vec::new(),
         no_power: false,
+        siri_audio: None,
+        siri_hold: false,
         port: 19190,
     };
     match args.peek().map(String::as_str) {
@@ -236,6 +289,10 @@ fn parse() -> Result<Options, String> {
             "--only" => opt.only.extend(step_list("--only", args.next())?),
             "--skip" => opt.skip.extend(step_list("--skip", args.next())?),
             "--no-power" => opt.no_power = true,
+            "--siri-hold" => opt.siri_hold = true,
+            "--siri-audio" => {
+                opt.siri_audio = Some(args.next().ok_or("--siri-audio needs a file")?.into());
+            }
             "--port" => {
                 opt.port = args
                     .next()
@@ -301,6 +358,9 @@ async fn main() {
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         exit(&format!("cannot create {}: {e}", dir.display()));
     }
+    if let Some(text) = old_driver(&opt.bin) {
+        println!("{text}");
+    }
     let mut driver = Driver::new(&opt.bin, &dir, opt.port);
     if let Err(e) = driver.start().await {
         exit(&e.msg);
@@ -316,6 +376,13 @@ async fn main() {
         oracle: None,
         key: String::new(),
         was_on: true,
+        answers: Vec::new(),
+        declined: None,
+        played_app: None,
+        siri_pcm: None,
+        // Started at once on a terminal, so lines typed before a prompt are dropped. A run in the
+        // background with a terminal stdin stops; use `< /dev/null` there.
+        stdin: checks::terminal().then(checks::stdin_lines),
         report: Vec::new(),
         failed: 0,
         skipped: 0,
@@ -344,7 +411,64 @@ async fn main() {
     {
         println!("Results: {file}");
     }
+    // Exit with 1 if a check failed.
     std::process::exit(i32::from(ctx.failed > 0));
+}
+
+/// A warning if the driver binary is older than a file in `src` or `resources`, or than
+/// `Cargo.toml`, `Cargo.lock` or `build.rs` of its repo. The repo is the folder above
+/// `target/<profile>/` with a `Cargo.toml`. `None` if it is not older or not in a repo.
+fn old_driver(bin: &std::path::Path) -> Option<String> {
+    let built = std::fs::metadata(bin).ok()?.modified().ok()?;
+    let profile = bin.parent()?.file_name()?.to_str()?;
+    let root = bin.ancestors().nth(3)?;
+    let root = if root.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        root
+    };
+    if !root.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let build = match profile {
+        "debug" => "cargo build".to_owned(),
+        "release" => "cargo build --release".to_owned(),
+        other => format!("cargo build --profile {other}"),
+    };
+    let modified = |f: &str| std::fs::metadata(root.join(f)).ok()?.modified().ok();
+    let newest = ["src", "resources"]
+        .iter()
+        .filter_map(|d| newest_file(&root.join(d)))
+        .chain(
+            ["Cargo.toml", "Cargo.lock", "build.rs"]
+                .into_iter()
+                .filter_map(modified),
+        )
+        .max()?;
+    (newest > built).then(|| {
+        format!(
+            "WARNING: the driver binary {} may be older than the source: run {build} (ignore \
+             this if it has nothing to build)",
+            bin.display()
+        )
+    })
+}
+
+/// Time of the newest file in `dir` and its subfolders.
+fn newest_file(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    for entry in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let time = if kind.is_dir() {
+            newest_file(&entry.path())
+        } else {
+            entry.metadata().ok().and_then(|m| m.modified().ok())
+        };
+        newest = newest.max(time);
+    }
+    newest
 }
 
 /// Pair the driver and save its `config.json` as `--config`.
@@ -424,6 +548,14 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("playback", checks::playback).await;
     ctx.step("languages", checks::languages).await;
     ctx.step("artwork", checks::artwork).await;
+    ctx.step("wake_command", checks::wake_command).await;
+    ctx.step("wake_artwork", checks::wake_artwork).await;
+    ctx.step("speed", checks::speed).await;
+    ctx.step("home_playing", checks::home_playing).await;
+    // Siri can cover the video, so it runs after the other checks that need playback.
+    ctx.step("siri_wake", checks::siri_wake).await;
+    // The same audio through the second connection, without the driver, to compare.
+    ctx.step("siri_direct", checks::siri_direct).await;
     // After the checks that need playback: power stops the video.
     ctx.step("power", checks::power).await;
     ctx.step("abort_setup", checks::abort_setup).await;
@@ -432,11 +564,29 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("driver_restart", checks::driver_restart).await;
     ctx.step("config_file", checks::config_file).await;
     ctx.step("broken_config", checks::broken_config).await;
+    // Needs a person, so only with `--only atv_restart`.
+    ctx.step("atv_restart", checks::atv_restart).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(line: &str) -> impl Iterator<Item = String> {
+        line.split_whitespace().map(String::from)
+    }
+
+    #[test]
+    fn siri_audio_option() {
+        let opt = parse_from(args("10.0.0.1 --siri-audio question.m4a")).unwrap();
+        assert_eq!(opt.siri_audio, Some(PathBuf::from("question.m4a")));
+        assert!(!opt.siri_hold);
+        let opt = parse_from(args("10.0.0.1")).unwrap();
+        assert_eq!(opt.siri_audio, None);
+        assert!(!opt.siri_hold);
+        assert!(parse_from(args("10.0.0.1 --siri-hold")).unwrap().siri_hold);
+        assert!(parse_from(args("10.0.0.1 --siri-audio")).is_err());
+    }
 
     #[test]
     fn step_selection() {
@@ -456,6 +606,17 @@ mod tests {
         assert!(!selected(&only, &[], "languages"));
         assert!(!selected(&only, &names(&["setup"]), "setup"), "--skip wins");
         assert!(!selected(&[], &names(&["log"]), "log"));
+        assert!(
+            !selected(&[], &[], "atv_restart"),
+            "opt-in step without --only"
+        );
+        assert!(!selected(&only, &[], "atv_restart"));
+        let restart = names(&["atv_restart"]);
+        assert!(selected(&restart, &[], "atv_restart"));
+        assert!(!selected(&restart, &restart, "atv_restart"), "--skip wins");
+        for name in OPT_IN_STEPS {
+            assert!(STEPS.contains(&name), "{name}");
+        }
     }
 
     /// Body of the fn that starts with `head`.
@@ -488,6 +649,54 @@ mod tests {
             assert!(at < middle_at, "{name} is not a base step");
         }
         assert!(STEPS.ends_with(&END_STEPS), "end steps are not last");
+    }
+
+    #[test]
+    fn old_driver_binary() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("remote-sim-old-{}", std::process::id()));
+        let bin = root.join("target/release/driver");
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("target");
+        std::fs::create_dir_all(root.join("src/sub")).expect("src");
+        std::fs::write(root.join("Cargo.toml"), "").expect("Cargo.toml");
+        std::fs::write(root.join("src/sub/a.rs"), "").expect("source");
+        let set = |time: SystemTime| {
+            std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&bin)
+                .and_then(|f| f.set_modified(time))
+                .expect("set time");
+        };
+        let now = SystemTime::now();
+        set(now - Duration::from_secs(100));
+        let warning = old_driver(&bin).expect("older than the source");
+        assert!(
+            warning.contains("run cargo build --release (ignore"),
+            "{warning}"
+        );
+        std::fs::remove_file(root.join("Cargo.toml")).expect("remove Cargo.toml");
+        assert!(old_driver(&bin).is_none(), "not in a repo");
+        std::fs::write(root.join("Cargo.toml"), "").expect("Cargo.toml");
+        set(now + Duration::from_secs(100));
+        assert!(old_driver(&bin).is_none(), "newer than the source");
+        // Only Cargo.lock is newer, as after a dependency update.
+        let age = |path: &std::path::Path, time: SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(time))
+                .expect("set time");
+        };
+        age(&root.join("src/sub/a.rs"), now - Duration::from_secs(300));
+        age(&root.join("Cargo.toml"), now - Duration::from_secs(300));
+        set(now - Duration::from_secs(100));
+        assert!(old_driver(&bin).is_none(), "older source");
+        std::fs::write(root.join("Cargo.lock"), "").expect("Cargo.lock");
+        assert!(old_driver(&bin).is_some(), "newer Cargo.lock");
+        assert!(old_driver(&root.join("missing")).is_none(), "no binary");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

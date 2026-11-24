@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Henrik Widlund
 // SPDX-License-Identifier: MPL-2.0
 
-//! The checks. They need no person. `tools/manual_test.sh` has the steps that need a person,
-//! and steps that are not checked here yet.
+//! The checks. Some ask the owner on the terminal: to start the right video, to choose a speed
+//! that tvOS does not take from the second connection, whether Siri answered, and to restart the
+//! Apple TV. Without a terminal they do not ask. `siri_direct` compares Siri through ratv
+//! directly with Siri through the driver. `tools/manual_test.sh` has the steps that are not
+//! checked here yet.
 
-use crate::oracle::{self, Oracle};
+use crate::oracle::{self, Content, Oracle};
 use crate::ws::{Client, field_ids, field_value};
 use crate::{Check, Ctx, Fail};
 use ratv::mrp::PlaybackState;
@@ -306,25 +309,273 @@ pub async fn pair_driver(ctx: &mut Ctx) -> Check {
     Ok("driver paired".into())
 }
 
-/// Read the PIN from the terminal. The WebSocket is read meanwhile, so the pings of the driver
-/// get an answer and the driver keeps the connection.
+/// Read the PIN from the terminal.
 async fn read_pin(ctx: &mut Ctx) -> Result<String, Fail> {
-    let mut line = String::new();
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let read = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line);
-    tokio::pin!(read);
-    loop {
-        tokio::select! {
-            result = &mut read => {
-                result?;
-                break;
-            }
-            result = ctx.client.listen_ms(500) => result?,
-        }
+    // A PIN from a pipe is kept.
+    if terminal() {
+        drop_typed_lines(ctx);
     }
+    let line = read_line(ctx).await?.unwrap_or_default();
     let pin = line.trim();
     ensure!(!pin.is_empty(), "no PIN");
     Ok(pin.to_owned())
+}
+
+/// Lines of the terminal. One thread reads them, so no typed line is lost between two reads.
+/// The channel closes at the end of the input.
+pub fn stdin_lines() -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Throw away the lines typed before a prompt, so they do not answer it.
+fn drop_typed_lines(ctx: &mut Ctx) {
+    if let Some(rx) = ctx.stdin.as_mut() {
+        while rx.try_recv().is_ok() {}
+    }
+}
+
+/// Read a line from the terminal. `None` at the end of the input. The WebSocket is read
+/// meanwhile, so the pings of the driver get an answer and the driver keeps the connection.
+async fn read_line(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
+    let rx = ctx.stdin.get_or_insert_with(stdin_lines);
+    loop {
+        tokio::select! {
+            line = rx.recv() => return Ok(line),
+            result = ctx.client.listen_ms(500) => result?,
+        }
+    }
+}
+
+/// What the owner answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    Done,
+    Yes,
+    No,
+    Skip,
+    /// The input ended, so the owner cannot answer.
+    NoInput,
+}
+
+/// Kind of question to the owner.
+#[derive(Clone, Copy)]
+enum Ask {
+    /// Something to do. Enter means it is done, s skips. The texts say what each key means.
+    Action(&'static str, &'static str),
+    /// A yes or no question. The texts say what y and n mean.
+    Question(&'static str, &'static str),
+}
+
+/// What s + Enter means for most questions.
+const SKIP_CHECK: &str = "skip this check";
+
+/// Ask the owner on the terminal and wait for the answer. Without a terminal it returns `Skip`,
+/// at the end of the input `NoInput`. The question and the answer go to the report of the step.
+async fn ask(ctx: &mut Ctx, kind: Ask, text: &str) -> Result<Answer, Fail> {
+    ask_hint(ctx, kind, text, None).await
+}
+
+/// [`ask`] with a `hint` line under the question. The report gets only the question.
+async fn ask_hint(
+    ctx: &mut Ctx,
+    kind: Ask,
+    text: &str,
+    hint: Option<&str>,
+) -> Result<Answer, Fail> {
+    if !terminal() {
+        ctx.answers
+            .push(format!("{text:?}: not asked, no terminal"));
+        return Ok(Answer::Skip);
+    }
+    let keys = match kind {
+        Ask::Action(done, skip) => format!("Enter = {done}, s + Enter = {skip}"),
+        Ask::Question(yes, no) => {
+            format!("y + Enter = {yes}, n + Enter = {no}, s + Enter = {SKIP_CHECK}")
+        }
+    };
+    drop_typed_lines(ctx);
+    match hint {
+        Some(hint) => println!("\n  >>> {text}\n  {hint}\n  {keys}"),
+        None => println!("\n  >>> {text}\n  {keys}"),
+    }
+    let answer = loop {
+        let Some(line) = read_line(ctx).await? else {
+            break Answer::NoInput;
+        };
+        let answer = match (kind, line.trim().to_ascii_lowercase().as_str()) {
+            (_, "s") => Answer::Skip,
+            (Ask::Action(..), "") => Answer::Done,
+            (Ask::Question(..), "y") => Answer::Yes,
+            (Ask::Question(..), "n") => Answer::No,
+            _ => {
+                println!("  Unknown answer. {keys}");
+                continue;
+            }
+        };
+        break answer;
+    };
+    ctx.answers.push(format!("{text:?}: {answer:?}"));
+    Ok(answer)
+}
+
+/// [`need_playback`], after a wait of up to 10 s for the driver to show the playback.
+async fn driver_plays(ctx: &mut Ctx, seen: PlaybackSeen) -> Result<(), Fail> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while need_playback(ctx, seen).is_err() && Instant::now() < deadline {
+        ctx.client.listen_ms(200).await?;
+    }
+    need_playback(ctx, seen)
+}
+
+/// True if the second connection has an open MRP connection.
+fn has_mrp(ctx: &Ctx) -> bool {
+    ctx.oracle.as_ref().is_some_and(Oracle::has_mrp)
+}
+
+/// What the second connection says is missing for `need`. `None` without it or its MRP.
+fn content_missing(ctx: &Ctx, need: Content) -> Option<String> {
+    ctx.oracle
+        .as_ref()
+        .filter(|o| o.has_mrp())
+        .and_then(|o| o.missing(need))
+}
+
+/// True if stdin is a terminal, so the owner can answer.
+pub fn terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+/// Wait up to `secs` until the second connection reports `need`. Returns what is still
+/// missing.
+async fn wait_content(ctx: &mut Ctx, need: Content, secs: u64) -> Result<Option<String>, Fail> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let missing = content_missing(ctx, need);
+        if missing.is_none() || Instant::now() >= deadline {
+            return Ok(missing);
+        }
+        ctx.client.listen_ms(500).await?;
+    }
+}
+
+/// Remember the content as not started, with `reason`. Keeps the least content.
+fn decline(ctx: &mut Ctx, need: Content, reason: String) {
+    // Nothing plays or no title: no content can be checked without the owner.
+    let need = if content_missing(ctx, Content::Playing).is_some() {
+        Content::Playing
+    } else {
+        need
+    };
+    if ctx.declined.as_ref().is_none_or(|(d, _)| need < *d) {
+        ctx.declined = Some((need, reason));
+    }
+}
+
+/// Check that the Apple TV plays `need`. If not, open the app that played before when nothing
+/// plays or the item has no title, then ask the owner until it is right or the owner skips.
+/// When MRP of the second connection shows the content, it waits up to 10 s for the driver.
+/// Without the second connection or its MRP, only the driver state counts, at once, see
+/// [`need_playback`].
+async fn need_content(ctx: &mut Ctx, need: Content, seen: PlaybackSeen) -> Result<(), Fail> {
+    if !has_mrp(ctx) {
+        return need_playback(ctx, seen);
+    }
+    let Some(mut missing) = content_missing(ctx, need) else {
+        return content_found(ctx, need, seen).await;
+    };
+    // Content that was not started before: do not ask again.
+    if let Some((_, reason)) = ctx.declined.as_ref().filter(|(d, _)| *d <= need) {
+        return Err(Fail::skip(reason.clone()));
+    }
+    // Nothing plays or the item has no title, for example after Settings came to the front:
+    // open the app that played.
+    if let Some(app) = ctx.played_app.clone()
+        && content_missing(ctx, Content::Playing).is_some()
+        && has_value(ctx, &ctx.mp(), "source_list", &app)
+    {
+        mp_command(ctx, "select_source", json!({ "source": app })).await?;
+        match wait_content(ctx, need, 10).await? {
+            None => return content_found(ctx, need, seen).await,
+            Some(still) => missing = still,
+        }
+    }
+    if !terminal() {
+        decline(
+            ctx,
+            need,
+            format!("not asked: no terminal, needs {}", need.text()),
+        );
+        return Err(Fail::skip(format!(
+            "not asked: no terminal, needs {}: {missing}",
+            need.text()
+        )));
+    }
+    // Ask until the content is right or the owner skips. Each prompt says what is wrong now.
+    let mut keys = Ask::Action("it plays", "skip the checks that need it");
+    loop {
+        let text = content_prompt(ctx, need, &missing);
+        let answer = ask(ctx, keys, &text).await?;
+        if answer != Answer::Done {
+            let why = if answer == Answer::NoInput {
+                "not started (no input)"
+            } else {
+                "the owner skipped"
+            };
+            let reason = format!("{why}: {}: {missing}", need.text());
+            decline(ctx, need, reason.clone());
+            return Err(Fail::skip(reason));
+        }
+        // Time for the new item to load.
+        match wait_content(ctx, need, 5).await? {
+            None => return content_found(ctx, need, seen).await,
+            Some(still) => missing = still,
+        }
+        keys = Ask::Action("check again", "skip the checks that need it");
+    }
+}
+
+/// Prompt for missing content: what plays now, what is missing, and what to open.
+fn content_prompt(ctx: &Ctx, need: Content, missing: &str) -> String {
+    let start = "in the Apple TV app, start it and wait until it plays.";
+    match ctx.oracle.as_ref().and_then(Oracle::now_text) {
+        Some(now) => format!(
+            "Now playing: {now}. It is not {}: {missing}. {} {start}",
+            need.text(),
+            need.open()
+        ),
+        None => format!("Nothing plays. Open {} {start}", need.text()),
+    }
+}
+
+/// MRP of the second connection shows the content: remember its app, then wait for the driver,
+/// see [`driver_plays`].
+async fn content_found(ctx: &mut Ctx, need: Content, seen: PlaybackSeen) -> Result<(), Fail> {
+    // Only an item that plays: a paused item can be an old item of another app. A paused movie
+    // counts: chapters and languages rule out such an old item.
+    let app = ctx.oracle.as_ref().and_then(|o| {
+        o.active_app()
+            .or_else(|| (need == Content::Movie).then(|| o.playing_app()).flatten())
+    });
+    if let Some(app) = app {
+        ctx.played_app = Some(app.to_owned());
+    }
+    driver_plays(ctx, seen).await.map_err(|_| {
+        Fail::skip(format!(
+            "the Apple TV plays, the driver shows {} after 10 s",
+            mp_state(ctx)
+        ))
+    })
 }
 
 /// The driver config with the pairing, as backup text.
@@ -415,7 +666,22 @@ pub async fn entities(ctx: &mut Ctx) -> Check {
 pub async fn states(ctx: &mut Ctx) -> Check {
     ctx.client.send_event("connect").await?;
     let count = subscribe_all(ctx).await?;
-    let state = wait_available(ctx, 30).await?;
+    let state = match wait_available(ctx, 30).await {
+        Ok(state) => state,
+        Err(e)
+            if ctx
+                .driver
+                .log_text()
+                .contains("pairing is not valid anymore") =>
+        {
+            return Err(Fail::new(format!(
+                "{e}. The driver pairing in {} is not valid anymore: run `remote-sim \
+                 pair-driver <address>`",
+                ctx.opt.config.display()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     ctx.was_on = state != "OFF";
     ctx.client.listen(2).await?;
     let Some(address) = ctx.opt.address else {
@@ -427,6 +693,12 @@ pub async fn states(ctx: &mut Ctx) -> Check {
             ctx.oracle = Some(oracle);
             // The second connection must not push the driver out.
             ctx.client.listen(3).await?;
+            // Now playing comes some time after the connect.
+            ctx.played_app = ctx
+                .oracle
+                .as_ref()
+                .and_then(Oracle::active_app)
+                .map(str::to_owned);
             ensure!(
                 closed_lines(ctx) == closed && mp_state(ctx) != "UNAVAILABLE",
                 "the driver lost the Apple TV when the second connection started"
@@ -644,12 +916,43 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     let took = start.elapsed().as_millis();
     ctx.client.refresh_states().await?;
     let after = wait_available(ctx, 5).await?;
+    let mut nothing = "";
     if ctx.oracle.is_some() {
         verify(ctx, 5).await?;
+        // `verify` does not see an old title when the Apple TV has none.
+        if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
+            no_old_item(ctx).await?;
+            nothing = ", nothing plays and no old item is shown";
+        }
     }
     Ok(format!(
-        "connected {took} ms after exit_standby, state {after}"
+        "connected {took} ms after exit_standby, state {after}{nothing}"
     ))
+}
+
+/// True for a cleared attribute: the driver sends "" or null.
+fn cleared(v: Option<&Value>) -> bool {
+    v.is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+}
+
+/// Wait up to 5 s until the driver shows no title and no image.
+async fn no_old_item(ctx: &mut Ctx) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let title = ctx.client.attr(&mp, "media_title");
+        let image = ctx.client.attr(&mp, "media_image_url");
+        if cleared(title) && cleared(image) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the Apple TV has no item, the driver shows title {:?}, image {:?}",
+            ctx.client.text(&mp, "media_title"),
+            ctx.client.text(&mp, "media_image_url")
+        );
+        ctx.client.listen_ms(200).await?;
+    }
 }
 
 pub async fn remote_wake(ctx: &mut Ctx) -> Check {
@@ -944,9 +1247,10 @@ fn need_playback(ctx: &Ctx, seen: PlaybackSeen) -> Result<(), Fail> {
     if playing(ctx) || oracle_plays {
         Ok(())
     } else {
-        Err(Fail::skip(
-            "nothing is playing: start a video with chapters and languages before the run",
-        ))
+        Err(Fail::skip(format!(
+            "nothing is playing: start {} before the run",
+            Content::Movie.text()
+        )))
     }
 }
 
@@ -1024,14 +1328,18 @@ fn home_clear_active(ctx: &Ctx) -> bool {
 ///
 /// When the Apple TV has no item, it skips if the driver shows no title and no image. A title
 /// or image on the driver after 3 seconds is a FAIL.
-async fn bring_to_front(ctx: &mut Ctx, standby: bool) -> Result<String, Fail> {
+///
+/// `app` is the app to open, for example the app that played before HOME. `None` takes the app
+/// of now playing. A given app that is not in the source list is a skip.
+async fn bring_to_front(ctx: &mut Ctx, standby: bool, app: Option<String>) -> Result<String, Fail> {
     let mp = ctx.mp();
-    let device_app = ctx
-        .oracle
-        .as_ref()
-        .and_then(Oracle::playing_app)
-        .map(str::to_owned);
-    let from_driver = device_app.is_none();
+    let device_app = app.clone().or_else(|| {
+        ctx.oracle
+            .as_ref()
+            .and_then(Oracle::playing_app)
+            .map(str::to_owned)
+    });
+    let from_driver = device_app.is_none() || app.is_some();
     let app = device_app.unwrap_or_else(|| ctx.client.text(&mp, "source"));
     if app.is_empty() {
         return Err(Fail::skip(
@@ -1135,15 +1443,14 @@ async fn bring_to_front(ctx: &mut Ctx, standby: bool) -> Result<String, Fail> {
     // sends no title, or a driver error that this check must find.
     if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
         // The driver must clear the title and the image. It sends "" for both.
-        let empty = |v: Option<&Value>| v.is_none_or(|v| v.is_null() || v.as_str() == Some(""));
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             // The Apple TV can send the item again: then check it as usual.
             if ctx.oracle.as_ref().and_then(Oracle::has_item) != Some(false) {
                 break;
             }
-            let no_title = empty(ctx.client.attr(&mp, "media_title"));
-            let no_image = empty(ctx.client.attr(&mp, "media_image_url"));
+            let no_title = cleared(ctx.client.attr(&mp, "media_title"));
+            let no_image = cleared(ctx.client.attr(&mp, "media_image_url"));
             if no_title && no_image {
                 return Err(Fail::skip(if title.is_empty() {
                     format!("{app} has no item")
@@ -1279,9 +1586,9 @@ fn position(ctx: &Ctx) -> Option<f64> {
 }
 
 pub async fn playback(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Movie, PlaybackSeen::DriverOrOracle).await?;
     let standby = matches!(mp_state(ctx).as_str(), "STANDBY" | "OFF");
-    need_playback(ctx, PlaybackSeen::DriverOrOracle)?;
-    let mut notes = vec![bring_to_front(ctx, standby).await?];
+    let mut notes = vec![bring_to_front(ctx, standby, None).await?];
     let mp = ctx.mp();
     mp_command(ctx, "PAUSE", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 5, "PAUSED").await?;
@@ -1507,7 +1814,7 @@ async fn sweep(ctx: &mut Ctx, kind: &str) -> Result<usize, Fail> {
 }
 
 pub async fn languages(ctx: &mut Ctx) -> Check {
-    need_playback(ctx, PlaybackSeen::Driver)?;
+    need_content(ctx, Content::Movie, PlaybackSeen::Driver).await?;
     let swept_audio = sweep(ctx, "audio_language").await?;
     // The Apple TV lists Auto only while it is current, so a sweep cannot set it back.
     let auto = ctx.client.text(&ctx.select("subtitles"), "current_option") == "Auto";
@@ -1596,10 +1903,15 @@ pub async fn languages(ctx: &mut Ctx) -> Check {
     // The sweep gives 0 for a single option, so show the option count then.
     let tested = if swept_audio >= 2 { swept_audio } else { audio };
     let s = plural(tested);
-    Ok(if auto {
-        format!("{tested} audio language{s}, subtitles on Auto and not swept")
+    let audio_note = if swept_audio >= 2 {
+        format!("{tested} audio language{s}")
     } else {
-        format!("{tested} audio language{s}, {subtitles} subtitle options")
+        format!("audio not swept: {tested} language{s}")
+    };
+    Ok(if auto {
+        format!("{audio_note}, subtitles on Auto and not swept")
+    } else {
+        format!("{audio_note}, {subtitles} subtitle options")
     })
 }
 
@@ -1630,16 +1942,13 @@ async fn http_get(url: &str) -> Result<(String, usize), Fail> {
     Ok((head, body.len() - end - 4))
 }
 
-pub async fn artwork(ctx: &mut Ctx) -> Check {
-    let url = ctx.client.text(&ctx.mp(), "media_image_url");
-    if url.is_empty() {
-        return Err(Fail::skip("no artwork"));
-    }
+/// Read an artwork URL of the driver. Returns a note. A URL of the app is not read.
+async fn fetch_artwork(ctx: &Ctx, url: &str) -> Result<String, Fail> {
     let own = format!("http://127.0.0.1:{}/", ctx.driver.port);
     if !url.starts_with(&own) {
         return Ok(format!("URL of the app: {url}"));
     }
-    let (head, size) = http_get(&url).await?;
+    let (head, size) = http_get(url).await?;
     let lower = head.to_ascii_lowercase();
     ensure!(head.contains(" 200 "), "artwork: {head}");
     ensure!(
@@ -1647,9 +1956,1290 @@ pub async fn artwork(ctx: &mut Ctx) -> Check {
         "artwork type: {head}"
     );
     ensure!(size > 0, "empty artwork");
-    let (missing, _) = http_get(&format!("{own}artwork/{}/missing.png", ctx.key)).await?;
-    ensure!(missing.contains(" 404 "), "unknown artwork: {missing}");
     Ok(format!("image of {size} bytes from the driver"))
+}
+
+/// The image URL of the media player. It waits up to 5 s for it if `wait` is true or the second
+/// connection has MRP: the driver can need a short time for the image of a new item. Empty if
+/// there is none.
+async fn wait_image(ctx: &mut Ctx, wait: bool) -> Result<String, Fail> {
+    let mp = ctx.mp();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let url = ctx.client.text(&mp, "media_image_url");
+        if !url.is_empty() || !(wait || has_mrp(ctx)) || Instant::now() >= deadline {
+            return Ok(url);
+        }
+        ctx.client.listen_ms(200).await?;
+    }
+}
+
+pub async fn artwork(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Video, PlaybackSeen::Driver).await?;
+    let url = wait_image(ctx, false).await?;
+    if url.is_empty() {
+        ensure!(
+            !has_mrp(ctx),
+            "the Apple TV has artwork, the driver shows no image after 5 s"
+        );
+        return Err(Fail::skip("no artwork"));
+    }
+    let note = fetch_artwork(ctx, &url).await?;
+    let own = format!("http://127.0.0.1:{}/", ctx.driver.port);
+    if url.starts_with(&own) {
+        let (missing, _) = http_get(&format!("{own}artwork/{}/missing.png", ctx.key)).await?;
+        ensure!(missing.contains(" 404 "), "unknown artwork: {missing}");
+    }
+    Ok(note)
+}
+
+// ---------------------------------------------------------------- at wake
+
+/// Driver log line of a full connect: both protocols in one go, or MRP after Companion.
+fn joined(log: &str) -> bool {
+    log.contains("] connected in ") || log.contains("MRP connected in")
+}
+
+/// Lines of `log` that contain one of `patterns`.
+fn lines_with<'a>(log: &'a str, patterns: &[&str]) -> Vec<&'a str> {
+    log.lines()
+        .filter(|l| patterns.iter().any(|p| l.contains(p)))
+        .collect()
+}
+
+/// Send `enter_standby` like a Remote that sleeps. The driver closes its connection to the Apple
+/// TV.
+async fn remote_sleep(ctx: &mut Ctx) -> Result<(), Fail> {
+    ctx.client.send_event("enter_standby").await?;
+    ctx.client.listen(3).await
+}
+
+/// Wait until the driver log after `mark` shows a full connect. Returns the ms since `start`.
+async fn wait_joined(ctx: &mut Ctx, mark: usize, start: Instant, secs: u64) -> Result<u128, Fail> {
+    let deadline = start + Duration::from_secs(secs);
+    loop {
+        let log = ctx.driver.log_since(mark);
+        if joined(&log) {
+            return Ok(start.elapsed().as_millis());
+        }
+        if Instant::now() >= deadline {
+            let mut msg = format!("no full connect {secs} s after exit_standby");
+            for line in lines_with(&log, &["did not connect"]) {
+                msg.push_str(" | ");
+                msg.push_str(line);
+            }
+            return Err(Fail::new(msg));
+        }
+        ctx.client.listen_ms(100).await?;
+    }
+}
+
+/// Wait until the driver and the second connection agree on PLAYING or PAUSED. Returns the
+/// state. Skips for another state.
+async fn stable_playback(ctx: &mut Ctx) -> Result<String, Fail> {
+    let state = wait_agree(
+        ctx,
+        Instant::now(),
+        Duration::from_secs(10),
+        |_| Duration::from_secs(1),
+        NoOracle::AnyStable,
+    )
+    .await
+    .map_err(|e| e.prefixed("before the check"))?;
+    match state.as_str() {
+        "PLAYING" | "PAUSED" => Ok(state),
+        _ => Err(Fail::skip(format!("nothing plays: state {state}"))),
+    }
+}
+
+/// Playback state of the Apple TV for a media player state.
+fn playback_of(state: &str) -> PlaybackState {
+    if state == "PLAYING" {
+        PlaybackState::Playing
+    } else {
+        PlaybackState::Paused
+    }
+}
+
+/// Send PLAY or PAUSE until the driver and the Apple TV show `state`.
+async fn set_play_state(ctx: &mut Ctx, state: &str) -> Result<(), Fail> {
+    let mp = ctx.mp();
+    let cmd = if state == "PLAYING" { "PLAY" } else { "PAUSE" };
+    mp_command(ctx, cmd, json!({})).await?;
+    ctx.client.wait_text(&mp, "state", 10, state).await?;
+    wait_playback(ctx, playback_of(state)).await
+}
+
+/// Driver log line when play_pause is sent again after a closed connection.
+const SENT_AGAIN: &str = "play_pause not sent, sending again";
+
+/// Make sure the video plays: send PLAY if needed, then wait until the driver and the second
+/// connection show PLAYING for 3 s. Skips if it does not play.
+async fn ensure_playing(ctx: &mut Ctx) -> Result<(), Fail> {
+    if stable_playback(ctx).await? != "PLAYING" {
+        set_play_state(ctx, "PLAYING")
+            .await
+            .map_err(|e| Fail::skip(format!("the video does not play: {}", e.msg)))?;
+    }
+    let state = wait_agree(
+        ctx,
+        Instant::now(),
+        Duration::from_secs(10),
+        |_| Duration::from_secs(3),
+        NoOracle::Playing,
+    )
+    .await
+    .map_err(|e| {
+        Fail::skip(format!(
+            "the video does not play: {}",
+            e.prefixed("PLAY").msg
+        ))
+    })?;
+    if state != "PLAYING" {
+        return Err(Fail::skip(format!(
+            "the video does not play: state {state}"
+        )));
+    }
+    Ok(())
+}
+
+/// play_pause right after `exit_standby` runs once, after the connect.
+pub async fn wake_command(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Playing, PlaybackSeen::Driver).await?;
+    let was = stable_playback(ctx).await?;
+    let result = wake_toggle(ctx).await;
+    // Set the play state from before the check back, on all paths. The first error is returned.
+    let restore = set_play_state(ctx, &was).await;
+    let note = result?;
+    restore?;
+    Ok(note)
+}
+
+/// The part of [`wake_command`] after the content check. It leaves the video paused.
+async fn wake_toggle(ctx: &mut Ctx) -> Check {
+    // A paused video can pause again after PLAY, for example without a player on the screen:
+    // start from PLAYING.
+    ensure_playing(ctx).await?;
+    let before = "PLAYING";
+    let toggled = "PAUSED";
+    remote_sleep(ctx).await?;
+    let mark = ctx.driver.log_len();
+    ctx.client.send_event("exit_standby").await?;
+    let start = Instant::now();
+    // Like a Remote that wakes on a key press: no wait for the connect.
+    mp_command(ctx, "play_pause", json!({})).await?;
+    let took = wait_joined(ctx, mark, start, 15).await?;
+    ctx.client.refresh_states().await?;
+    let mp = ctx.mp();
+    ctx.client.wait_text(&mp, "state", 10, toggled).await?;
+    wait_playback(ctx, playback_of(toggled)).await?;
+    // A second toggle comes within a short time.
+    ctx.client.listen(3).await?;
+    let log = ctx.driver.log_since(mark);
+    let sent = log.matches("] play_pause -> ").count();
+    let again = log.contains(SENT_AGAIN);
+    ensure!(
+        sent == 1 || (sent == 2 && again),
+        "{sent} 'play_pause ->' lines in the log, expected 1"
+    );
+    // The first try logs "play_pause failed" before it is sent again: that line is allowed.
+    let base = ["NotConnected", "did not connect", "play_pause not sent:"];
+    let (head, tail) = log.split_at(log.find(SENT_AGAIN).unwrap_or(0));
+    let mut bad: Vec<&str> = lines_with(head, &base)
+        .into_iter()
+        .filter(|l| !l.contains("play_pause failed:"))
+        .collect();
+    bad.extend(lines_with(tail, &base));
+    bad.extend(lines_with(tail, &["play_pause failed"]));
+    ensure!(bad.is_empty(), "{}", bad.join(" | "));
+    let shown = mp_state(ctx);
+    ensure!(
+        shown == toggled,
+        "state {shown} 3 s later, expected {toggled}"
+    );
+    if let Some(o) = ctx.oracle.as_ref() {
+        let device = o.playback_state();
+        ensure!(
+            entity_state(device) == toggled,
+            "the Apple TV is {} 3 s later, expected {toggled}",
+            device_text(Some(device))
+        );
+    }
+    let again = if again {
+        ", sent again after a closed connection"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{before} -> {toggled} once, connected after {took} ms{again}"
+    ))
+}
+
+/// The image shows again after a standby and wake.
+pub async fn wake_artwork(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Video, PlaybackSeen::Driver).await?;
+    stable_playback(ctx).await?;
+    let mp = ctx.mp();
+    let before = wait_image(ctx, false).await?;
+    if before.is_empty() {
+        ensure!(
+            !has_mrp(ctx),
+            "the Apple TV has artwork, the driver shows no image after 5 s"
+        );
+        return Err(Fail::skip("no artwork before the standby"));
+    }
+    remote_sleep(ctx).await?;
+    let mark = ctx.driver.log_len();
+    ctx.client.send_event("exit_standby").await?;
+    let start = Instant::now();
+    let took = wait_joined(ctx, mark, start, 15).await?;
+    // The driver keeps the entity states over the standby. Read them again, so only what the
+    // driver shows after the connect counts, not the cache of this client.
+    ctx.client.forget_states();
+    ctx.client.refresh_states().await?;
+    // An image showed before the standby, so one is expected now.
+    let url = wait_image(ctx, true).await?;
+    ensure!(!url.is_empty(), "no image 5 s after the connect");
+    let shown = start.elapsed().as_millis();
+    fetch_artwork(ctx, &url).await?;
+    // An artwork error or a new image can come after the first image.
+    ctx.client.listen(2).await?;
+    let log = ctx.driver.log_since(mark);
+    let failed = lines_with(&log, &["artwork failed"]);
+    ensure!(failed.is_empty(), "{}", failed.join(" | "));
+    let after = ctx.client.text(&mp, "media_image_url");
+    ensure!(!after.is_empty(), "the image went away 2 s after it showed");
+    let note = fetch_artwork(ctx, &after).await?;
+    let later = if log.contains("is fetched when MRP connects") {
+        ", fetched after the MRP join"
+    } else {
+        ""
+    };
+    // The driver keeps the URL from before the standby when the item did not change.
+    let image = if after == before && url == before {
+        "the URL from before the standby is kept".to_owned()
+    } else {
+        format!("new URL after {shown} ms")
+    };
+    Ok(format!("connected after {took} ms, {image}{later}, {note}"))
+}
+
+/// Set the rate on the Apple TV, like the speed menu of the player. If tvOS refuses
+/// (`CommandFailed`) or ignores it, ask the owner to choose it on the TV. A closed second
+/// connection or a rate that the app does not list (ratv does not send it) skips. Other errors
+/// fail. `skip` is the text for the s key of that prompt.
+/// Returns how the rate was set.
+async fn set_device_rate(
+    ctx: &mut Ctx,
+    rate: f32,
+    skip: &'static str,
+) -> Result<&'static str, Fail> {
+    let refused = match oracle(ctx)?.set_rate(rate).await {
+        Ok(()) => match wait_rate(ctx, rate).await {
+            Ok(()) => return Ok("set by the second connection"),
+            Err(e) => {
+                let now = ctx.oracle.as_ref().and_then(Oracle::rate);
+                match now.filter(|r| (r - 1.0).abs() >= 0.01) {
+                    // Another rate, for example a scan: end it with PLAY before the owner acts.
+                    Some(other) => {
+                        mp_command(ctx, "PLAY", json!({})).await?;
+                        let _ = wait_rate(ctx, 1.0).await;
+                        format!("tvOS set rate {other} instead of {rate}")
+                    }
+                    None => format!("tvOS ignored rate {rate}: {}", e.msg),
+                }
+            }
+        },
+        Err(e @ ratv::Error::CommandFailed { .. }) => format!("tvOS refused rate {rate}: {e}"),
+        Err(ratv::Error::InvalidArgument(_)) => {
+            return Err(Fail::skip(format!("rate {rate} is not listed by the app")));
+        }
+        // The MRP connection of the second connection closed: not an error of the driver.
+        Err(
+            e @ (ratv::Error::Disconnected | ratv::Error::Closed | ratv::Error::NotConnected(_)),
+        ) => {
+            return Err(Fail::skip(format!("rate {rate}: {e}")));
+        }
+        Err(e) => return Err(Fail::new(format!("rate {rate}: {e}"))),
+    };
+    let text = format!("{refused}. Choose {rate}x in the speed menu of the player on the TV.");
+    if ask(ctx, Ask::Action("done", skip), &text).await? != Answer::Done {
+        return Err(Fail::skip(refused));
+    }
+    wait_rate(ctx, rate)
+        .await
+        .map_err(|e| Fail::skip(format!("{refused}. Set on the TV: {}", e.msg)))?;
+    Ok("set on the TV")
+}
+
+/// Speeds set on the Apple TV: 1.5x shows PLAYING, 2x is shown as information.
+pub async fn speed(ctx: &mut Ctx) -> Check {
+    oracle(ctx)?;
+    // ratv sets the rate over MRP.
+    if !has_mrp(ctx) {
+        return Err(Fail::skip("the second connection has no MRP"));
+    }
+    need_content(ctx, Content::Playing, PlaybackSeen::Driver).await?;
+    let before = stable_playback(ctx).await?;
+    let result = speeds(ctx, before == "PAUSED").await;
+    // Set the play state back on all paths. The first error is returned.
+    let restore = if before == "PAUSED" {
+        set_play_state(ctx, "PAUSED").await
+    } else {
+        Ok(())
+    };
+    let note = result?;
+    restore?;
+    Ok(note)
+}
+
+/// The rates of [`speed`]. `paused`: send PLAY first.
+async fn speeds(ctx: &mut Ctx, paused: bool) -> Check {
+    // ratv sends only rates that the app lists, and only with the rate command enabled.
+    let oracle = oracle(ctx)?;
+    if !oracle.accepts_rate(1.5) {
+        return Err(Fail::skip(format!(
+            "the app does not accept 1.5x, its speeds: {:?}",
+            oracle.playback_speeds()
+        )));
+    }
+    if paused {
+        set_play_state(ctx, "PLAYING").await?;
+    }
+    let result = async {
+        let how = set_device_rate(ctx, 1.5, SKIP_CHECK).await?;
+        // Rate 1.5 is a playback speed, not a scan: PLAYING, not BUFFERING.
+        let shown = wait_agree(
+            ctx,
+            Instant::now(),
+            Duration::from_secs(5),
+            |_| Duration::from_secs(2),
+            NoOracle::Playing,
+        )
+        .await
+        .map_err(|e| e.prefixed("at 1.5x"))?;
+        ensure!(
+            shown == "PLAYING",
+            "state {shown} at 1.5x, expected PLAYING"
+        );
+        let mut notes = vec![format!("1.5x PLAYING ({how})")];
+        if !ctx.oracle.as_ref().is_some_and(|o| o.accepts_rate(2.0)) {
+            notes.push("2x not tested: the app does not accept 2x".to_owned());
+            return Ok(notes);
+        }
+        match set_device_rate(ctx, 2.0, "skip the 2x test").await {
+            Ok(how) => {
+                ctx.client.listen(3).await?;
+                let device = ctx.oracle.as_ref().map(Oracle::playback_state);
+                notes.push(format!(
+                    "2x: driver {}, Apple TV {} ({how})",
+                    mp_state(ctx),
+                    device_text(device)
+                ));
+            }
+            Err(e) if e.skip => notes.push(format!("2x not tested: {}", e.msg)),
+            Err(e) => return Err(e),
+        }
+        Ok(notes)
+    }
+    .await;
+    // Always go back to 1x, also after an error. The first error is returned. PLAY ends a speed
+    // or a scan; ratv sends rate 1.0 only when the app lists other speeds.
+    let reset = async {
+        let at_1x = ctx
+            .oracle
+            .as_ref()
+            .and_then(Oracle::rate)
+            .is_some_and(|r| (r - 1.0).abs() < 0.01);
+        let mut note = "back to 1x";
+        if !at_1x {
+            mp_command(ctx, "PLAY", json!({})).await?;
+            if wait_rate(ctx, 1.0).await.is_err() {
+                // Without MRP the second connection does not see the rate.
+                if !has_mrp(ctx) {
+                    note = "1x not checked: the second connection has no MRP";
+                } else {
+                    let rate = ctx.oracle.as_ref().and_then(Oracle::rate);
+                    let rate = rate.map_or_else(|| "unknown".to_owned(), |r| format!("{r}x"));
+                    let text = format!(
+                        "The rate is still {rate} after PLAY. Choose 1x (normal speed) in the \
+                         speed menu of the player on the TV."
+                    );
+                    let answer = ask(ctx, Ask::Action("done", SKIP_CHECK), &text).await?;
+                    if answer != Answer::Done {
+                        let why = match answer {
+                            Answer::NoInput => "not set (no input)",
+                            _ if !terminal() => "not asked: no terminal",
+                            _ => "the owner skipped",
+                        };
+                        return Err(Fail::skip(format!("the rate is not 1x, {why}")));
+                    }
+                    // If the owner's change on the TV did not work, it is not a driver fault.
+                    wait_rate(ctx, 1.0)
+                        .await
+                        .map_err(|e| Fail::skip(format!("set 1x on the TV: {}", e.msg)))?;
+                }
+            }
+        }
+        let mp = ctx.mp();
+        ctx.client.wait_text(&mp, "state", 5, "PLAYING").await?;
+        Ok(note)
+    }
+    .await;
+    let notes = result?;
+    let reset = reset?;
+    Ok(notes.join(", ") + ", " + reset)
+}
+
+/// HOME while an app plays clears now playing on the driver, or the Apple TV stops the app.
+pub async fn home_playing(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Playing, PlaybackSeen::Driver).await?;
+    let before = stable_playback(ctx).await?;
+    let mp = ctx.mp();
+    if ctx.client.text(&mp, "source").is_empty() {
+        return Err(Fail::skip("the driver shows no app"));
+    }
+    // The app to open again after HOME, not the item that now playing shows after it.
+    let app_before = ctx.client.text(&mp, "source");
+    let title_before = ctx.client.text(&mp, "media_title");
+    let mark = ctx.driver.log_len();
+    let start = Instant::now();
+    press(ctx, "HOME").await?;
+    let result = async {
+        // The Apple TV can also stop the app: then now playing shows another app or nothing,
+        // and the driver has nothing to clear.
+        // Without a title before HOME, another item cannot be told apart: only the clear counts.
+        let left_app = |ctx: &Ctx| {
+            let source = ctx.client.text(&mp, "source");
+            let title = ctx.client.text(&mp, "media_title");
+            !title_before.is_empty()
+                && mp_state(ctx) != "PLAYING"
+                && (source.is_empty()
+                    || title.is_empty()
+                    || source != app_before
+                    || title != title_before)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cleared_by_driver = loop {
+            if ctx.driver.log_since(mark).contains(HOME_CLEAR) {
+                break true;
+            }
+            if left_app(ctx) {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                break true;
+            }
+            ctx.client.listen_ms(200).await?;
+        };
+        if !cleared_by_driver {
+            let shown = mp_state(ctx);
+            if let Some(o) = ctx.oracle.as_ref() {
+                ensure!(
+                    o.playback_state() != Some(PlaybackState::Playing),
+                    "the Apple TV plays on the Home Screen"
+                );
+            }
+            return Ok(format!(
+                "the Apple TV stopped {app_before} ({title_before:?}) {} ms after HOME, driver \
+                 shows {:?} / {:?}, state {shown}",
+                start.elapsed().as_millis(),
+                ctx.client.text(&mp, "source"),
+                ctx.client.text(&mp, "media_title")
+            ));
+        }
+        if !ctx.driver.log_since(mark).contains(HOME_CLEAR) {
+            // An app that plays audio in the background keeps playing on the Home Screen.
+            let plays = ctx
+                .oracle
+                .as_ref()
+                .is_some_and(|o| o.playback_state() == Some(PlaybackState::Playing));
+            if plays {
+                return Err(Fail::skip("the app keeps playing on the Home Screen"));
+            }
+            if !ctx.driver.log_since(mark).contains("screen changed") {
+                return Err(Fail::skip(
+                    "HOME did not reach the Home Screen: no screen change from the Apple TV",
+                ));
+            }
+            let device = ctx.oracle.as_ref().map(Oracle::playback_state);
+            return Err(Fail::new(format!(
+                "no Home Screen clear in 10 s and the driver still shows {app_before}, driver \
+                 state {}, Apple TV {}",
+                mp_state(ctx),
+                device_text(device)
+            )));
+        }
+        let seen = start.elapsed().as_millis();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left: Vec<String> = ["source", "media_title", "media_image_url"]
+                .into_iter()
+                .filter(|a| !cleared(ctx.client.attr(&mp, a)))
+                .map(|a| format!("{a} {:?}", ctx.client.text(&mp, a)))
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "5 s after the Home Screen clear the driver shows {}",
+                left.join(", ")
+            );
+            ctx.client.listen_ms(200).await?;
+        }
+        let shown = mp_state(ctx);
+        ensure!(
+            shown != "PLAYING",
+            "driver state PLAYING on the Home Screen"
+        );
+        if let Some(o) = ctx.oracle.as_ref() {
+            ensure!(
+                o.playback_state() != Some(PlaybackState::Playing),
+                "the Apple TV plays on the Home Screen"
+            );
+        }
+        Ok(format!(
+            "Home Screen clear {seen} ms after HOME, state {shown}"
+        ))
+    }
+    .await;
+    // Open the app again for the later checks, also after an error.
+    let back = match bring_to_front(ctx, true, Some(app_before)).await {
+        Ok(_) if mp_state(ctx) != before => set_play_state(ctx, &before)
+            .await
+            .map(|()| "app open again")
+            .map_err(|e| Fail {
+                msg: format!("play state not restored: {}", e.msg),
+                skip: e.skip,
+            }),
+        Ok(_) => Ok("app open again"),
+        Err(e) => Err(Fail {
+            msg: format!("app not open again: {}", e.msg),
+            skip: e.skip,
+        }),
+    };
+    let note = result?;
+    match back {
+        Ok(back) => Ok(format!("{note}, {back}")),
+        Err(e) if e.skip => Ok(format!("{note}, {}", e.msg)),
+        Err(e) => Err(Fail::new(format!("{note}, but {}", e.msg))),
+    }
+}
+
+/// Text that `say` speaks for the Siri checks.
+const SIRI_TEXT: &str = "What time is it";
+/// Time Siri can take to answer after the audio ends. The prompt in [`siri_answer`] says 20 s.
+const SIRI_ANSWER_MS: u64 = 20_000;
+/// Audio chunk size: 64 ms of 16 kHz mono 16 bit audio.
+const VOICE_CHUNK: usize = 2048;
+/// Bytes of 1 ms of 16 kHz mono 16 bit audio.
+const BYTES_PER_MS: usize = 32;
+/// Silence before the speech, like a person who starts to speak after the key press.
+const SILENCE_BEFORE_MS: usize = 500;
+/// Silence after the speech, so the end of the speech is not cut. Short, so the audio ends
+/// before the Apple TV ends the recording: on tvOS 27.2.1, when the TV ends it first, the
+/// dimmed Siri overlay stays on the TV and blocks navigation until Siri and then Back twice are
+/// pressed.
+const SILENCE_AFTER_MS: usize = 300;
+/// Silence after the speech with `--siri-hold`, like a user who holds the button past the end
+/// of listening.
+const SILENCE_HOLD_MS: usize = 1500;
+/// Samples with an absolute value below this are always quiet.
+const QUIET_LEVEL: u16 = 500;
+/// Block size to find the start and end of the speech: 20 ms.
+const QUIET_BLOCK: usize = 320;
+/// Loud blocks in a row that count as speech: 60 ms.
+const SPEECH_BLOCKS: usize = 3;
+
+/// Speech of `text` as 16 kHz mono signed 16 bit PCM, made with macOS `say`. `None` without
+/// `say`.
+async fn speech(
+    dir: &std::path::Path,
+    text: &str,
+    after_ms: usize,
+) -> Result<Option<Vec<u8>>, Fail> {
+    let file = dir.join("siri.wav");
+    let status = tokio::process::Command::new("say")
+        .arg("-o")
+        .arg(&file)
+        .arg("--data-format=LEI16@16000")
+        .arg(text)
+        .status()
+        .await;
+    match status {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Fail::new(format!("say: {e}"))),
+        Ok(s) if !s.success() => return Err(Fail::new(format!("say: {s}"))),
+        Ok(_) => {}
+    }
+    Ok(Some(padded(&tokio::fs::read(&file).await?, after_ms)?))
+}
+
+/// The samples of a recorded file, converted by `afconvert` to `dir/siri.wav`.
+async fn recording(
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    after_ms: usize,
+) -> Result<Vec<u8>, Fail> {
+    ensure!(input.is_file(), "no Siri audio file {}", input.display());
+    let file = dir.join("siri.wav");
+    let out = tokio::process::Command::new("afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+        .arg(input)
+        .arg(&file)
+        .output()
+        .await
+        .map_err(|e| Fail::new(format!("afconvert: {e}")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        return Err(Fail::new(format!(
+            "afconvert {}: {}",
+            out.status,
+            if err.is_empty() { "no error text" } else { err }
+        )));
+    }
+    padded(&tokio::fs::read(&file).await?, after_ms)
+}
+
+/// The samples of a WAV file without the quiet start and end, with [`SILENCE_BEFORE_MS`] of silence
+/// before and `after_ms` after them.
+fn padded(wav: &[u8], after_ms: usize) -> Result<Vec<u8>, Fail> {
+    let speech = wav_pcm(wav)?;
+    let speech = trim_quiet(&speech);
+    ensure!(
+        !speech.is_empty(),
+        "no speech in the audio: silent or too quiet"
+    );
+    // Zero samples are silence.
+    let mut pcm = Vec::with_capacity((SILENCE_BEFORE_MS + after_ms) * BYTES_PER_MS + speech.len());
+    pcm.resize(SILENCE_BEFORE_MS * BYTES_PER_MS, 0);
+    pcm.extend_from_slice(speech);
+    pcm.resize(pcm.len() + after_ms * BYTES_PER_MS, 0);
+    Ok(pcm)
+}
+
+/// 16 bit little endian PCM without the quiet start and end. The PCM is read in blocks of
+/// [`QUIET_BLOCK`] samples. A block is loud when its peak is at least [`QUIET_LEVEL`] and at
+/// least 1/16 of the peak of all samples, so room noise is quiet. The speech starts with the
+/// first and ends with the last run of [`SPEECH_BLOCKS`] or more loud blocks, so short clicks
+/// are cut. Empty when there is no such run.
+fn trim_quiet(pcm: &[u8]) -> &[u8] {
+    let samples = pcm.as_chunks::<2>().0;
+    let level = |b: &[u8; 2]| i16::from_le_bytes(*b).unsigned_abs();
+    let peak = samples.iter().map(level).max().unwrap_or(0);
+    let loud_level = QUIET_LEVEL.max(peak / 16);
+    let (mut start, mut end) = (None, 0);
+    let (mut run, mut run_start, mut pos) = (0, 0, 0);
+    for block in samples.chunks(QUIET_BLOCK) {
+        if block.iter().any(|b| level(b) >= loud_level) {
+            if run == 0 {
+                run_start = pos;
+            }
+            run += 1;
+        } else {
+            run = 0;
+        }
+        pos += block.len();
+        if run >= SPEECH_BLOCKS {
+            start.get_or_insert(run_start);
+            end = pos;
+        }
+    }
+    &pcm[start.unwrap_or(0) * 2..end * 2]
+}
+
+/// The samples of a WAV file. It must be 16 kHz mono signed 16 bit PCM.
+fn wav_pcm(wav: &[u8]) -> Result<Vec<u8>, Fail> {
+    ensure!(
+        wav.len() >= 12 && &wav[..4] == b"RIFF" && &wav[8..12] == b"WAVE",
+        "not a WAV file"
+    );
+    let mut rest = &wav[12..];
+    let mut format_ok = false;
+    while rest.len() >= 8 {
+        let (id, len) = (
+            &rest[..4],
+            u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]),
+        );
+        let len = len as usize;
+        let body = &rest[8..];
+        ensure!(body.len() >= len, "cut WAV chunk");
+        let data = &body[..len];
+        match id {
+            b"fmt " => {
+                ensure!(data.len() >= 16, "short WAV format");
+                let u16_at = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]);
+                let rate = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                // PCM, or extensible (0xFFFE) with a PCM sub format; 1 channel, 16 kHz, 16 bit.
+                let pcm = match u16_at(0) {
+                    1 => true,
+                    0xFFFE => data.len() >= 26 && u16_at(24) == 1,
+                    _ => false,
+                };
+                format_ok = pcm && u16_at(2) == 1 && rate == 16_000 && u16_at(14) == 16;
+            }
+            b"data" => {
+                ensure!(format_ok, "WAV is not 16 kHz mono 16 bit PCM");
+                return Ok(data.to_vec());
+            }
+            _ => {}
+        }
+        // A chunk with an odd size has one pad byte.
+        rest = &body[(len + (len & 1)).min(body.len())..];
+    }
+    Err(Fail::new("no audio data in the WAV file"))
+}
+
+/// A protobuf varint.
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// A length-delimited protobuf field.
+fn field_bytes(out: &mut Vec<u8>, field: u8, data: &[u8]) {
+    out.push(field << 3 | 2);
+    varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+/// A varint protobuf field.
+fn field_varint(out: &mut Vec<u8>, field: u8, v: u64) {
+    out.push(field << 3);
+    varint(out, v);
+}
+
+/// A voice message of the Remote.
+enum Voice<'a> {
+    Begin,
+    Data(&'a [u8]),
+    End,
+}
+
+/// Binary `IntegrationMessage` with a voice message of `session_id`.
+fn voice_message(msg: &Voice<'_>, session_id: u32) -> Vec<u8> {
+    let samples = match msg {
+        Voice::Data(samples) => samples.len(),
+        _ => 0,
+    };
+    let mut inner = Vec::with_capacity(samples + 16);
+    field_varint(&mut inner, 1, u64::from(session_id));
+    let field = match msg {
+        Voice::Begin => {
+            // AudioConfiguration: 1 channel, 16 kHz, I16 (2), PCM (1).
+            let mut cfg = Vec::with_capacity(12);
+            field_varint(&mut cfg, 1, 1);
+            field_varint(&mut cfg, 2, 16_000);
+            field_varint(&mut cfg, 3, 2);
+            field_varint(&mut cfg, 4, 1);
+            field_bytes(&mut inner, 2, &cfg);
+            1
+        }
+        Voice::Data(samples) => {
+            field_bytes(&mut inner, 2, samples);
+            2
+        }
+        Voice::End => 3,
+    };
+    let mut out = Vec::with_capacity(inner.len() + 4);
+    field_bytes(&mut out, field, &inner);
+    out
+}
+
+/// Set the Siri mode in the setup. Returns the mode before and the result of the change. A
+/// failed change aborts the setup.
+async fn set_siri_mode(ctx: &mut Ctx, mode: &str) -> Result<(String, Result<(), Fail>), Fail> {
+    let page = start_setup(ctx, true).await?;
+    let Some(old) = field_value(&page, "siri_mode") else {
+        abort(ctx).await?;
+        return Err(Fail::new(format!(
+            "no siri_mode on the configuration page: {page}"
+        )));
+    };
+    let key = ctx.key.clone();
+    let mut done = ctx
+        .client
+        .answer(json!({ "choice": key, "action": "settings", "siri_mode": mode }))
+        .await;
+    if done.is_ok() {
+        done = ctx.client.setup_done(10).await;
+    }
+    if done.is_err() {
+        abort(ctx).await?;
+    }
+    Ok((old, done))
+}
+
+/// The speech for the Siri checks, made once: from `--siri-audio` with `afconvert`, else with
+/// `say`. The quiet start and end are cut, then [`SILENCE_AFTER_MS`] of silence follows, or
+/// [`SILENCE_HOLD_MS`] with `--siri-hold`. Skips without `say`.
+async fn siri_audio(ctx: &mut Ctx) -> Result<Vec<u8>, Fail> {
+    if let Some(pcm) = &ctx.siri_pcm {
+        return Ok(pcm.clone());
+    }
+    let after_ms = if ctx.opt.siri_hold {
+        SILENCE_HOLD_MS
+    } else {
+        SILENCE_AFTER_MS
+    };
+    let pcm = if let Some(input) = &ctx.opt.siri_audio {
+        recording(&ctx.driver.dir, input, after_ms).await?
+    } else if let Some(pcm) = speech(&ctx.driver.dir, SIRI_TEXT, after_ms).await? {
+        pcm
+    } else {
+        return Err(Fail::skip("no `say` command to make the speech"));
+    };
+    ctx.siri_pcm = Some(pcm.clone());
+    Ok(pcm)
+}
+
+/// Which audio the Siri checks send.
+fn voice_note(ctx: &Ctx) -> String {
+    let voice = match ctx
+        .opt
+        .siri_audio
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+    {
+        Some(name) => format!("real voice from {}", name.to_string_lossy()),
+        None => "`say` voice".into(),
+    };
+    let (after_ms, hold, flag) = if ctx.opt.siri_hold {
+        (SILENCE_HOLD_MS, "held ", " (--siri-hold)")
+    } else {
+        (SILENCE_AFTER_MS, "", "")
+    };
+    // The speech is the audio without the added silence.
+    let speech = ctx.siri_pcm.as_ref().map_or(0, |pcm| {
+        (pcm.len() / BYTES_PER_MS).saturating_sub(SILENCE_BEFORE_MS + after_ms)
+    });
+    format!("{voice}, {speech} ms of speech, {hold}{after_ms} ms after the speech{flag}")
+}
+
+/// The Siri question to the owner. PASS on yes, FAIL on no, else SKIP. `note` starts each
+/// result. The driver and the second connection stay open until the answer, because Siri
+/// answers some seconds after the audio and a closed connection loses the answer. Without a
+/// terminal or input it waits until [`SIRI_ANSWER_MS`] after `audio_end` instead. Then it
+/// closes the answer with [`close_siri`].
+async fn siri_answer(ctx: &mut Ctx, note: &str, audio_end: Instant) -> Check {
+    let question = match ctx
+        .opt
+        .siri_audio
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+    {
+        Some(name) => format!(
+            "Did Siri answer the question in {}?",
+            name.to_string_lossy()
+        ),
+        None => format!("Did Siri answer '{SIRI_TEXT}' and show the time?"),
+    };
+    let hint = Some("Siri can take up to 20 s to answer.");
+    // A WebSocket error in a wait is a FAIL, not hidden behind the SKIP.
+    let mut lost = None;
+    if !terminal() {
+        lost = siri_late_answer(ctx, audio_end).await.err();
+    }
+    // s + Enter does not wait.
+    let keys = Ask::Question("it answered", "nothing came after 20 s");
+    let answer = ask_hint(ctx, keys, &question, hint).await?;
+    if answer == Answer::NoInput {
+        lost = siri_late_answer(ctx, audio_end).await.err();
+    }
+    let closed = close_siri(ctx).await;
+    if let Some(e) = lost {
+        return Err(Fail::new(format!(
+            "{note}, while waiting for the Siri answer: {}{closed}",
+            e.msg
+        )));
+    }
+    match answer {
+        Answer::No => Err(Fail::new(format!(
+            "{note}, Siri did not answer as expected{closed}"
+        ))),
+        Answer::Yes => Ok(format!("{note}, Siri answered{closed}")),
+        _ => Err(Fail::skip(format!(
+            "{note}, the answer on the TV was not checked{closed}"
+        ))),
+    }
+}
+
+/// Close the Siri answer with Back, like a user. The Siri Remote must not be used for this.
+/// Uses the remote entity of the driver while the connections are open, then waits 1 s.
+/// Returns an empty note, or a note when the send failed.
+async fn close_siri(ctx: &mut Ctx) -> String {
+    let note = match press(ctx, "BACK").await {
+        Ok(()) => String::new(),
+        Err(e) => format!(", Siri not closed with Back: {}", e.msg),
+    };
+    let _ = ctx.client.listen_ms(1000).await;
+    note
+}
+
+/// Siri with the audio of `siri_wake` (speech and silence of [`siri_audio`]), sent over the
+/// second connection with ratv, without the driver. It shows whether Siri works with ratv
+/// directly, to compare with `siri_wake`.
+pub async fn siri_direct(ctx: &mut Ctx) -> Check {
+    oracle(ctx)?;
+    if ctx.oracle.as_ref().and_then(Oracle::siri_enabled) == Some(false) {
+        return Err(Fail::skip("Siri is off on the Apple TV"));
+    }
+    let pcm = siri_audio(ctx).await?;
+    let samples: Vec<i16> = pcm
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
+        .collect();
+    turn_on(ctx).await?;
+    let sent = {
+        let oracle = ctx
+            .oracle
+            .as_ref()
+            .ok_or_else(|| Fail::skip("no second connection to compare with"))?;
+        let send = oracle.ask_siri(&samples);
+        tokio::pin!(send);
+        // Read the WebSocket meanwhile, so the driver keeps the connection.
+        loop {
+            tokio::select! {
+                sent = &mut send => break sent,
+                result = ctx.client.listen_ms(500) => result?,
+            }
+        }
+    };
+    let audio_end = Instant::now();
+    // 16 samples are 1 ms.
+    let total = samples.len() / 16;
+    let voice = voice_note(ctx);
+    let note = match sent {
+        Ok((protocol, sent)) if sent < samples.len() => format!(
+            "direct path without the driver, over {protocol}, {voice}, the Apple TV stopped \
+             recording after {} ms of {total} ms of audio",
+            sent / 16
+        ),
+        Ok((protocol, _)) => {
+            format!("direct path without the driver, over {protocol}, {voice}, {total} ms of audio")
+        }
+        Err((e @ ratv::Error::SiriDisabled, _)) => {
+            return Err(Fail::skip(format!("direct path without the driver: {e}")));
+        }
+        Err((e, started)) => {
+            // No wait when no audio was sent.
+            let closed = if started
+                && !matches!(e, ratv::Error::SiriNoAudio | ratv::Error::SiriNotRecording)
+            {
+                // The check fails already.
+                let _ = siri_late_answer(ctx, audio_end).await;
+                close_siri(ctx).await
+            } else {
+                String::new()
+            };
+            return Err(Fail::new(format!(
+                "direct path without the driver, ratv error: {e}{closed}"
+            )));
+        }
+    };
+    siri_answer(ctx, &note, audio_end).await
+}
+
+/// Siri mode id in `settings.json` of the driver. The driver loads a missing or unknown value
+/// as `auto`.
+fn siri_mode(ctx: &Ctx) -> String {
+    let text = std::fs::read_to_string(ctx.driver.dir.join("settings.json")).unwrap_or_default();
+    let settings: Value = serde_json::from_str(&text).unwrap_or_default();
+    match settings["siri_mode"].as_str() {
+        Some("mrp") => "mrp".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// Siri right after `exit_standby` in the Auto mode (Companion on tvOS 27), with the speech and
+/// silence of [`siri_audio`]. MRP Siri does not work on tvOS 27 and later, so the check does not
+/// use it.
+pub async fn siri_wake(ctx: &mut Ctx) -> Check {
+    if ctx.oracle.as_ref().and_then(Oracle::siri_enabled) == Some(false) {
+        return Err(Fail::skip("Siri is off on the Apple TV"));
+    }
+    let pcm = siri_audio(ctx).await?;
+    // Already Auto: the setup is not touched.
+    if siri_mode(ctx) == "auto" {
+        return siri_session(ctx, &pcm).await;
+    }
+    let (old, set) = set_siri_mode(ctx, "auto").await?;
+    let result = match set {
+        Ok(()) => siri_session(ctx, &pcm).await,
+        Err(e) => Err(Fail::new(format!("Siri mode Auto: {}", e.msg))),
+    };
+    // Set the old mode back, also after an error. The first error is returned.
+    let restore = if old == "auto" {
+        Ok(())
+    } else {
+        set_siri_mode(ctx, &old).await.and_then(|(_, done)| done)
+    };
+    let note = result?;
+    restore.map_err(|e| {
+        Fail::new(format!(
+            "{note}, but Siri mode {old} not set back: {}",
+            e.msg
+        ))
+    })?;
+    Ok(note)
+}
+
+/// Wake with exit_standby and send the speech to Siri through the driver.
+async fn siri_session(ctx: &mut Ctx, pcm: &[u8]) -> Check {
+    turn_on(ctx).await?;
+    let voice = ctx.voice();
+    remote_sleep(ctx).await?;
+    let mark = ctx.driver.log_len();
+    ctx.client.clear_events();
+    ctx.client.send_event("exit_standby").await?;
+    let start = Instant::now();
+    // Like a Remote that wakes on the voice key: no wait for the connect.
+    let session: u32 = 4711;
+    ctx.client
+        .command_ok(
+            "voice_assistant",
+            &voice,
+            "voice_start",
+            json!({
+                "session_id": session,
+                "audio_cfg": { "channels": 1, "sample_rate": 16000, "sample_format": "I16" },
+            }),
+        )
+        .await?;
+    // Like the Remote: the audio starts after the ready event.
+    // The driver waits for the connect (up to 10 s), then starts Siri.
+    let ready = match next_voice_event(ctx, session, 15).await? {
+        Some(Ok(true)) => start.elapsed().as_millis(),
+        found => {
+            // End the session on the driver, so it does not wait for audio.
+            ctx.client
+                .send_binary(voice_message(&Voice::End, session))
+                .await?;
+            return Err(Fail::new(match found {
+                Some(Err(message)) => format!("assistant error before ready: {message}"),
+                Some(Ok(_)) => "assistant_event finished before ready".to_owned(),
+                None => "no assistant_event ready in 15 s".to_owned(),
+            }));
+        }
+    };
+    // At the speed of speech.
+    ctx.client
+        .send_binary(voice_message(&Voice::Begin, session))
+        .await?;
+    let ms = (VOICE_CHUNK / BYTES_PER_MS) as u64;
+    let mut sent = 0;
+    // The Apple TV can end Siri before all audio is sent: then stop, like the Remote.
+    let mut early = None;
+    for chunk in pcm.chunks(VOICE_CHUNK) {
+        ctx.client
+            .send_binary(voice_message(&Voice::Data(chunk), session))
+            .await?;
+        sent += chunk.len();
+        ctx.client.listen_ms(ms).await?;
+        while let Some(event) = ctx.client.pop_assistant() {
+            if let Some(found) = voice_event(&event, session) {
+                early = Some(found);
+            }
+        }
+        if early.is_some() {
+            break;
+        }
+    }
+    // A lost WebSocket returns at once.
+    ctx.client
+        .send_binary(voice_message(&Voice::End, session))
+        .await?;
+    let audio_end = Instant::now();
+    let audio_ms = |bytes: usize| bytes / BYTES_PER_MS;
+    let sent_note = if sent < pcm.len() {
+        format!(
+            "Siri ended the session after {} ms of {} ms of audio",
+            audio_ms(sent),
+            audio_ms(pcm.len())
+        )
+    } else {
+        format!("all {} ms of audio sent", audio_ms(pcm.len()))
+    };
+    // The owner can listen to the audio that was sent.
+    let wav = ctx.driver.dir.join("siri-sent.wav");
+    let written = tokio::fs::write(&wav, wav_file(&pcm[..sent]))
+        .await
+        .map_err(|e| Fail::new(format!("{}: {e}", wav.display())));
+    let wav_note = format!("{}, audio: afplay {}", voice_note(ctx), wav.display());
+    let checked = match written {
+        Ok(()) => siri_result(ctx, session, mark, ready, sent, early).await,
+        Err(e) => Err(e),
+    };
+    let result = match checked {
+        Ok(note) => {
+            let note = format!("{note}, the automatic checks passed");
+            siri_answer(ctx, &note, audio_end).await
+        }
+        Err(mut e) => {
+            if sent > 0 {
+                // The check fails already.
+                let _ = siri_late_answer(ctx, audio_end).await;
+                e.msg.push_str(&close_siri(ctx).await);
+            }
+            Err(e)
+        }
+    };
+    result
+        .map(|note| format!("{note}, {sent_note}, {wav_note}"))
+        .map_err(|e| Fail {
+            msg: format!("{}; {sent_note}, {wav_note}", e.msg),
+            skip: e.skip,
+        })
+}
+
+/// The automatic checks of [`siri_session`] after the audio: the end event and the log. `sent`
+/// is the number of audio bytes sent. `early` is an end event that came while the audio was
+/// sent.
+async fn siri_result(
+    ctx: &mut Ctx,
+    session: u32,
+    mark: usize,
+    ready: u128,
+    sent: usize,
+    early: Option<Result<bool, String>>,
+) -> Check {
+    let voice = ctx.voice();
+    // Siri answers after the audio. The driver sends finished or error at the end.
+    let event = match early {
+        Some(event) => Some(event),
+        None => next_voice_event(ctx, session, 30).await?,
+    };
+    let end = match event {
+        Some(Ok(false)) => Ok(()),
+        Some(Err(message)) => Err(message),
+        Some(Ok(true)) => Err("a second ready event".to_owned()),
+        None => return Err(Fail::new("no assistant_event finished or error in 30 s")),
+    };
+    // The voice_end line can come a short time after the end event.
+    let end_line = format!("=> voice_end({session}): ");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut log = ctx.driver.log_since(mark);
+    while !log.contains(&end_line) && Instant::now() < deadline {
+        ctx.client.listen_ms(100).await?;
+        log = ctx.driver.log_since(mark);
+    }
+    let failed = lines_with(&log, &["Siri failed"]);
+    ensure!(failed.is_empty(), "{}", failed.join(" | "));
+    if let Err(message) = end {
+        return Err(Fail::new(format!("assistant error: {message}")));
+    }
+    ensure!(
+        log.contains(&format!("=> voice_begin({session})")),
+        "no voice_begin line in the log"
+    );
+    let bytes = log
+        .lines()
+        .find_map(|l| {
+            let rest = l.split_once(&end_line)?.1;
+            let (_, rest) = rest.split_once(" chunks, ")?;
+            rest.split_once(" bytes")?.0.parse::<u64>().ok()
+        })
+        .ok_or_else(|| Fail::new("no voice_end line in the log 2 s after the end"))?;
+    // The driver counts each chunk, also after the session ended. Fewer bytes means a lost
+    // chunk.
+    ensure!(
+        bytes == sent as u64,
+        "voice_end with {bytes} bytes, {sent} sent"
+    );
+    ensure!(
+        log.contains("mode Auto"),
+        "the Siri session did not use the Auto mode"
+    );
+    ctx.client.refresh_states().await?;
+    let state = ctx.client.text(&voice, "state");
+    ensure!(
+        !ctx.client.was_unavailable(&voice) && state != "UNAVAILABLE",
+        "the voice entity was UNAVAILABLE"
+    );
+    Ok(format!(
+        "ready after {ready} ms, {bytes} bytes received by the driver"
+    ))
+}
+
+/// Wait until [`SIRI_ANSWER_MS`] after `audio_end`, when the owner cannot answer or a check
+/// failed after the audio, so the next step does not close a connection before Siri answers.
+/// The WebSocket is read meanwhile.
+/// On a WebSocket error it still waits, then returns the error.
+async fn siri_late_answer(ctx: &mut Ctx, audio_end: Instant) -> Result<(), Fail> {
+    let end = audio_end + Duration::from_millis(SIRI_ANSWER_MS);
+    let ms = end.saturating_duration_since(Instant::now()).as_millis() as u64;
+    let result = ctx.client.listen_ms(ms).await;
+    if result.is_err() {
+        tokio::time::sleep_until(end.into()).await;
+    }
+    result
+}
+
+/// The next assistant event of `session` within `secs`: `Ok(true)` for ready, `Ok(false)` for
+/// finished, `Err` with the message for error. Other events are skipped.
+async fn next_voice_event(
+    ctx: &mut Ctx,
+    session: u32,
+    secs: u64,
+) -> Result<Option<Result<bool, String>>, Fail> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        let Some(event) = ctx.client.next_assistant(left.as_secs().max(1)).await? else {
+            return Ok(None);
+        };
+        if let Some(found) = voice_event(&event, session) {
+            return Ok(Some(found));
+        }
+    }
+}
+
+/// An assistant event of `session`: `Ok(true)` for ready, `Ok(false)` for finished, `Err` with
+/// the message for error. `None` for other events.
+fn voice_event(event: &Value, session: u32) -> Option<Result<bool, String>> {
+    if event["session_id"] != session {
+        return None;
+    }
+    match event["type"].as_str()? {
+        "ready" => Some(Ok(true)),
+        "finished" => Some(Ok(false)),
+        "error" => {
+            let message = event["data"]["message"].as_str().unwrap_or_default();
+            Some(Err(message.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// A WAV file with 16 kHz mono signed 16 bit PCM.
+fn wav_file(pcm: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&len.saturating_add(36).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16_u32.to_le_bytes());
+    // PCM, 1 channel, 16 kHz, 32000 bytes per second, 2 bytes per sample, 16 bit.
+    w.extend_from_slice(&1_u16.to_le_bytes());
+    w.extend_from_slice(&1_u16.to_le_bytes());
+    w.extend_from_slice(&16_000_u32.to_le_bytes());
+    w.extend_from_slice(&32_000_u32.to_le_bytes());
+    w.extend_from_slice(&2_u16.to_le_bytes());
+    w.extend_from_slice(&16_u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&len.to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
 }
 
 // ---------------------------------------------------------------- reconfiguration
@@ -1834,10 +3424,33 @@ pub async fn driver_restart(ctx: &mut Ctx) -> Check {
         );
         format!("{after} apps from the cache")
     };
-    if ctx.oracle.is_some() {
-        verify(ctx, 10).await?;
+    let mut fresh = "";
+    if ctx.oracle.is_some()
+        && let Err(e) = verify(ctx, 10).await
+    {
+        // The second connection can keep an old paused item that a new connection does not
+        // get. Compare once more with a new second connection.
+        let old_item = mismatches(ctx).await.is_ok_and(|diff| {
+            !diff.is_empty()
+                && diff
+                    .iter()
+                    .all(|d| d.starts_with("source ") || d.starts_with("media_title "))
+        }) && ctx
+            .oracle
+            .as_ref()
+            .is_some_and(|o| o.playback_state() != Some(PlaybackState::Playing));
+        if !old_item {
+            return Err(e);
+        }
+        reconnect_oracle(ctx)
+            .await
+            .map_err(|r| Fail::new(format!("{}; second connection not open again: {r}", e.msg)))?;
+        verify(ctx, 10)
+            .await
+            .map_err(|e| Fail::new(format!("{} (with a new second connection)", e.msg)))?;
+        fresh = ", second connection opened again: it had an old item";
     }
-    Ok(format!("state {state} after {took} ms, {apps}"))
+    Ok(format!("state {state} after {took} ms, {apps}{fresh}"))
 }
 
 pub async fn config_file(ctx: &mut Ctx) -> Check {
@@ -1911,6 +3524,63 @@ fn bad_files(ctx: &Ctx) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Close the second connection and open a new one, then wait 3 s for its state.
+async fn reconnect_oracle(ctx: &mut Ctx) -> Result<(), Fail> {
+    let address = ctx.opt.address.ok_or_else(|| Fail::new("no address"))?;
+    if let Some(old) = ctx.oracle.take() {
+        old.close().await;
+    }
+    ctx.oracle = Some(Oracle::connect(address, &ctx.opt.credentials).await?);
+    // Time for the new connection to get the state of the Apple TV, like in `states`.
+    ctx.client.listen(3).await
+}
+
+/// Driver log lines when the connection to the Apple TV closes.
+const CLOSED: [&str; 3] = ["connection closed", "Companion closed", "Mrp closed"];
+
+/// The owner restarts the Apple TV. The driver must connect again. Only with `--only`.
+pub async fn atv_restart(ctx: &mut Ctx) -> Check {
+    turn_on(ctx).await?;
+    let mark = ctx.driver.log_len();
+    let text = "Restart the Apple TV: Settings > System > Restart.";
+    if ask(ctx, Ask::Action("the restart started", SKIP_CHECK), text).await? != Answer::Done {
+        return Err(Fail::skip("no restart"));
+    }
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(300);
+    let closed_at = |log: &str| CLOSED.iter().filter_map(|p| log.find(p)).min();
+    while closed_at(&ctx.driver.log_since(mark)).is_none() {
+        ensure!(Instant::now() < deadline, "no closed line in 300 s");
+        ctx.client.listen_ms(200).await?;
+    }
+    let closed_ms = start.elapsed().as_millis();
+    let joined_ms = loop {
+        // Only a connect after the closed line counts.
+        let log = ctx.driver.log_since(mark);
+        if closed_at(&log).is_some_and(|at| joined(&log[at..])) {
+            break start.elapsed().as_millis();
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "closed after {closed_ms} ms, no full connect in 300 s"
+        );
+        ctx.client.listen_ms(200).await?;
+    };
+    ctx.client.refresh_states().await?;
+    let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+    let state = wait_available(ctx, left.max(10)).await?;
+    let available = start.elapsed().as_millis();
+    // The second connection closed with the restart.
+    let oracle = match reconnect_oracle(ctx).await {
+        Ok(()) => "",
+        Err(_) => ", second connection not open again",
+    };
+    Ok(format!(
+        "closed after {closed_ms} ms, connected after {joined_ms} ms, {state} after \
+         {available} ms{oracle}"
+    ))
+}
+
 // ---------------------------------------------------------------- end
 
 pub async fn restore_power(ctx: &mut Ctx) -> Check {
@@ -1970,4 +3640,148 @@ pub async fn log(ctx: &mut Ctx) -> Check {
         warnings.len(),
         ctx.driver.log.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_messages() {
+        let begin = [
+            0x0a, 0x0d, 0x08, 0x07, 0x12, 0x09, 0x08, 0x01, 0x10, 0x80, 0x7d, 0x18, 0x02, 0x20,
+            0x01,
+        ];
+        assert_eq!(begin.as_slice(), voice_message(&Voice::Begin, 7));
+        assert_eq!(
+            [0x12, 0x06, 0x08, 0x07, 0x12, 0x02, 0x01, 0x02].as_slice(),
+            voice_message(&Voice::Data(&[1, 2]), 7)
+        );
+        assert_eq!(
+            [0x1a, 0x02, 0x08, 0x07].as_slice(),
+            voice_message(&Voice::End, 7)
+        );
+        // A session id of more than 7 bits needs two bytes.
+        assert_eq!(
+            [0x1a, 0x03, 0x08, 0xe7, 0x24].as_slice(),
+            voice_message(&Voice::End, 4711)
+        );
+    }
+
+    /// A WAV file with a `JUNK` chunk of odd size before `fmt `, like `say` writes one.
+    fn wav(channels: u16, rate: u32, data: &[u8]) -> Vec<u8> {
+        let mut w = b"RIFF\0\0\0\0WAVE".to_vec();
+        w.extend_from_slice(b"JUNK\x03\0\0\0abc\0");
+        w.extend_from_slice(b"fmt \x10\0\0\0");
+        w.extend_from_slice(&1_u16.to_le_bytes());
+        w.extend_from_slice(&channels.to_le_bytes());
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * 2).to_le_bytes());
+        w.extend_from_slice(&2_u16.to_le_bytes());
+        w.extend_from_slice(&16_u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        w.extend_from_slice(data);
+        w
+    }
+
+    #[test]
+    fn wav_round_trip() {
+        let pcm = [1, 2, 3, 4, 5, 6];
+        assert_eq!(
+            Ok(pcm.to_vec()),
+            wav_pcm(&wav_file(&pcm)).map_err(|e| e.msg)
+        );
+    }
+
+    #[test]
+    fn quiet_trimmed() {
+        let pcm = |s: &[i16]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let block = |v: i16| vec![v; QUIET_BLOCK];
+        let blocks = |v: i16, n: usize| vec![v; n * QUIET_BLOCK];
+        // Room noise up to 450, below 1/16 of the peak: quiet.
+        let mut samples = [blocks(300, 5), block(-450)].concat();
+        let lead = samples.len();
+        // Speech of 4 loud blocks, one with quiet samples inside.
+        samples.extend([block(9000), block(-3000), block(10), block(i16::MIN)].concat());
+        samples[lead + 2 * QUIET_BLOCK] = 5000;
+        let speech_end = samples.len();
+        // A quiet tail, a click over a block border, then quiet again.
+        samples.extend(blocks(-400, 50));
+        let click = samples.len() - QUIET_BLOCK / 2;
+        samples.extend(blocks(0, 3));
+        samples[click..click + QUIET_BLOCK].fill(20_000);
+        let audio = pcm(&samples);
+        assert_eq!(trim_quiet(&audio), &audio[lead * 2..speech_end * 2]);
+        // 2 loud blocks are not speech.
+        assert!(trim_quiet(&pcm(&blocks(3000, 2))).is_empty());
+        assert!(trim_quiet(&pcm(&[1, -2, 499])).is_empty());
+        assert!(trim_quiet(&[]).is_empty());
+    }
+
+    #[test]
+    fn wav_samples() {
+        assert_eq!(
+            Ok(vec![1, 2, 3, 4]),
+            wav_pcm(&wav(1, 16_000, &[1, 2, 3, 4])).map_err(|e| e.msg)
+        );
+        assert!(wav_pcm(&wav(2, 16_000, &[1, 2])).is_err(), "stereo");
+        assert!(wav_pcm(&wav(1, 44_100, &[1, 2])).is_err(), "other rate");
+        assert!(wav_pcm(b"RIFF").is_err(), "short");
+        let mut cut = wav(1, 16_000, &[1, 2, 3, 4]);
+        cut.truncate(cut.len() - 1);
+        assert!(wav_pcm(&cut).is_err(), "cut data");
+    }
+
+    /// Header as `afconvert -f WAVE -d LEI16@16000 -c 1` writes it: extensible format, FLLR chunk.
+    fn extensible_wav(sub_format: u16, data: &[u8]) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        for v in [0xFFFE_u16, 1] {
+            fmt.extend_from_slice(&v.to_le_bytes());
+        }
+        fmt.extend_from_slice(&16_000_u32.to_le_bytes());
+        fmt.extend_from_slice(&32_000_u32.to_le_bytes());
+        for v in [2_u16, 16, 22, 16] {
+            fmt.extend_from_slice(&v.to_le_bytes());
+        }
+        fmt.extend_from_slice(&4_u32.to_le_bytes());
+        fmt.extend_from_slice(&sub_format.to_le_bytes());
+        fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+        let mut w = b"RIFF\0\0\0\0WAVE".to_vec();
+        for (id, body) in [
+            (b"fmt ", fmt),
+            (b"FLLR", vec![0; 6]),
+            (b"data", data.to_vec()),
+        ] {
+            w.extend_from_slice(id);
+            w.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+            w.extend_from_slice(&body);
+        }
+        w
+    }
+
+    #[test]
+    fn wav_extensible() {
+        assert_eq!(
+            Ok(vec![1, 2, 3, 4]),
+            wav_pcm(&extensible_wav(1, &[1, 2, 3, 4])).map_err(|e| e.msg)
+        );
+        assert!(
+            wav_pcm(&extensible_wav(3, &[1, 2, 3, 4])).is_err(),
+            "float sub format"
+        );
+        // `wav` has a 12-byte JUNK chunk, so the format tag is at 32.
+        let mut short = wav(1, 16_000, &[1, 2]);
+        short[32..34].copy_from_slice(&0xFFFE_u16.to_le_bytes());
+        assert!(wav_pcm(&short).is_err(), "extensible without sub format");
+    }
+
+    #[test]
+    fn full_connect_lines() {
+        assert!(joined("INFO x] [ATV] connected in 812 ms (mDNS)"));
+        assert!(joined("INFO x] [ATV] MRP connected in 1200 ms"));
+        assert!(!joined(
+            "INFO x] [ATV] Companion connected in 300 ms (mDNS), MRP next"
+        ));
+    }
 }

@@ -175,7 +175,8 @@ pub struct Snapshot {
     pub up_next: Vec<QueueItem>,
     /// Rates as the app lists them, to find changes.
     pub rates: Vec<f32>,
-    /// Playback speeds for the select, from [`NowPlaying::playback_speeds`].
+    /// Playback speeds for the select, from [`NowPlaying::playback_speeds`]. Empty when the app
+    /// has [`Command::ChangePlaybackRate`] off, because ratv sends no rate then.
     pub supported_rates: Vec<f32>,
     /// Commands the app supports. Empty if nothing plays.
     pub commands: Vec<Command>,
@@ -314,16 +315,8 @@ impl Snapshot {
         );
         update!(d, Dirty::CHAPTERS, self.chapters, np.chapters);
         update!(d, Dirty::QUEUE, self.up_next, np.up_next);
-        // `playback_speeds` allocates, so call it only when the rates change.
-        if self.rates != np.supported_rates {
-            self.rates.clone_from(&np.supported_rates);
-            let speeds = np.playback_speeds();
-            if self.supported_rates != speeds {
-                self.supported_rates = speeds;
-                d |= Dirty::RATES;
-            }
-        }
-        // Used only for commands.
+        d |= self.update_rates(np);
+        // Used for commands and for the rate command above.
         if self.commands != np.commands {
             self.commands.clone_from(&np.commands);
         }
@@ -337,6 +330,28 @@ impl Snapshot {
             return d | Dirty::ARTWORK;
         }
         d | artwork
+    }
+
+    /// The speeds of the select. Call it before `commands` is updated.
+    fn update_rates(&mut self, np: &NowPlaying) -> Dirty {
+        // `playback_speeds` allocates, so call it only when the rates change or the rate command
+        // turns on or off.
+        let rate_command = np.supports(Command::ChangePlaybackRate);
+        let rate_command_changed =
+            self.commands.contains(&Command::ChangePlaybackRate) != rate_command;
+        if self.rates != np.supported_rates || rate_command_changed {
+            self.rates.clone_from(&np.supported_rates);
+            let speeds = if rate_command {
+                np.playback_speeds()
+            } else {
+                Vec::new()
+            };
+            if self.supported_rates != speeds {
+                self.supported_rates = speeds;
+                return Dirty::RATES;
+            }
+        }
+        Dirty::NONE
     }
 
     /// Copy only the fields that Companion gives, while MRP connects. The other fields keep
@@ -436,8 +451,8 @@ impl Snapshot {
         d
     }
 
-    /// Clear the MRP fields that belong to the current item. App, shuffle, repeat, rates and
-    /// the artwork stay: the caller sets the artwork, duration, position and captions.
+    /// Clear the MRP fields that belong to the current item. App, shuffle, repeat and the artwork
+    /// stay: the caller sets the artwork, duration, position and captions.
     fn clear_item_fields(&mut self) -> Dirty {
         fn clear<T>(field: &mut Option<T>) -> bool {
             field.take().is_some()
@@ -477,7 +492,12 @@ impl Snapshot {
         if language {
             d |= Dirty::LANGUAGE;
         }
-        // Used only for commands.
+        // The speeds need the commands of the new item. The next MRP update builds them again.
+        self.rates.clear();
+        if !self.supported_rates.is_empty() {
+            self.supported_rates.clear();
+            d |= Dirty::RATES;
+        }
         self.commands.clear();
         self.skip_forward_interval = None;
         self.skip_backward_interval = None;
@@ -852,6 +872,38 @@ mod tests {
         let d = s.update_now_playing(&np);
         assert!(d.any(Dirty::PLAYBACK) && d.any(Dirty::POSITION));
         assert!(!d.any(Dirty::METADATA));
+    }
+
+    #[test]
+    fn speeds_only_with_rate_command() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.supported_rates = vec![0.5, 1.5, 2.0];
+        // The app lists speeds, but the rate command is off.
+        assert!(!s.update_now_playing(&np).any(Dirty::RATES));
+        assert_eq!(Vec::<f32>::new(), s.supported_rates);
+
+        np.commands = vec![Command::Play, Command::ChangePlaybackRate];
+        assert!(s.update_now_playing(&np).any(Dirty::RATES));
+        assert_eq!(vec![0.5, 1.0, 1.5, 2.0], s.supported_rates);
+        // Another command change keeps the speeds.
+        np.commands.push(Command::Pause);
+        assert!(!s.update_now_playing(&np).any(Dirty::RATES));
+        assert_eq!(4, s.supported_rates.len());
+
+        np.commands.retain(|c| *c != Command::ChangePlaybackRate);
+        assert!(s.update_now_playing(&np).any(Dirty::RATES));
+        assert_eq!(Vec::<f32>::new(), s.supported_rates);
+
+        // A new item from Companion hides the speeds until MRP sends its commands.
+        np.commands.push(Command::ChangePlaybackRate);
+        assert!(s.update_now_playing(&np).any(Dirty::RATES));
+        let mut companion = NowPlaying::default();
+        companion.title = Some("Next".into());
+        assert!(s.update_companion_now_playing(&companion).any(Dirty::RATES));
+        assert_eq!(Vec::<f32>::new(), s.supported_rates);
+        assert!(s.update_now_playing(&np).any(Dirty::RATES));
+        assert_eq!(4, s.supported_rates.len());
     }
 
     /// A position update is the most frequent update. It must not allocate.

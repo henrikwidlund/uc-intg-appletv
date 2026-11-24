@@ -20,6 +20,38 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 /// Client name shown on the Apple TV.
 const NAME: &str = "remote-sim";
 
+/// Content that a check needs on the Apple TV. The order is used only to not ask again after a
+/// decline: a check skips when the owner declined its content or an earlier variant.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Content {
+    /// Something that plays and has a title.
+    Playing,
+    /// A video with artwork.
+    Video,
+    /// A movie with chapters and more than one audio or subtitle language.
+    Movie,
+}
+
+impl Content {
+    /// What the owner opens when the content is missing.
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Movie => "a movie with chapters and more than one audio or subtitle language",
+            Self::Video => "a video with artwork",
+            Self::Playing => "a video",
+        }
+    }
+
+    /// Start of the request to open the content, after a text that says what is wrong.
+    pub const fn open(self) -> &'static str {
+        match self {
+            Self::Movie => "Open such a movie",
+            Self::Video => "Open such a video",
+            Self::Playing => "Open a video",
+        }
+    }
+}
+
 pub struct Oracle {
     tv: AppleTv,
     pub apps: Vec<App>,
@@ -80,7 +112,19 @@ impl Oracle {
         let ep = endpoints(address).await?;
         let mut options = ClientOptions::default();
         options.name = NAME.into();
-        let tv = AppleTv::connect(&ep, &credentials, &options).await?;
+        let tv = AppleTv::connect(&ep, &credentials, &options)
+            .await
+            .map_err(|e| {
+                if e.is_auth() {
+                    Fail::new(format!(
+                        "{e}. The pairing in {} is not valid anymore: run `remote-sim pair \
+                         <address>`",
+                        file.display()
+                    ))
+                } else {
+                    e.into()
+                }
+            })?;
         ensure_protocols(&tv)?;
         let apps = tv.apps().await?;
         Ok(Self { tv, apps })
@@ -110,6 +154,119 @@ impl Oracle {
     /// Playback rate, without a copy of now playing.
     pub fn rate(&self) -> Option<f32> {
         self.tv.now_playing().borrow().rate
+    }
+
+    /// Set the playback rate on the Apple TV, like the speed menu of the player.
+    pub async fn set_rate(&self, rate: f32) -> Result<(), ratv::Error> {
+        self.tv.set_playback_rate(rate).await
+    }
+
+    /// True if ratv sends `rate`: the app lists it and has the rate command enabled.
+    pub fn accepts_rate(&self, rate: f32) -> bool {
+        self.tv.now_playing().borrow().accepts_rate(rate)
+    }
+
+    /// Normal playback speeds that the app lists. Empty if the app lists no normal speed other
+    /// than 1.0.
+    pub fn playback_speeds(&self) -> Vec<f32> {
+        self.tv.now_playing().borrow().playback_speeds()
+    }
+
+    /// Send speech to Siri over this connection, not through the driver, like the `remote`
+    /// example of ratv: Companion if it is open, else MRP. One chunk of 100 ms every 100 ms.
+    /// Returns the protocol and the number of samples pushed to ratv (ratv may still hold up to
+    /// about 100 ms of it). Fewer than in `pcm` means that the Apple TV stopped recording first.
+    /// The error has `true` if Siri had started.
+    pub async fn ask_siri(
+        &self,
+        pcm: &[i16],
+    ) -> Result<(&'static str, usize), (ratv::Error, bool)> {
+        let mut siri = self.tv.start_siri().await.map_err(|e| (e, false))?;
+        let protocol = match siri {
+            ratv::Siri::Companion(_) => "Companion",
+            ratv::Siri::Mrp(_) => "MRP",
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut sent = 0;
+        for chunk in pcm.chunks(1600) {
+            tick.tick().await;
+            if siri.ended() {
+                break;
+            }
+            match siri.push_pcm(chunk).await {
+                // ratv keeps the audio and sends it with the next chunk.
+                Ok(()) | Err(ratv::Error::QueueFull) => {}
+                Err(e) => return Err((e, true)),
+            }
+            sent += chunk.len();
+        }
+        siri.finish().await.map_err(|e| (e, true))?;
+        Ok((protocol, sent))
+    }
+
+    /// True if Siri is on in the Apple TV settings. `None` if the Apple TV does not say.
+    pub fn siri_enabled(&self) -> Option<bool> {
+        self.tv.siri_enabled()
+    }
+
+    /// True if the MRP connection is open.
+    pub fn has_mrp(&self) -> bool {
+        self.tv.is_open(Protocol::Mrp)
+    }
+
+    /// What the current item lacks for `need`. `None` if it has all of it. Needs MRP.
+    pub fn missing(&self, need: Content) -> Option<String> {
+        if !self.tv.is_open(Protocol::Mrp) {
+            return Some("no MRP on the second connection".into());
+        }
+        let rx = self.tv.now_playing();
+        let np = rx.borrow();
+        let mut out = Vec::new();
+        let plays = matches!(
+            np.state,
+            Some(
+                PlaybackState::Playing
+                    | PlaybackState::Paused
+                    | PlaybackState::Interrupted
+                    | PlaybackState::Seeking
+            )
+        );
+        if !plays {
+            out.push("nothing plays");
+        }
+        let item = np.title.as_deref().is_some_and(|t| !t.is_empty());
+        if !item {
+            out.push("no title");
+        }
+        match need {
+            Content::Movie => {
+                if np.chapters.is_empty() && np.chapter_count.unwrap_or(0) <= 0 {
+                    out.push("no chapters");
+                }
+                // Auto is not a language.
+                let subtitles = np
+                    .subtitle_languages
+                    .iter()
+                    .filter(|o| !o.is_auto())
+                    .count();
+                if np.audio_languages.len() < 2 && subtitles < 2 {
+                    out.push("less than 2 audio and less than 2 subtitle languages");
+                }
+                if np.is_live == Some(true) {
+                    out.push("live content");
+                }
+            }
+            Content::Video => {
+                // The driver uses the artwork URL, the image data of Companion, or fetches the
+                // image over MRP, also without an id.
+                if np.artwork_id.is_none() && np.artwork_url.is_none() && np.artwork_data.is_none()
+                {
+                    out.push("no artwork");
+                }
+            }
+            Content::Playing => {}
+        }
+        (!out.is_empty()).then(|| out.join(", "))
     }
 
     /// True if now playing has an item: item metadata, an artwork id, an artwork URL or image
@@ -155,6 +312,43 @@ impl Oracle {
     /// the `is_live` sensor of the driver.
     pub fn is_live(&self) -> bool {
         self.tv.now_playing().borrow().is_live == Some(true)
+    }
+
+    /// What plays now, for example `'Downsizing' (TV)`. `None` if nothing plays.
+    pub fn now_text(&self) -> Option<String> {
+        let rx = self.tv.now_playing();
+        let np = rx.borrow();
+        let plays = matches!(
+            np.state,
+            Some(
+                PlaybackState::Playing
+                    | PlaybackState::Paused
+                    | PlaybackState::Interrupted
+                    | PlaybackState::Seeking
+            )
+        );
+        if !plays {
+            return None;
+        }
+        let title = match np.title.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => format!("'{t}'"),
+            None => "an item without a title".to_owned(),
+        };
+        Some(match np.app.as_deref().and_then(|b| self.app_name(b)) {
+            Some(app) => format!("{title} ({app})"),
+            None => title,
+        })
+    }
+
+    /// Name of the app that plays now, with the state Playing. A paused item can be an old
+    /// item of another app, for example Music after the TV app stopped. Without a copy.
+    pub fn active_app(&self) -> Option<&str> {
+        let rx = self.tv.now_playing();
+        let np = rx.borrow();
+        if np.state != Some(PlaybackState::Playing) {
+            return None;
+        }
+        self.app_name(np.app.as_deref()?)
     }
 
     /// Name of the app that plays, without a copy of now playing.

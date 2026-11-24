@@ -63,7 +63,8 @@ One pairing with one PIN covers all features.
 - Metadata, artwork and playback speeds depend on the app. Many apps send only some of them.
   For example, the Apple TV app sends genre and content rating, and season and episode for shows.
   The Music app sends the genre.
-- The playback speed select is empty when the app does not report speeds.
+- The playback speed select is empty when the app does not report speeds or does not allow a speed
+  change.
 - Fast-forward and rewind depend on the app. In Disney+ they skip forward and back instead.
   HBO Max and Netflix do not support them. Skip works in all three.
 
@@ -170,7 +171,7 @@ not have yet, with a real Apple TV and Remote, one step at a time.
 It saves the results to `manual-test-results-<time>.md`.
 
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,
-connects to it like a Remote and runs the checks that need no person. It uses the driver pairing
+connects to it like a Remote and runs the checks. It uses the driver pairing
 in `config.json`. `pair-driver` makes this file: it runs the setup of the driver and asks for the
 PIN. An old file is kept as `config.json.old-<time>`. A second connection with its own pairing
 reads the values of the Apple TV to compare them with the driver. `pair` pairs it. Each pairing
@@ -184,14 +185,38 @@ tools/remote-sim/target/debug/remote-sim pair 192.168.1.20
 tools/remote-sim/target/debug/remote-sim 192.168.1.20
 ```
 
-Start a video with chapters and more than one audio language before the run to also test
-playback and languages. `--only a,b` and `--skip a,b` choose the checks; both can be given more
-than once. `--only` also runs `setup`, `entities` and `states`, because the other checks need
-them, and `restore_power` and `log` at the end, unless `--skip` names them. Unknown step names
-are refused. If `setup`, `entities` or `states` fails, only `restore_power` and `log` run after
-it. With `--skip setup`, `entities` fails, because the driver has no device. `--no-power` keeps
-the Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to
-the driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`.
+Start a movie with chapters and more than one audio or subtitle language in the Apple TV app
+before the run. The checks also test commands, artwork and Siri right after a wake from standby,
+Home while an app plays, and playback speeds set on the Apple TV. Some checks ask on the
+terminal: to start the right video when it is missing, to choose a speed on the TV when tvOS
+does not take it from the second connection, and whether Siri answered. The prompt says what
+each key does. Without a terminal the checks do not ask. On a terminal, remote-sim reads it from
+the start, so lines typed before a prompt are dropped. A run in the background with a terminal
+stdin stops; use `< /dev/null` there. The results file has the questions and the answers. The
+time of a step includes the time you need to answer. The Siri checks use the macOS `say`
+command, or a recorded file with `--siri-audio <file>` in any format that `afconvert` reads. To
+record "What time is it", use Voice Memos on the Mac or QuickTime Player > New Audio Recording,
+then share or export the file. The file holds your voice: keep it out of git. Siri answers some
+seconds after the audio. Closing the Apple TV connection earlier loses the answer, so the Siri
+checks keep the connections open until you answer, or for 20 s without a terminal. Then they
+close the answer with Back. Do not close it with Apple's Siri Remote during a run. If the TV
+stays dimmed after a Siri check, press Siri on a remote, then Back twice. The audio ends 300 ms
+after the speech. `--siri-hold` sends 1500 ms of silence instead, like a user who holds the
+button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri overlay on the
+Apple TV, which blocks navigation until Siri and then Back twice are pressed. It is
+for testing that. `siri_wake` tests Siri at wake in the _Auto_ mode: Siri over MRP
+does not work on tvOS 27 and later. `siri_direct` sends the same audio to Siri through ratv
+directly, without the driver, to compare with Siri through the driver. `atv_restart` asks you to
+restart the Apple TV and measures the reconnect; it runs only with `--only atv_restart`.
+
+`--only a,b` and `--skip a,b` choose the checks; both can be given more than once. `--only` also
+runs `setup`, `entities` and `states`, because the other checks need them, and `restore_power`
+and `log` at the end, unless `--skip` names them. Unknown step names are refused. If `setup`,
+`entities` or `states` fails, only `restore_power` and `log` run after it. With `--skip setup`,
+`entities` fails, because the driver has no device. `--no-power` keeps the Apple TV on. The
+results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to the driver log
+filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read debug lines
+of the driver, so a `RUST_LOG` must keep `uc_intg_appletv=debug`.
 
 CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks
 against an Apple TV.

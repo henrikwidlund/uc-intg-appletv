@@ -27,6 +27,10 @@ pub struct Client {
     attrs: HashMap<String, Map<String, Value>>,
     /// Setup events that were not read yet.
     setup: VecDeque<Value>,
+    /// `assistant_event` data that was not read yet.
+    assistant: VecDeque<Value>,
+    /// Entities that had the state `UNAVAILABLE` in an `entity_change` event.
+    unavailable: Vec<String>,
 }
 
 impl Client {
@@ -39,6 +43,8 @@ impl Client {
             next_id: 0,
             attrs: HashMap::new(),
             setup: VecDeque::new(),
+            assistant: VecDeque::new(),
+            unavailable: Vec::new(),
         };
         // The driver sends the authentication answer at once.
         client
@@ -79,6 +85,11 @@ impl Client {
                 if let (Some(id), Some(attrs)) =
                     (data["entity_id"].as_str(), data["attributes"].as_object())
                 {
+                    if attrs.get("state").and_then(Value::as_str) == Some("UNAVAILABLE")
+                        && !self.unavailable.iter().any(|u| u == id)
+                    {
+                        self.unavailable.push(id.to_owned());
+                    }
                     self.attrs
                         .entry(id.to_owned())
                         .or_default()
@@ -86,6 +97,7 @@ impl Client {
                 }
             }
             Some("driver_setup_change") => self.setup.push_back(data.clone()),
+            Some("assistant_event") => self.assistant.push_back(data.clone()),
             _ => {}
         }
     }
@@ -93,6 +105,42 @@ impl Client {
     pub async fn send(&mut self, value: Value) -> Result<(), Fail> {
         self.sink.send(Message::text(value.to_string())).await?;
         Ok(())
+    }
+
+    pub async fn send_binary(&mut self, data: Vec<u8>) -> Result<(), Fail> {
+        self.sink.send(Message::binary(data)).await?;
+        Ok(())
+    }
+
+    /// Forget the `assistant_event` events that were not read yet and the entities seen as
+    /// `UNAVAILABLE`.
+    pub fn clear_events(&mut self) {
+        self.assistant.clear();
+        self.unavailable.clear();
+    }
+
+    /// True if an `entity_change` event since [`Self::clear_events`] made `entity` unavailable.
+    pub fn was_unavailable(&self, entity: &str) -> bool {
+        self.unavailable.iter().any(|u| u == entity)
+    }
+
+    /// The next `assistant_event` data that was already read, without a wait.
+    pub fn pop_assistant(&mut self) -> Option<Value> {
+        self.assistant.pop_front()
+    }
+
+    /// The next `assistant_event` data, or `None` after `secs`.
+    pub async fn next_assistant(&mut self, secs: u64) -> Result<Option<Value>, Fail> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(event) = self.assistant.pop_front() {
+                return Ok(Some(event));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            self.pump(deadline).await?;
+        }
     }
 
     /// Send a request and wait for the response.

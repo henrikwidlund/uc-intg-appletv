@@ -92,8 +92,9 @@ impl From<ratv::Error> for ServiceError {
             ratv::Error::Timeout | ratv::Error::NoAnswer(_) | ratv::Error::SendTimeout(_) => {
                 Self::Timeout
             }
-            ratv::Error::InvalidArgument(a) => Self::BadRequest(a.into()),
-            ratv::Error::NoTextField | ratv::Error::NoChapter => Self::BadRequest(e.to_string()),
+            ratv::Error::InvalidArgument(_) | ratv::Error::NoTextField | ratv::Error::NoChapter => {
+                Self::BadRequest(e.to_string())
+            }
             // Refusals, or no volume control on the device. Mapped to `NotSupported`, which is
             // logged at info.
             ratv::Error::VolumeNotAvailable => {
@@ -168,6 +169,14 @@ mod tests {
         assert_eq!(
             ServiceError::Timeout,
             ServiceError::from_device_mailbox(MailboxError::Timeout)
+        );
+    }
+
+    #[test]
+    fn invalid_argument_text() {
+        assert_eq!(
+            ServiceError::BadRequest("invalid rate".into()),
+            ratv::Error::InvalidArgument("rate").into()
         );
     }
 
