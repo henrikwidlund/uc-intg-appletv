@@ -15,8 +15,7 @@
 //! - `remote-sim pair-driver <address>`: pair the driver through its setup flow and save its
 //!   `config.json` as `--config`. An old file is kept as `<config>.old-<unix time>`.
 //! - `remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-audio <file>]
-//!   [--siri-hold]`
+//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-hold]`
 //!
 //! `--siri-hold` sends 1500 ms of silence after the speech instead of 300 ms, like a user who
 //! holds the button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri
@@ -94,8 +93,7 @@ const USAGE: &str = "Usage:
   remote-sim pair <address> [--credentials <path>]
   remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--port <port>]
   remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-             [--only a,b] [--skip a,b] [--no-power] [--port <port>]
-             [--siri-audio <file>] [--siri-hold]";
+             [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-hold]";
 
 /// A failed or skipped check.
 pub struct Fail {
@@ -146,8 +144,6 @@ pub struct Options {
     pub only: Vec<String>,
     pub skip: Vec<String>,
     pub no_power: bool,
-    /// Recorded Siri question, in a format that `afconvert` reads. Else `say` makes it.
-    pub siri_audio: Option<PathBuf>,
     /// 1500 ms of silence after the speech instead of 300 ms. On tvOS 27.2.1 this leaves the
     /// dimmed Siri overlay on the Apple TV, which blocks navigation until Siri and then Back
     /// twice are pressed. It is for testing that.
@@ -267,7 +263,6 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Options, String> {
         only: Vec::new(),
         skip: Vec::new(),
         no_power: false,
-        siri_audio: None,
         siri_hold: false,
         port: 19190,
     };
@@ -290,9 +285,6 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--skip" => opt.skip.extend(step_list("--skip", args.next())?),
             "--no-power" => opt.no_power = true,
             "--siri-hold" => opt.siri_hold = true,
-            "--siri-audio" => {
-                opt.siri_audio = Some(args.next().ok_or("--siri-audio needs a file")?.into());
-            }
             "--port" => {
                 opt.port = args
                     .next()
@@ -577,15 +569,9 @@ mod tests {
     }
 
     #[test]
-    fn siri_audio_option() {
-        let opt = parse_from(args("10.0.0.1 --siri-audio question.m4a")).unwrap();
-        assert_eq!(opt.siri_audio, Some(PathBuf::from("question.m4a")));
-        assert!(!opt.siri_hold);
-        let opt = parse_from(args("10.0.0.1")).unwrap();
-        assert_eq!(opt.siri_audio, None);
-        assert!(!opt.siri_hold);
+    fn siri_hold_option() {
+        assert!(!parse_from(args("10.0.0.1")).unwrap().siri_hold);
         assert!(parse_from(args("10.0.0.1 --siri-hold")).unwrap().siri_hold);
-        assert!(parse_from(args("10.0.0.1 --siri-audio")).is_err());
     }
 
     #[test]

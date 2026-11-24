@@ -193,21 +193,19 @@ does not take it from the second connection, and whether Siri answered. The prom
 each key does. Without a terminal the checks do not ask. On a terminal, remote-sim reads it from
 the start, so lines typed before a prompt are dropped. A run in the background with a terminal
 stdin stops; use `< /dev/null` there. The results file has the questions and the answers. The
-time of a step includes the time you need to answer. The Siri checks use the macOS `say`
-command, or a recorded file with `--siri-audio <file>` in any format that `afconvert` reads. To
-record "What time is it", use Voice Memos on the Mac or QuickTime Player > New Audio Recording,
-then share or export the file. The file holds your voice: keep it out of git. Siri answers some
-seconds after the audio. Closing the Apple TV connection earlier loses the answer, so the Siri
-checks keep the connections open until you answer, or for 20 s without a terminal. Then they
-close the answer with Back. Do not close it with Apple's Siri Remote during a run. If the TV
-stays dimmed after a Siri check, press Siri on a remote, then Back twice. The audio ends 300 ms
-after the speech. `--siri-hold` sends 1500 ms of silence instead, like a user who holds the
-button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri overlay on the
-Apple TV, which blocks navigation until Siri and then Back twice are pressed. It is
-for testing that. `siri_wake` tests Siri at wake in the _Auto_ mode: Siri over MRP
-does not work on tvOS 27 and later. `siri_direct` sends the same audio to Siri through ratv
-directly, without the driver, to compare with Siri through the driver. `atv_restart` asks you to
-restart the Apple TV and measures the reconnect; it runs only with `--only atv_restart`.
+time of a step includes the time you need to answer. The Siri checks use the macOS `say` command
+to speak "What time is it". Siri answers some seconds after the audio. Closing the Apple TV
+connection earlier loses the answer, so the Siri checks keep the connections open until you
+answer, or for 20 s without a terminal. Then they close the answer with Back. Do not close it
+with Apple's Siri Remote during a run. If the TV stays dimmed after a Siri check, press Siri on
+a remote, then Back twice. The audio ends 300 ms after the speech. `--siri-hold` sends 1500 ms
+of silence instead, like a user who holds the button past the end of listening. On tvOS 27.2.1
+this leaves the dimmed Siri overlay on the Apple TV, which blocks navigation until Siri and then
+Back twice are pressed. It is for testing that. `siri_wake` tests Siri at wake in the _Auto_
+mode: Siri over MRP does not work on tvOS 27 and later. `siri_direct` sends the same audio to
+Siri through ratv directly, without the driver, to compare with Siri through the driver.
+`atv_restart` asks you to restart the Apple TV and measures the reconnect; it runs only with
+`--only atv_restart`.
 
 `--only a,b` and `--skip a,b` choose the checks; both can be given more than once. `--only` also
 runs `setup`, `entities` and `states`, because the other checks need them, and `restore_power`

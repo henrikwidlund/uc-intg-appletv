@@ -19,7 +19,7 @@ dhat-heap = ["dep:dhat"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "9eb8ddd1c96a9472bede21f684c43643021bcc19", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "f63f0cfb60f6b3f45004b4b4a53f59ce5525df6e", features = ["opus"] }
 
 # WebSocket server
 actix = "0.13"

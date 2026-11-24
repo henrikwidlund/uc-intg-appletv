@@ -2535,8 +2535,6 @@ const SIRI_ANSWER_MS: u64 = 20_000;
 const VOICE_CHUNK: usize = 2048;
 /// Bytes of 1 ms of 16 kHz mono 16 bit audio.
 const BYTES_PER_MS: usize = 32;
-/// Silence before the speech, like a person who starts to speak after the key press.
-const SILENCE_BEFORE_MS: usize = 500;
 /// Silence after the speech, so the end of the speech is not cut. Short, so the audio ends
 /// before the Apple TV ends the recording: on tvOS 27.2.1, when the TV ends it first, the
 /// dimmed Siri overlay stays on the TV and blocks navigation until Siri and then Back twice are
@@ -2552,8 +2550,8 @@ const QUIET_BLOCK: usize = 320;
 /// Loud blocks in a row that count as speech: 60 ms.
 const SPEECH_BLOCKS: usize = 3;
 
-/// Speech of `text` as 16 kHz mono signed 16 bit PCM, made with macOS `say`. `None` without
-/// `say`.
+/// Speech of `text` as 16 kHz mono signed 16 bit PCM, made with macOS `say`, without the quiet
+/// start and end, with `after_ms` of silence after it, see [`padded`]. `None` without `say`.
 async fn speech(
     dir: &std::path::Path,
     text: &str,
@@ -2576,35 +2574,8 @@ async fn speech(
     Ok(Some(padded(&tokio::fs::read(&file).await?, after_ms)?))
 }
 
-/// The samples of a recorded file, converted by `afconvert` to `dir/siri.wav`.
-async fn recording(
-    dir: &std::path::Path,
-    input: &std::path::Path,
-    after_ms: usize,
-) -> Result<Vec<u8>, Fail> {
-    ensure!(input.is_file(), "no Siri audio file {}", input.display());
-    let file = dir.join("siri.wav");
-    let out = tokio::process::Command::new("afconvert")
-        .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
-        .arg(input)
-        .arg(&file)
-        .output()
-        .await
-        .map_err(|e| Fail::new(format!("afconvert: {e}")))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let err = err.trim();
-        return Err(Fail::new(format!(
-            "afconvert {}: {}",
-            out.status,
-            if err.is_empty() { "no error text" } else { err }
-        )));
-    }
-    padded(&tokio::fs::read(&file).await?, after_ms)
-}
-
-/// The samples of a WAV file without the quiet start and end, with [`SILENCE_BEFORE_MS`] of silence
-/// before and `after_ms` after them.
+/// The samples of a WAV file without the quiet start and end, with `after_ms` of silence after
+/// them.
 fn padded(wav: &[u8], after_ms: usize) -> Result<Vec<u8>, Fail> {
     let speech = wav_pcm(wav)?;
     let speech = trim_quiet(&speech);
@@ -2613,8 +2584,7 @@ fn padded(wav: &[u8], after_ms: usize) -> Result<Vec<u8>, Fail> {
         "no speech in the audio: silent or too quiet"
     );
     // Zero samples are silence.
-    let mut pcm = Vec::with_capacity((SILENCE_BEFORE_MS + after_ms) * BYTES_PER_MS + speech.len());
-    pcm.resize(SILENCE_BEFORE_MS * BYTES_PER_MS, 0);
+    let mut pcm = Vec::with_capacity(speech.len() + after_ms * BYTES_PER_MS);
     pcm.extend_from_slice(speech);
     pcm.resize(pcm.len() + after_ms * BYTES_PER_MS, 0);
     Ok(pcm)
@@ -2672,13 +2642,8 @@ fn wav_pcm(wav: &[u8]) -> Result<Vec<u8>, Fail> {
                 ensure!(data.len() >= 16, "short WAV format");
                 let u16_at = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]);
                 let rate = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                // PCM, or extensible (0xFFFE) with a PCM sub format; 1 channel, 16 kHz, 16 bit.
-                let pcm = match u16_at(0) {
-                    1 => true,
-                    0xFFFE => data.len() >= 26 && u16_at(24) == 1,
-                    _ => false,
-                };
-                format_ok = pcm && u16_at(2) == 1 && rate == 16_000 && u16_at(14) == 16;
+                // PCM, 1 channel, 16 kHz, 16 bit.
+                format_ok = u16_at(0) == 1 && u16_at(2) == 1 && rate == 16_000 && u16_at(14) == 16;
             }
             b"data" => {
                 ensure!(format_ok, "WAV is not 16 kHz mono 16 bit PCM");
@@ -2775,10 +2740,10 @@ async fn set_siri_mode(ctx: &mut Ctx, mode: &str) -> Result<(String, Result<(), 
     Ok((old, done))
 }
 
-/// The speech for the Siri checks, made once: from `--siri-audio` with `afconvert`, else with
-/// `say`. The quiet start and end are cut, then [`SILENCE_AFTER_MS`] of silence follows, or
-/// [`SILENCE_HOLD_MS`] with `--siri-hold`. Skips without `say`.
-async fn siri_audio(ctx: &mut Ctx) -> Result<Vec<u8>, Fail> {
+/// The speech for the Siri checks, made once with `say`. The quiet start and end are cut, then
+/// [`SILENCE_AFTER_MS`] of silence follows, or [`SILENCE_HOLD_MS`] with `--siri-hold`. Skips
+/// without `say`.
+async fn siri_speech(ctx: &mut Ctx) -> Result<Vec<u8>, Fail> {
     if let Some(pcm) = &ctx.siri_pcm {
         return Ok(pcm.clone());
     }
@@ -2787,11 +2752,7 @@ async fn siri_audio(ctx: &mut Ctx) -> Result<Vec<u8>, Fail> {
     } else {
         SILENCE_AFTER_MS
     };
-    let pcm = if let Some(input) = &ctx.opt.siri_audio {
-        recording(&ctx.driver.dir, input, after_ms).await?
-    } else if let Some(pcm) = speech(&ctx.driver.dir, SIRI_TEXT, after_ms).await? {
-        pcm
-    } else {
+    let Some(pcm) = speech(&ctx.driver.dir, SIRI_TEXT, after_ms).await? else {
         return Err(Fail::skip("no `say` command to make the speech"));
     };
     ctx.siri_pcm = Some(pcm.clone());
@@ -2800,25 +2761,17 @@ async fn siri_audio(ctx: &mut Ctx) -> Result<Vec<u8>, Fail> {
 
 /// Which audio the Siri checks send.
 fn voice_note(ctx: &Ctx) -> String {
-    let voice = match ctx
-        .opt
-        .siri_audio
-        .as_deref()
-        .and_then(std::path::Path::file_name)
-    {
-        Some(name) => format!("real voice from {}", name.to_string_lossy()),
-        None => "`say` voice".into(),
-    };
     let (after_ms, hold, flag) = if ctx.opt.siri_hold {
         (SILENCE_HOLD_MS, "held ", " (--siri-hold)")
     } else {
         (SILENCE_AFTER_MS, "", "")
     };
     // The speech is the audio without the added silence.
-    let speech = ctx.siri_pcm.as_ref().map_or(0, |pcm| {
-        (pcm.len() / BYTES_PER_MS).saturating_sub(SILENCE_BEFORE_MS + after_ms)
-    });
-    format!("{voice}, {speech} ms of speech, {hold}{after_ms} ms after the speech{flag}")
+    let speech = ctx
+        .siri_pcm
+        .as_ref()
+        .map_or(0, |pcm| (pcm.len() / BYTES_PER_MS).saturating_sub(after_ms));
+    format!("`say` voice, {speech} ms of speech, {hold}{after_ms} ms after the speech{flag}")
 }
 
 /// The Siri question to the owner. PASS on yes, FAIL on no, else SKIP. `note` starts each
@@ -2827,18 +2780,7 @@ fn voice_note(ctx: &Ctx) -> String {
 /// terminal or input it waits until [`SIRI_ANSWER_MS`] after `audio_end` instead. Then it
 /// closes the answer with [`close_siri`].
 async fn siri_answer(ctx: &mut Ctx, note: &str, audio_end: Instant) -> Check {
-    let question = match ctx
-        .opt
-        .siri_audio
-        .as_deref()
-        .and_then(std::path::Path::file_name)
-    {
-        Some(name) => format!(
-            "Did Siri answer the question in {}?",
-            name.to_string_lossy()
-        ),
-        None => format!("Did Siri answer '{SIRI_TEXT}' and show the time?"),
-    };
+    let question = format!("Did Siri answer '{SIRI_TEXT}' and show the time?");
     let hint = Some("Siri can take up to 20 s to answer.");
     // A WebSocket error in a wait is a FAIL, not hidden behind the SKIP.
     let mut lost = None;
@@ -2881,7 +2823,7 @@ async fn close_siri(ctx: &mut Ctx) -> String {
     note
 }
 
-/// Siri with the audio of `siri_wake` (speech and silence of [`siri_audio`]), sent over the
+/// Siri with the audio of `siri_wake` (speech and silence of [`siri_speech`]), sent over the
 /// second connection with ratv, without the driver. It shows whether Siri works with ratv
 /// directly, to compare with `siri_wake`.
 pub async fn siri_direct(ctx: &mut Ctx) -> Check {
@@ -2889,7 +2831,7 @@ pub async fn siri_direct(ctx: &mut Ctx) -> Check {
     if ctx.oracle.as_ref().and_then(Oracle::siri_enabled) == Some(false) {
         return Err(Fail::skip("Siri is off on the Apple TV"));
     }
-    let pcm = siri_audio(ctx).await?;
+    let pcm = siri_speech(ctx).await?;
     let samples: Vec<i16> = pcm
         .as_chunks::<2>()
         .0
@@ -2959,13 +2901,13 @@ fn siri_mode(ctx: &Ctx) -> String {
 }
 
 /// Siri right after `exit_standby` in the Auto mode (Companion on tvOS 27), with the speech and
-/// silence of [`siri_audio`]. MRP Siri does not work on tvOS 27 and later, so the check does not
+/// silence of [`siri_speech`]. MRP Siri does not work on tvOS 27 and later, so the check does not
 /// use it.
 pub async fn siri_wake(ctx: &mut Ctx) -> Check {
     if ctx.oracle.as_ref().and_then(Oracle::siri_enabled) == Some(false) {
         return Err(Fail::skip("Siri is off on the Apple TV"));
     }
-    let pcm = siri_audio(ctx).await?;
+    let pcm = siri_speech(ctx).await?;
     // Already Auto: the setup is not touched.
     if siri_mode(ctx) == "auto" {
         return siri_session(ctx, &pcm).await;
@@ -3067,17 +3009,8 @@ async fn siri_session(ctx: &mut Ctx, pcm: &[u8]) -> Check {
     } else {
         format!("all {} ms of audio sent", audio_ms(pcm.len()))
     };
-    // The owner can listen to the audio that was sent.
-    let wav = ctx.driver.dir.join("siri-sent.wav");
-    let written = tokio::fs::write(&wav, wav_file(&pcm[..sent]))
-        .await
-        .map_err(|e| Fail::new(format!("{}: {e}", wav.display())));
-    let wav_note = format!("{}, audio: afplay {}", voice_note(ctx), wav.display());
-    let checked = match written {
-        Ok(()) => siri_result(ctx, session, mark, ready, sent, early).await,
-        Err(e) => Err(e),
-    };
-    let result = match checked {
+    let voice = voice_note(ctx);
+    let result = match siri_result(ctx, session, mark, ready, sent, early).await {
         Ok(note) => {
             let note = format!("{note}, the automatic checks passed");
             siri_answer(ctx, &note, audio_end).await
@@ -3092,9 +3025,9 @@ async fn siri_session(ctx: &mut Ctx, pcm: &[u8]) -> Check {
         }
     };
     result
-        .map(|note| format!("{note}, {sent_note}, {wav_note}"))
+        .map(|note| format!("{note}, {sent_note}, {voice}"))
         .map_err(|e| Fail {
-            msg: format!("{}; {sent_note}, {wav_note}", e.msg),
+            msg: format!("{}; {sent_note}, {voice}", e.msg),
             skip: e.skip,
         })
 }
@@ -3219,27 +3152,6 @@ fn voice_event(event: &Value, session: u32) -> Option<Result<bool, String>> {
         }
         _ => None,
     }
-}
-
-/// A WAV file with 16 kHz mono signed 16 bit PCM.
-fn wav_file(pcm: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
-    let mut w = Vec::with_capacity(44 + pcm.len());
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&len.saturating_add(36).to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16_u32.to_le_bytes());
-    // PCM, 1 channel, 16 kHz, 32000 bytes per second, 2 bytes per sample, 16 bit.
-    w.extend_from_slice(&1_u16.to_le_bytes());
-    w.extend_from_slice(&1_u16.to_le_bytes());
-    w.extend_from_slice(&16_000_u32.to_le_bytes());
-    w.extend_from_slice(&32_000_u32.to_le_bytes());
-    w.extend_from_slice(&2_u16.to_le_bytes());
-    w.extend_from_slice(&16_u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&len.to_le_bytes());
-    w.extend_from_slice(pcm);
-    w
 }
 
 // ---------------------------------------------------------------- reconfiguration
@@ -3686,15 +3598,6 @@ mod tests {
     }
 
     #[test]
-    fn wav_round_trip() {
-        let pcm = [1, 2, 3, 4, 5, 6];
-        assert_eq!(
-            Ok(pcm.to_vec()),
-            wav_pcm(&wav_file(&pcm)).map_err(|e| e.msg)
-        );
-    }
-
-    #[test]
     fn quiet_trimmed() {
         let pcm = |s: &[i16]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
         let block = |v: i16| vec![v; QUIET_BLOCK];
@@ -3731,49 +3634,10 @@ mod tests {
         let mut cut = wav(1, 16_000, &[1, 2, 3, 4]);
         cut.truncate(cut.len() - 1);
         assert!(wav_pcm(&cut).is_err(), "cut data");
-    }
-
-    /// Header as `afconvert -f WAVE -d LEI16@16000 -c 1` writes it: extensible format, FLLR chunk.
-    fn extensible_wav(sub_format: u16, data: &[u8]) -> Vec<u8> {
-        let mut fmt = Vec::new();
-        for v in [0xFFFE_u16, 1] {
-            fmt.extend_from_slice(&v.to_le_bytes());
-        }
-        fmt.extend_from_slice(&16_000_u32.to_le_bytes());
-        fmt.extend_from_slice(&32_000_u32.to_le_bytes());
-        for v in [2_u16, 16, 22, 16] {
-            fmt.extend_from_slice(&v.to_le_bytes());
-        }
-        fmt.extend_from_slice(&4_u32.to_le_bytes());
-        fmt.extend_from_slice(&sub_format.to_le_bytes());
-        fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
-        let mut w = b"RIFF\0\0\0\0WAVE".to_vec();
-        for (id, body) in [
-            (b"fmt ", fmt),
-            (b"FLLR", vec![0; 6]),
-            (b"data", data.to_vec()),
-        ] {
-            w.extend_from_slice(id);
-            w.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
-            w.extend_from_slice(&body);
-        }
-        w
-    }
-
-    #[test]
-    fn wav_extensible() {
-        assert_eq!(
-            Ok(vec![1, 2, 3, 4]),
-            wav_pcm(&extensible_wav(1, &[1, 2, 3, 4])).map_err(|e| e.msg)
-        );
-        assert!(
-            wav_pcm(&extensible_wav(3, &[1, 2, 3, 4])).is_err(),
-            "float sub format"
-        );
         // `wav` has a 12-byte JUNK chunk, so the format tag is at 32.
-        let mut short = wav(1, 16_000, &[1, 2]);
-        short[32..34].copy_from_slice(&0xFFFE_u16.to_le_bytes());
-        assert!(wav_pcm(&short).is_err(), "extensible without sub format");
+        let mut float = wav(1, 16_000, &[1, 2]);
+        float[32..34].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(wav_pcm(&float).is_err(), "not PCM");
     }
 
     #[test]
