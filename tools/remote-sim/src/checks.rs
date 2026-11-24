@@ -1092,7 +1092,7 @@ async fn bring_to_front(ctx: &mut Ctx, standby: bool) -> Result<String, Fail> {
         match state.as_str() {
             "PLAYING" | "PAUSED" => break,
             "STANDBY" => return Err(Fail::skip("app stopped playback when opened")),
-            // BUFFERING: the rate is not 1x, or the item loads.
+            // BUFFERING: a scan rate, or the item loads.
             "BUFFERING" => {
                 if Instant::now() >= deadline {
                     return Err(Fail::skip("Apple TV stays in BUFFERING"));
@@ -1379,16 +1379,17 @@ pub async fn playback(ctx: &mut Ctx) -> Check {
     };
 
     let speed = ctx.select("playback_speed");
-    // Options are rates such as "1.5x". Find 1x and the first other rate above 0.
+    // Options are rates such as "1.5x". Find 1x and the highest rate above 1x, else the first
+    // other rate above 0.
     let mut has_1x = false;
     let mut found: Option<(&str, f32)> = None;
     let options = ctx.client.attr(&speed, "options").and_then(Value::as_array);
     for o in options.into_iter().flatten().filter_map(Value::as_str) {
         if o == "1x" {
             has_1x = true;
-        } else if found.is_none()
-            && let Some(rate) = o.strip_suffix('x').and_then(|r| r.parse::<f32>().ok())
+        } else if let Some(rate) = o.strip_suffix('x').and_then(|r| r.parse::<f32>().ok())
             && rate > 0.0
+            && found.is_none_or(|(_, f)| (f <= 1.0 && rate > 1.0) || (f > 1.0 && rate > f))
         {
             found = Some((o, rate));
         }
@@ -1418,7 +1419,24 @@ pub async fn playback(ctx: &mut Ctx) -> Check {
             ctx.client
                 .wait_text(&speed, "current_option", 5, &other)
                 .await?;
-            wait_rate(ctx, rate).await
+            wait_rate(ctx, rate).await?;
+            // A listed rate above 1x is a playback speed, not a scan: PLAYING, not BUFFERING.
+            if rate > 1.0 {
+                let shown = wait_agree(
+                    ctx,
+                    Instant::now(),
+                    Duration::from_secs(5),
+                    |_| Duration::from_secs(2),
+                    NoOracle::Playing,
+                )
+                .await
+                .map_err(|e| e.prefixed(&format!("at {other}")))?;
+                ensure!(
+                    shown == "PLAYING",
+                    "state {shown} at {other}, expected PLAYING"
+                );
+            }
+            Ok(())
         }
         .await;
         // Always go back to 1x, also after an error. The first error is returned.
@@ -1435,6 +1453,9 @@ pub async fn playback(ctx: &mut Ctx) -> Check {
         tried?;
         reset?;
         notes.push(format!("speed {other} and back"));
+        if rate <= 1.0 {
+            notes.push("PLAYING above 1x not tested: no option above 1x".into());
+        }
     }
     if ctx.oracle.is_some() {
         verify(ctx, 3).await?;
