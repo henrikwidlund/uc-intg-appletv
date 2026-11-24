@@ -698,9 +698,6 @@ async fn turn_on(ctx: &mut Ctx) -> Result<(), Fail> {
     wait_power(ctx, true, 10).await
 }
 
-/// Wait between the Apple TV going to sleep and a wake command.
-const WAKE_AFTER_SLEEP: Duration = Duration::from_secs(3);
-
 pub async fn power(ctx: &mut Ctx) -> Check {
     if ctx.opt.no_power {
         return Err(Fail::skip("--no-power"));
@@ -712,9 +709,8 @@ pub async fn power(ctx: &mut Ctx) -> Check {
     ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
     let off = start.elapsed().as_millis();
     wait_power(ctx, false, 10).await?;
-    // The Apple TV ignores a wake that comes within about 1 s of the sleep command.
-    sleep(WAKE_AFTER_SLEEP).await;
-    // A command other than power turns the Apple TV on first.
+    // No wait: tvOS 27 ignores a wake within about 5 s of the sleep command, and ratv must handle
+    // that. A command other than power turns the Apple TV on first.
     let start = Instant::now();
     press(ctx, "HOME").await?;
     ctx.client
@@ -725,7 +721,6 @@ pub async fn power(ctx: &mut Ctx) -> Check {
     mp_command(ctx, "toggle", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 15, "OFF").await?;
     wait_power(ctx, false, 10).await?;
-    sleep(WAKE_AFTER_SLEEP).await;
     mp_command(ctx, "toggle", json!({})).await?;
     ctx.client
         .wait_attr(&mp, "state", 15, |v| v != "OFF")
