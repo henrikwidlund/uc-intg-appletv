@@ -40,3 +40,23 @@ macro_rules! return_fut_err {
 
 pub(crate) use return_fut_err;
 pub(crate) use return_fut_ok;
+
+/// Allocation count for the `dhat_` tests.
+#[cfg(all(test, feature = "dhat-heap"))]
+pub mod alloc_count {
+    use std::sync::{Mutex, PoisonError};
+
+    /// Only one dhat profiler can run at a time.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` and return its result and the number of allocations it made. Other threads also
+    /// count, so run these tests alone.
+    pub fn blocks<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let _lock = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _profiler = dhat::Profiler::builder().testing().build();
+        let before = dhat::HeapStats::get().total_blocks;
+        let result = f();
+        let after = dhat::HeapStats::get().total_blocks;
+        (result, after - before)
+    }
+}

@@ -19,6 +19,8 @@ const MAX_REPEAT: u64 = 20;
 const MAX_HOLD_MS: u64 = 10_000;
 /// Longest pause between commands in milliseconds.
 const MAX_DELAY_MS: u64 = 5_000;
+/// Longest command name that is made lowercase. All media player command names fit.
+const MAX_COMMAND_LEN: usize = 32;
 
 /// Media player commands offered as simple commands of the remote.
 const MEDIA_PLAYER_COMMANDS: &[&str] = &[
@@ -223,7 +225,15 @@ fn map_command(command: &str) -> Result<Action, ServiceError> {
     if SimpleCommand::from_str(command).is_ok() {
         return media_player::command(command, None);
     }
-    media_player::command(&command.to_ascii_lowercase(), None)
+    // Lowercase on the stack. A longer name is not a known command.
+    let mut buf = [0u8; MAX_COMMAND_LEN];
+    let Some(lower) = buf.get_mut(..command.len()) else {
+        return media_player::command(command, None);
+    };
+    lower.copy_from_slice(command.as_bytes());
+    lower.make_ascii_lowercase();
+    // Only ASCII letters changed, so the bytes are still UTF-8.
+    media_player::command(std::str::from_utf8(lower).unwrap_or(command), None)
 }
 
 /// Repeat count. The Remote sends 4 for a held button: this is changed to 1 until the
@@ -269,6 +279,20 @@ mod tests {
 
     fn params(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn command_names_fit_the_lowercase_buffer() {
+        use strum::VariantNames;
+        let longest = uc_api::MediaPlayerCommand::VARIANTS
+            .iter()
+            .map(|n| n.len())
+            .max();
+        assert!(longest.is_some_and(|n| n <= MAX_COMMAND_LEN), "{longest:?}");
+        assert!(map_command("CURSOR_UP").is_ok());
+        assert!(map_command("Cursor_Up").is_ok());
+        assert!(map_command(&"A".repeat(MAX_COMMAND_LEN + 1)).is_err());
+        assert!(map_command("CURSOR_ÜP").is_err());
     }
 
     #[test]

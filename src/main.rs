@@ -18,6 +18,14 @@ mod server;
 mod startup;
 mod util;
 
+/// Counts allocations in the `dhat_` tests.
+#[cfg(all(test, feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+// Builds that are not tests do not use dhat. This stops the unused dependency warning.
+#[cfg(all(not(test), feature = "dhat-heap"))]
+use dhat as _;
+
 use crate::configuration::{ENV_DISABLE_MDNS_PUBLISH, Settings};
 use crate::controller::Controller;
 use crate::server::{ArtworkStore, publish_service};

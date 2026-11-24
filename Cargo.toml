@@ -13,6 +13,9 @@ default = ["mdns-sd"]
 # mDNS service publishing. The Remote needs it to find the driver.
 # Pure Rust, works on all platforms and in cross builds.
 mdns-sd = ["dep:mdns-sd"]
+# Allocation tests. They run alone:
+# `cargo test --features dhat-heap dhat_ -- --ignored --test-threads=1`.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb1", features = ["prost"] }
@@ -47,6 +50,8 @@ uuid = { version = "1.29", features = ["v4"] }
 env_logger = "0.11"
 log = "0.4"
 mdns-sd = { version = "0.22", optional = true }
+# Only for tests. A feature cannot enable a dev-dependency.
+dhat = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 # Paused time in tests.

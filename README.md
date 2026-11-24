@@ -151,9 +151,19 @@ See `.github/workflows/build.yml`. A `v*` tag creates a GitHub release with the 
 ```shell
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features dhat-heap -- -D warnings
 cargo test --locked
 cargo deny check
 ```
+
+The allocation tests use dhat. They count the allocations of all threads, so they run alone:
+
+```shell
+cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1
+```
+
+To add one, measure with `util::alloc_count::blocks` and set the limit to the measured count.
+Name it `dhat_…`, gate it with the `dhat-heap` feature and mark it `#[ignore]`.
 
 `tools/manual_test.sh` runs the tests with a real Apple TV and Remote, one step at a time.
 It saves the results to `manual-test-results-<time>.md`.
@@ -181,6 +191,9 @@ are refused. If `setup`, `entities` or `states` fails, only `restore_power` and 
 it. With `--skip setup`, `entities` fails, because the driver has no device. `--no-power` keeps
 the Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to
 the driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`.
+
+CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks
+against an Apple TV.
 
 ratv is a git dependency with a fixed commit. To test local ratv changes, add this to
 `~/.cargo/config.toml` and remove it when you are done:

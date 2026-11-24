@@ -842,6 +842,28 @@ mod tests {
         assert!(!d.any(Dirty::METADATA));
     }
 
+    /// A position update is the most frequent update. It must not allocate.
+    #[cfg(feature = "dhat-heap")]
+    #[ignore = "counts the allocations of all threads, run alone"]
+    #[test]
+    fn dhat_position_update() {
+        let mut s = Snapshot::default();
+        let mut np = NowPlaying::default();
+        np.title = Some("Song".into());
+        np.artist = Some("Artist".into());
+        np.state = Some(PlaybackState::Playing);
+        np.rate = Some(1.0);
+        np.elapsed = Some(10.0);
+        np.elapsed_timestamp = Some(100.0);
+        np.duration = Some(200.0);
+        s.update_now_playing(&np);
+        np.elapsed = Some(20.0);
+        np.elapsed_timestamp = Some(110.0);
+        let (dirty, blocks) = crate::util::alloc_count::blocks(|| s.update_now_playing(&np));
+        assert_eq!(Dirty::POSITION, dirty);
+        assert_eq!(0, blocks);
+    }
+
     #[test]
     fn companion_update_keeps_mrp_fields() {
         let mut s = Snapshot::default();

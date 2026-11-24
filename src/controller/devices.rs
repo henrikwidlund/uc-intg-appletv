@@ -1012,6 +1012,57 @@ mod tests {
         assert_eq!(expected, own);
     }
 
+    /// A new position: build the attributes, merge them into the cache and build the event text.
+    #[cfg(feature = "dhat-heap")]
+    #[ignore = "counts the allocations of all threads, run alone"]
+    #[test]
+    fn dhat_position_event() {
+        use crate::device::state::{Dirty, Snapshot};
+        use crate::entities::{EntityKind, attributes};
+        use ratv::mrp::PlaybackState;
+
+        let mut s = Snapshot {
+            power: crate::device::state::Power::On,
+            state: Some(PlaybackState::Playing),
+            elapsed: Some(10.0),
+            elapsed_timestamp: Some(100.0),
+            rate: Some(1.0),
+            duration: Some(200.0),
+            ..Snapshot::default()
+        };
+        let event = |s: &Snapshot, cache: &mut Map<String, Value>| {
+            let mut attrs = Map::new();
+            attributes(
+                s,
+                EntityKind::MediaPlayer,
+                Dirty::POSITION,
+                100.0,
+                &mut attrs,
+            );
+            let (any, keys) = diff(cache, attrs, true);
+            assert!(any);
+            entity_change_text(EntityChangeRef {
+                entity_type: EntityType::MediaPlayer,
+                entity_id: "media_player.x",
+                attributes: Picked { cache, keys: &keys },
+            })
+            .expect("text")
+        };
+        let mut cache = Map::new();
+        event(&s, &mut cache);
+        s.elapsed = Some(20.0);
+        let (text, blocks) = crate::util::alloc_count::blocks(|| event(&s, &mut cache));
+        assert!(text.contains("\"media_position\":20"), "{text}");
+        assert!(text.contains("media_position_updated_at"), "{text}");
+        assert!(
+            !text.contains("media_duration"),
+            "only changed attributes: {text}"
+        );
+        // Attribute names and the map, the changed names, the timestamp and the text. The text
+        // grows one more time when its timestamp is long: 13 is the most.
+        assert!(blocks <= 13, "{blocks} allocations");
+    }
+
     #[test]
     fn entity_change_text_has_only_the_keys() {
         let cache = map(json!({ "state": "ON", "media_title": "Song" }));

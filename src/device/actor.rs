@@ -3265,6 +3265,88 @@ mod tests {
             .expect("send");
     }
 
+    /// A key press: check the command and plan its calls.
+    #[cfg(feature = "dhat-heap")]
+    #[ignore = "counts the allocations of all threads, run alone"]
+    #[actix::test]
+    async fn dhat_command_parse_and_plan() {
+        let actor = idle_actor("dhat-command", None);
+        let command = |kind, cmd_id: &str, params: Option<Value>| Command {
+            kind,
+            cmd_id: cmd_id.into(),
+            params: params.map(|p| p.as_object().cloned().expect("object")),
+            reply: None,
+        };
+        let play = command(EntityKind::MediaPlayer, "play_pause", None);
+        let key = command(
+            EntityKind::Remote,
+            "send_cmd",
+            Some(serde_json::json!({ "command": "CURSOR_UP" })),
+        );
+        let counts = actor
+            .send(Run(move |act: &mut AppleTvActor| {
+                // The writer thread of the store allocates when it first waits. Let it handle a
+                // job and wait once, so this is not counted.
+                act.ctx.store.flush();
+                std::thread::sleep(Duration::from_millis(20));
+                act.s.power = Power::On;
+                let mut count = |msg: &Command| {
+                    let (calls, blocks) = crate::util::alloc_count::blocks(|| {
+                        let run = AppleTvActor::parse(msg).expect("parse");
+                        act.plan(&run).expect("plan")
+                    });
+                    assert_eq!(1, calls.len(), "{calls:?}");
+                    blocks
+                };
+                (count(&play), count(&key))
+            }))
+            .await
+            .expect("send");
+        // The list of actions and the list of calls.
+        assert!(counts.0 <= 2 && counts.1 <= 2, "{counts:?} allocations");
+    }
+
+    /// A new item: build the artwork URL with the cached base and send the image.
+    #[cfg(feature = "dhat-heap")]
+    #[ignore = "counts the allocations of all threads, run alone"]
+    #[actix::test]
+    async fn dhat_artwork_url() {
+        let actor = idle_actor("dhat-artwork", Some(IpAddr::from([192, 0, 2, 9])));
+        let blocks = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                // The writer thread of the store allocates when it first waits. Let it handle a
+                // job and wait once, so this is not counted.
+                act.ctx.store.flush();
+                std::thread::sleep(Duration::from_millis(20));
+                act.s.power = Power::On;
+                act.s.state = Some(PlaybackState::Playing);
+                let save = |act: &AppleTvActor, id: &str| {
+                    act.ctx.artwork.save(
+                        &act.key,
+                        id,
+                        Some("image/png"),
+                        Bytes::from_static(b"png"),
+                    )
+                };
+                let first = save(act, "art1");
+                assert!(act.show_file(first, 1));
+                let second = save(act, "art2");
+                let path = format!("/artwork/{}/{second}", act.key);
+                let (shown, blocks) = crate::util::alloc_count::blocks(|| act.show_file(second, 2));
+                assert!(shown);
+                let url = act.s.artwork_url.as_deref().expect("url");
+                assert!(
+                    url.starts_with("http://192.0.2.9:0/") && url.ends_with(&path),
+                    "{url}"
+                );
+                blocks
+            }))
+            .await
+            .expect("send");
+        // The URL, and the attributes and the event of the image.
+        assert!(blocks <= 9, "{blocks} allocations");
+    }
+
     #[actix::test]
     async fn listen_address_ignores_the_remote_address() {
         let actor = idle_actor("art-listen", Some(IpAddr::from([192, 0, 2, 9])));
