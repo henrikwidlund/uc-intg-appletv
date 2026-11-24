@@ -38,7 +38,6 @@ const STEPS: [&str; 25] = [
     "remote_ui",
     "standby",
     "remote_wake",
-    "power",
     "remote_commands",
     "simple_commands",
     "app_select",
@@ -46,6 +45,7 @@ const STEPS: [&str; 25] = [
     "playback",
     "languages",
     "artwork",
+    "power",
     "abort_setup",
     "configure",
     "backup_restore",
@@ -417,7 +417,6 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
-    ctx.step("power", checks::power).await;
     ctx.step("remote_commands", checks::remote_commands).await;
     ctx.step("simple_commands", checks::simple_commands).await;
     ctx.step("app_select", checks::app_select).await;
@@ -425,6 +424,8 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("playback", checks::playback).await;
     ctx.step("languages", checks::languages).await;
     ctx.step("artwork", checks::artwork).await;
+    // After the checks that need playback: power stops the video.
+    ctx.step("power", checks::power).await;
     ctx.step("abort_setup", checks::abort_setup).await;
     ctx.step("configure", checks::configure).await;
     ctx.step("backup_restore", checks::backup_restore).await;
