@@ -53,6 +53,8 @@ impl Dirty {
     pub const LANGUAGE: Self = Self(1 << 17);
     /// The supported playback rates changed.
     pub const RATES: Self = Self(1 << 18);
+    /// The duration changed. Also sets [`Self::POSITION`]: the position is limited to the duration.
+    pub const DURATION: Self = Self(1 << 19);
     pub const ALL: Self = Self(u32::MAX);
 
     /// Returns `true` if any group of `other` is dirty.
@@ -268,7 +270,12 @@ impl Snapshot {
         update!(d, Dirty::METADATA, self.audio_format, np.audio_format);
         // Live content can report a duration of 0.
         let duration = np.duration.filter(|d| *d > 0.0);
-        update!(d, Dirty::POSITION, self.duration, duration);
+        update!(
+            d,
+            Dirty::POSITION | Dirty::DURATION,
+            self.duration,
+            duration
+        );
         update!(d, Dirty::POSITION, self.elapsed, np.elapsed);
         update!(
             d,
@@ -370,7 +377,12 @@ impl Snapshot {
         }
         let duration = np.duration.filter(|d| *d > 0.0);
         if new_item || duration.is_some() {
-            update!(d, Dirty::POSITION, self.duration, duration);
+            update!(
+                d,
+                Dirty::POSITION | Dirty::DURATION,
+                self.duration,
+                duration
+            );
         }
         update!(d, Dirty::POSITION, self.elapsed, np.elapsed);
         update!(
@@ -928,6 +940,7 @@ mod tests {
         assert!(!d.any(Dirty::APP));
         assert_ne!(s.item_seq, item);
         assert_eq!(s.duration, None, "not sent for the new item");
+        assert!(d.any(Dirty::DURATION) && d.any(Dirty::POSITION));
         assert_eq!(s.audio_languages, Vec::new());
         assert_eq!(s.audio_language, None);
         assert_eq!(s.up_next, Vec::new());

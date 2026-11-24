@@ -151,8 +151,10 @@ pub fn attributes(s: &Snapshot, dirty: Dirty, now: f64, out: &mut Map<String, Va
         metadata_attributes(s, off, out);
     }
     // With PLAYBACK, so a resume sends a new timestamp.
-    if dirty.any(Dirty::POSITION | Dirty::PLAYBACK | Dirty::POWER | Dirty::CONNECTION) {
-        position_attributes(s, off, now, out);
+    if dirty
+        .any(Dirty::POSITION | Dirty::DURATION | Dirty::PLAYBACK | Dirty::POWER | Dirty::CONNECTION)
+    {
+        position_attributes(s, off, now, dirty, out);
     }
     if dirty.any(Dirty::ARTWORK | Dirty::POWER | Dirty::CONNECTION) {
         let url = if off || s.state.is_none() {
@@ -210,19 +212,28 @@ fn metadata_attributes(s: &Snapshot, off: bool, out: &mut Map<String, Value>) {
     );
 }
 
-fn position_attributes(s: &Snapshot, off: bool, now: f64, out: &mut Map<String, Value>) {
+fn position_attributes(
+    s: &Snapshot,
+    off: bool,
+    now: f64,
+    dirty: Dirty,
+    out: &mut Map<String, Value>,
+) {
     let pos = if off { None } else { s.position(now) };
-    let duration = if off { None } else { s.duration };
     set(
         out,
         Attr::MediaPosition,
         pos.map_or(0, |p| p.round() as u64).into(),
     );
-    set(
-        out,
-        Attr::MediaDuration,
-        duration.map_or(0, |d| d.round() as u64).into(),
-    );
+    // Not for a position change only: the duration stays the same.
+    if dirty.any(Dirty::DURATION | Dirty::PLAYBACK | Dirty::POWER | Dirty::CONNECTION) {
+        let duration = if off { None } else { s.duration };
+        set(
+            out,
+            Attr::MediaDuration,
+            duration.map_or(0, |d| d.round() as u64).into(),
+        );
+    }
     // The controller sets the time only if it sends the position, see [`position_timestamp`].
     set(out, Attr::MediaPositionUpdatedAt, Value::Null);
 }
@@ -509,6 +520,42 @@ fn param_f64(params: Option<&Map<String, Value>>, name: &str) -> Result<f64, Ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_and_live_sensor_only_when_the_duration_changes() {
+        use crate::entities::{EntityKind, SensorKind, attributes};
+        let mut s = Snapshot {
+            power: Power::On,
+            state: Some(PlaybackState::Playing),
+            ..Snapshot::default()
+        };
+        let mut np = ratv::mrp::NowPlaying::default();
+        np.state = Some(PlaybackState::Playing);
+        np.duration = Some(200.0);
+        np.elapsed = Some(10.0);
+        s.update_now_playing(&np);
+        let build = |s: &Snapshot, dirty, kind| {
+            let mut out = Map::new();
+            attributes(s, kind, dirty, 0.0, &mut out);
+            out
+        };
+        let live = EntityKind::Sensor(SensorKind::IsLive);
+
+        np.elapsed = Some(20.0);
+        let dirty = s.update_now_playing(&np);
+        assert!(!dirty.any(Dirty::DURATION));
+        let mp = build(&s, dirty, EntityKind::MediaPlayer);
+        assert!(mp.contains_key("media_position"));
+        assert!(!mp.contains_key("media_duration"));
+        assert!(build(&s, dirty, live).is_empty());
+
+        np.duration = Some(300.0);
+        let dirty = s.update_now_playing(&np);
+        assert!(dirty.any(Dirty::DURATION) && dirty.any(Dirty::POSITION));
+        let mp = build(&s, dirty, EntityKind::MediaPlayer);
+        assert_eq!(Some(&Value::from(300)), mp.get("media_duration"));
+        assert!(!build(&s, dirty, live).is_empty());
+    }
 
     #[test]
     fn launched_app_is_shown_until_another_app_plays() {

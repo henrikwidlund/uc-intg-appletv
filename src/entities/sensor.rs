@@ -45,7 +45,7 @@ const fn dirty_groups(kind: SensorKind) -> Dirty {
         Some(s) => select::dirty_groups(s),
         None => match kind {
             SensorKind::VolumeControl => Dirty::VOLUME,
-            SensorKind::IsLive => Dirty::METADATA.or(Dirty::PLAYBACK).or(Dirty::POSITION),
+            SensorKind::IsLive => Dirty::METADATA.or(Dirty::PLAYBACK).or(Dirty::DURATION),
             _ => Dirty::METADATA,
         },
     }

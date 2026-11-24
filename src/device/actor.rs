@@ -3306,6 +3306,33 @@ mod tests {
         assert!(counts.0 <= 2 && counts.1 <= 2, "{counts:?} allocations");
     }
 
+    /// A new position: build the attributes of all entities and send them to the controller.
+    #[cfg(feature = "dhat-heap")]
+    #[ignore = "counts the allocations of all threads, run alone"]
+    #[actix::test]
+    async fn dhat_position_emit() {
+        let actor = idle_actor("dhat-emit", None);
+        let blocks = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                // The writer thread of the store allocates when it first waits. Let it handle a
+                // job and wait once, so this is not counted.
+                act.ctx.store.flush();
+                std::thread::sleep(Duration::from_millis(20));
+                act.s.power = Power::On;
+                act.s.state = Some(PlaybackState::Playing);
+                act.s.elapsed = Some(20.0);
+                act.s.elapsed_timestamp = Some(now());
+                act.s.rate = Some(1.0);
+                act.s.duration = Some(200.0);
+                crate::util::alloc_count::blocks(|| act.emit(Dirty::POSITION)).1
+            }))
+            .await
+            .expect("send");
+        // 4 for the list of changes with the media player attributes, 2 for the message to the
+        // controller.
+        assert!((1..=6).contains(&blocks), "{blocks} allocations");
+    }
+
     /// A new item: build the artwork URL with the cached base and send the image.
     #[cfg(feature = "dhat-heap")]
     #[ignore = "counts the allocations of all threads, run alone"]

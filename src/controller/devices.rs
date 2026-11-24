@@ -1059,8 +1059,8 @@ mod tests {
             "only changed attributes: {text}"
         );
         // Attribute names and the map, the changed names, the timestamp and the text. The text
-        // grows one more time when its timestamp is long: 13 is the most.
-        assert!(blocks <= 13, "{blocks} allocations");
+        // can grow when its timestamp is long: 12 is the most.
+        assert!(blocks <= 12, "{blocks} allocations");
     }
 
     #[test]
