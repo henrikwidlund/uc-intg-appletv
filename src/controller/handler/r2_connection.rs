@@ -6,6 +6,7 @@
 
 use crate::controller::devices::Trigger;
 use crate::controller::{Controller, NewR2Session, R2Session, R2SessionDisconnect, SendWsMessage};
+use crate::device::RemoteAddressChanged;
 use actix::{Context, Handler};
 use log::{error, info};
 use uc_api::ws::WsMessage;
@@ -21,6 +22,13 @@ impl Handler<NewR2Session> for Controller {
             error!("[{}] Error sending get_version: {e}", msg.id);
         }
         info!("[{}] Remote connected", msg.id);
+        if let Some(ip) = msg.local_ip
+            && self.device_ctx.set_remote_ip(ip)
+        {
+            for device in self.devices.values() {
+                device.addr.do_send(RemoteAddressChanged);
+            }
+        }
         self.sessions.insert(msg.id.clone(), session);
         self.send_device_state(&msg.id);
     }

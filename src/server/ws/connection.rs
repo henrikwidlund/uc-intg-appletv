@@ -120,6 +120,7 @@ impl WsConn {
             .send(NewR2Session {
                 addr: sender.clone().recipient(),
                 id: self.id.clone(),
+                local_ip: self.local_ip,
             })
             .await
         {
@@ -609,6 +610,7 @@ mod tests {
     async fn bad_voice_format_ends_only_the_voice_session() {
         let mut conn = WsConn::new(
             "test".into(),
+            None,
             controller("ws-voice"),
             HeartbeatSettings::default(),
             ByteString::new(),
@@ -782,6 +784,52 @@ mod tests {
             frame.extend(payload.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
             s.write_all(&frame).expect("write");
         }
+    }
+
+    /// The local address of the Remote connection reaches the controller.
+    #[actix::test]
+    async fn remote_connection_address_is_stored() {
+        use crate::controller::test_util::RemoteIp;
+        use crate::server::{Authentication, save_local_address, ws_index};
+        use actix_web::{App, HttpServer, web};
+
+        let addr = controller("ws-local-ip");
+        let controller = web::Data::new(addr.clone());
+        let heartbeat = web::Data::new(HeartbeatSettings::default());
+        let metadata = serde_json::from_value(serde_json::json!({})).expect("metadata");
+        let auth = web::Data::new(Authentication::new(&metadata));
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(heartbeat.clone())
+                .app_data(auth.clone())
+                .app_data(controller.clone())
+                .service(ws_index)
+        })
+        .on_connect(save_local_address)
+        .workers(1)
+        .disable_signals()
+        .bind(("127.0.0.1", 0))
+        .expect("bind");
+        let server_addr = server.addrs()[0];
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let client = tokio::task::spawn_blocking(move || raw::connect(server_addr))
+            .await
+            .expect("client");
+        let mut stored = None;
+        // Up to 5 s, like the read timeout of the raw client.
+        for _ in 0..250 {
+            stored = addr.send(RemoteIp).await.expect("send");
+            if stored.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(Some(server_addr.ip()), stored);
+        drop(client);
+        handle.stop(false).await;
     }
 
     #[actix::test]

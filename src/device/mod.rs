@@ -19,8 +19,8 @@ use actix::Message;
 use bytes::Bytes;
 use serde_json::{Map, Value};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use uc_api::intg::AssistantEvent;
 use uc_api::intg::ws::BrowseMediaResponseMsgData;
 use uc_api::model::Paging;
@@ -39,6 +39,9 @@ pub struct DeviceContext {
     pub artwork: ArtworkStore,
     /// [`SiriMode`] as `u8`. The setup can change it.
     pub siri_mode: AtomicU8,
+    /// Local address of the last Remote connection, for artwork URLs. The Remote can reach the
+    /// driver there.
+    pub(crate) remote_ip: Mutex<Option<IpAddr>>,
 }
 
 impl DeviceContext {
@@ -49,6 +52,37 @@ impl DeviceContext {
     pub fn set_siri_mode(&self, mode: SiriMode) {
         self.siri_mode.store(mode as u8, Ordering::Relaxed);
     }
+
+    pub fn remote_ip(&self) -> Option<IpAddr> {
+        *self
+            .remote_ip
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Store the address of a new Remote connection. A loopback address does not replace an
+    /// address that is not loopback: otherwise a program on the same host would break the
+    /// artwork of a Remote on the network. Returns `true` if the stored address changed.
+    pub fn set_remote_ip(&self, ip: IpAddr) -> bool {
+        // An IPv4 address can come as an IPv6 address on a `::` listener.
+        let ip = ip.to_canonical();
+        let mut stored = self
+            .remote_ip
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let replace = replaces_remote_ip(*stored, ip);
+        if replace {
+            *stored = Some(ip);
+        }
+        replace
+    }
+}
+
+/// A new Remote address `new` replaces `old`, unless it is the same, or it is a loopback address
+/// and `old` is an address that is not loopback. Both are canonical (see
+/// [`IpAddr::to_canonical`]).
+fn replaces_remote_ip(old: Option<IpAddr>, new: IpAddr) -> bool {
+    old != Some(new) && (!new.is_loopback() || old.is_none_or(|o| o.is_loopback()))
 }
 
 /// The pairing does not work with the device at this address: the device rejected the
@@ -112,6 +146,11 @@ pub struct Disconnect;
 #[rtype(result = "()")]
 pub struct SiriModeChanged;
 
+/// The Remote address in [`DeviceContext`] changed: build the artwork URL again.
+#[derive(Debug, Message)]
+#[rtype(result = "()")]
+pub struct RemoteAddressChanged;
+
 /// Disconnect and stop the actor.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
@@ -164,4 +203,41 @@ pub struct Browse {
 pub struct AudioChunk {
     pub session_id: u32,
     pub data: Bytes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_does_not_replace_a_network_address() {
+        let lan = IpAddr::from([192, 0, 2, 20]);
+        let other = IpAddr::from([192, 0, 2, 21]);
+        let lo = IpAddr::from([127, 0, 0, 1]);
+        let lo6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert!(replaces_remote_ip(None, lo), "first address");
+        assert!(replaces_remote_ip(Some(lo), lan));
+        assert!(replaces_remote_ip(Some(lan), other));
+        assert!(replaces_remote_ip(Some(lo), lo6));
+        assert!(!replaces_remote_ip(Some(lan), lan), "same address");
+        assert!(!replaces_remote_ip(Some(lan), lo));
+        assert!(!replaces_remote_ip(Some(lan), lo6));
+    }
+
+    #[test]
+    fn mapped_loopback_does_not_replace_a_network_address() {
+        let mapped = |ip: std::net::Ipv4Addr| IpAddr::V6(ip.to_ipv6_mapped());
+        let lan = std::net::Ipv4Addr::new(192, 0, 2, 20);
+        let canonical = |ip: IpAddr| ip.to_canonical();
+        assert_eq!(IpAddr::V4(lan), canonical(mapped(lan)));
+        let lo = canonical(mapped(std::net::Ipv4Addr::LOCALHOST));
+        assert!(
+            !replaces_remote_ip(Some(IpAddr::V4(lan)), lo),
+            "mapped loopback"
+        );
+        assert!(!replaces_remote_ip(
+            Some(IpAddr::V4(lan)),
+            canonical(mapped(lan))
+        ));
+    }
 }

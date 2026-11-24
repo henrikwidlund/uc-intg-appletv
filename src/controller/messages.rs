@@ -9,6 +9,7 @@ use crate::util::DeserializeMsgData;
 use actix::prelude::{Message, Recipient};
 use bytes::Bytes;
 use bytestring::ByteString;
+use std::net::IpAddr;
 use std::sync::Arc;
 use uc_api::intg::ws::{R2Event, R2Request, R2Response};
 use uc_api::ws::WsMessage;
@@ -39,6 +40,8 @@ pub struct NewR2Session {
     pub addr: Recipient<SendWsMessage>,
     /// Unique identifier of the WebSocket connection.
     pub id: Arc<str>,
+    /// Local address that the connection arrived on. The Remote can reach the driver there.
+    pub local_ip: Option<IpAddr>,
 }
 
 /// A Remote disconnected.

@@ -30,8 +30,8 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uc_api::intg::{DeviceState, IntegrationDriverUpdate};
 use uc_api::ws::{EventCategory, WsMessage};
@@ -203,6 +203,7 @@ impl Controller {
             store: store.clone(),
             artwork,
             siri_mode: AtomicU8::new(driver_settings.siri_mode as u8),
+            remote_ip: Mutex::default(),
         });
         Self {
             sessions: HashMap::default(),

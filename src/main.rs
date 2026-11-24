@@ -73,6 +73,7 @@ async fn main() -> io::Result<()> {
             .service(server::ws_index)
             .service(server::artwork_index)
     })
+    .on_connect(server::save_local_address)
     .workers(1)
     // Open WebSocket connections do not end by themselves: do not wait the default 30 s.
     .shutdown_timeout(10)

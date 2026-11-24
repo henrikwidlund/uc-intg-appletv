@@ -60,6 +60,18 @@ impl Handler<DeviceAddr> for Controller {
     }
 }
 
+/// The stored address of the last Remote connection.
+#[derive(Message)]
+#[rtype(result = "Option<std::net::IpAddr>")]
+pub(crate) struct RemoteIp;
+
+impl Handler<RemoteIp> for Controller {
+    type Result = Option<std::net::IpAddr>;
+    fn handle(&mut self, _: RemoteIp, _: &mut Context<Self>) -> Self::Result {
+        self.device_ctx.remote_ip()
+    }
+}
+
 /// Answer when the store has done all queued file jobs.
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -130,6 +142,7 @@ pub(crate) async fn connect(controller: &Addr<Controller>, id: &str) -> TestRemo
         .send(NewR2Session {
             addr: addr.clone().recipient(),
             id: id.into(),
+            local_ip: None,
         })
         .await
         .expect("send");

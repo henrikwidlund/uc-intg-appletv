@@ -11,6 +11,7 @@ use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use bytestring::ByteString;
 use log::debug;
 use std::env;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use uc_api::intg::IntegrationDriverUpdate;
@@ -25,6 +26,8 @@ mod responses;
 struct WsConn {
     /// Unique connection identifier, used for logging and to route messages in the [`Controller`].
     id: Arc<str>,
+    /// Local address that the connection arrived on.
+    local_ip: Option<IpAddr>,
     /// Time of the last client activity.
     hb: Instant,
     /// [`Controller`] address for sending events and requests.
@@ -69,6 +72,7 @@ struct VoiceCount {
 impl WsConn {
     fn new(
         client_id: String,
+        local_ip: Option<IpAddr>,
         controller_addr: Addr<Controller>,
         heartbeat: HeartbeatSettings,
         authentication: ByteString,
@@ -77,6 +81,7 @@ impl WsConn {
         Self {
             authentication,
             id: client_id.into(),
+            local_ip,
             hb: Instant::now(),
             heartbeat,
             msg_tracing_in: msg_tracing == "all" || msg_tracing == "in",
@@ -85,6 +90,20 @@ impl WsConn {
             audio: controller_addr.clone().recipient(),
             controller_addr,
         }
+    }
+}
+
+/// Local address that a connection arrived on.
+#[derive(Clone, Copy)]
+struct LocalAddress(IpAddr);
+
+/// Save the local address of a new connection for [`ws_index`]. The OS sets it, so a client
+/// cannot change it.
+pub fn save_local_address(conn: &dyn std::any::Any, data: &mut actix_web::dev::Extensions) {
+    if let Some(tcp) = conn.downcast_ref::<actix_web::rt::net::TcpStream>()
+        && let Ok(addr) = tcp.local_addr()
+    {
+        data.insert(LocalAddress(addr.ip()));
     }
 }
 
@@ -111,8 +130,10 @@ pub async fn ws_index(
         .max_frame_size(128 * 1024)
         .aggregate_continuations();
 
+    let local_ip = request.conn_data::<LocalAddress>().map(|a| a.0);
     let conn = WsConn::new(
         client_id,
+        local_ip,
         controller.get_ref().clone(),
         *heartbeat.get_ref(),
         authentication.0.clone(),

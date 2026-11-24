@@ -11,7 +11,8 @@ use crate::device::state::{
 };
 use crate::device::{
     AudioChunk, Browse, Command, Connect, DeviceContext, DeviceEvent, DeviceStatus, Disconnect,
-    SiriModeChanged, Stop, UpdateConfig, browse, discovery, now, pairing_not_valid,
+    RemoteAddressChanged, SiriModeChanged, Stop, UpdateConfig, browse, discovery, now,
+    pairing_not_valid,
 };
 use crate::entities::{self, EntityKind, media_player, remote, select};
 use crate::errors::ServiceError;
@@ -285,8 +286,9 @@ pub struct AppleTvActor {
     /// Name of the shown artwork file.
     shown_file: Option<Box<str>>,
     item_art: ItemArtwork,
-    /// Cached result of [`Self::find_http_base`]. Reset on close.
-    http_base: Option<String>,
+    /// Cached result of [`Self::find_http_base`], with the Remote address it used. Reset on
+    /// close.
+    http_base: Option<(Option<IpAddr>, String)>,
     /// Endpoints of the last successful connect, or of the last scan while a protocol is missing.
     /// Tried before discovery on reconnect.
     endpoints: Option<Endpoints>,
@@ -1594,10 +1596,11 @@ impl AppleTvActor {
     /// Show a kept artwork file. Returns `false` if there is no local address for the URL.
     #[must_use]
     fn show_file(&mut self, name: Box<str>, item: u32) -> bool {
-        if self.http_base.is_none() {
-            self.http_base = self.find_http_base();
+        let remote = self.ctx.remote_ip();
+        if self.http_base.as_ref().is_none_or(|(ip, _)| *ip != remote) {
+            self.http_base = self.find_http_base(remote).map(|base| (remote, base));
         }
-        let Some(base) = &self.http_base else {
+        let Some((_, base)) = &self.http_base else {
             warn!("[{}] no local address for the artwork URL", self.cfg.name);
             return false;
         };
@@ -1617,10 +1620,11 @@ impl AppleTvActor {
         self.ctx.artwork.touch(&self.key, name).then(|| name.into())
     }
 
-    /// Base URL of the HTTP server, with an address on the network of the Apple TV.
-    fn find_http_base(&self) -> Option<String> {
+    /// Base URL of the HTTP server. `remote`: local address of the last Remote connection.
+    fn find_http_base(&self, remote: Option<IpAddr>) -> Option<String> {
         http_base(
             self.ctx.http_address,
+            remote,
             self.cfg.address,
             self.ctx.http_ipv6,
             self.ctx.http_port,
@@ -2482,6 +2486,39 @@ impl Handler<Disconnect> for AppleTvActor {
     }
 }
 
+impl Handler<RemoteAddressChanged> for AppleTvActor {
+    type Result = ();
+
+    /// Show the shown image again with the new address. Without a URL before, use the image
+    /// seen before for the item: its URL could not be built.
+    fn handle(&mut self, _: RemoteAddressChanged, _: &mut Self::Context) {
+        // With a listen address, the URL does not use the Remote address.
+        if self.ctx.http_address.is_some() {
+            return;
+        }
+        let shown = self.s.artwork_url.is_some();
+        let (name, item, kept) = match &self.shown_file {
+            Some(name) if shown => (name.clone(), self.s.artwork_item, self.s.artwork_kept),
+            // Like `update_artwork`, but also without a connection, as in the case above: an
+            // image from the cache only for a playing item with images that the driver fetches.
+            None if !shown
+                && self.s.artwork_fetch
+                && self.s.state.is_some()
+                && self.s.has_item_key() =>
+            {
+                let Some(name) = self.cached_art(self.s.item_key()) else {
+                    return;
+                };
+                (name, self.s.item_seq, false)
+            }
+            _ => return,
+        };
+        if self.show_file(name, item) {
+            self.s.artwork_kept = kept;
+        }
+    }
+}
+
 impl Handler<SiriModeChanged> for AppleTvActor {
     type Result = ();
 
@@ -3013,15 +3050,25 @@ fn running_window(end: Option<Instant>, now: Instant) -> Option<Instant> {
     end.filter(|end| now < *end)
 }
 
-/// Base URL of the HTTP server at `port`. Without `http_address`, the address is the local
-/// address on the network of `device`. No packet is sent: connect only selects it.
+/// Base URL of the HTTP server at `port`. The address is the first of:
+/// - `http_address`, the address the server listens on;
+/// - `remote`, the local address that the Remote connected to;
+/// - the local address on the network of `device`. No packet is sent: connect only selects it.
+///
+/// A Remote or local address that is unspecified or link-local IPv6 is not used: for link-local,
+/// the URL would need the zone of the Remote.
 fn http_base(
     http_address: Option<IpAddr>,
+    remote: Option<IpAddr>,
     device: Option<IpAddr>,
     ipv6: bool,
     port: u16,
 ) -> Option<String> {
-    let ip = http_address.or_else(|| {
+    let usable = |ip: &IpAddr| {
+        !ip.is_unspecified() && !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local())
+    };
+    let remote = remote.map(|ip| ip.to_canonical()).filter(usable);
+    let ip = http_address.or(remote).or_else(|| {
         let device = device?;
         // An IPv6 address only if the server listens on `::`.
         let any = match device {
@@ -3030,7 +3077,7 @@ fn http_base(
         };
         let socket = UdpSocket::bind((any, 0)).ok()?;
         socket.connect(SocketAddr::new(device, 9)).ok()?;
-        Some(socket.local_addr().ok()?.ip())
+        Some(socket.local_addr().ok()?.ip()).filter(usable)
     })?;
     Some(format!("http://{}", SocketAddr::new(ip, port)))
 }
@@ -3041,6 +3088,7 @@ mod tests {
     use crate::config_store::ConfigStore;
     use crate::entities::SensorKind;
     use crate::server::ArtworkStore;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU8;
 
     #[test]
@@ -3079,7 +3127,7 @@ mod tests {
     fn http_base_address() {
         let lo = IpAddr::from([127, 0, 0, 1]);
         let fixed = IpAddr::from([192, 0, 2, 9]);
-        let base = |a, d, v6| http_base(a, d, v6, 8080);
+        let base = |a, d, v6| http_base(a, None, d, v6, 8080);
         assert_eq!(
             Some("http://192.0.2.9:8080".into()),
             base(Some(fixed), Some(lo), false)
@@ -3098,6 +3146,148 @@ mod tests {
                 base(None, Some(lo6), true)
             );
         }
+    }
+
+    #[test]
+    fn http_base_uses_the_remote_address() {
+        let fixed = IpAddr::from([192, 0, 2, 9]);
+        let remote = IpAddr::from([192, 0, 2, 20]);
+        let v6_device = Some(IpAddr::from(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+        let base = |a, r| http_base(a, r, v6_device, false, 8080);
+        assert_eq!(
+            Some("http://192.0.2.9:8080".into()),
+            base(Some(fixed), Some(remote)),
+            "listen address first"
+        );
+        assert_eq!(
+            Some("http://192.0.2.20:8080".into()),
+            base(None, Some(remote))
+        );
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 20).to_ipv6_mapped());
+        assert_eq!(
+            Some("http://192.0.2.20:8080".into()),
+            base(None, Some(mapped))
+        );
+        let link_local = IpAddr::from(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        // IPv6 device with the server on 0.0.0.0: no local address is found.
+        assert_eq!(None, base(None, Some(link_local)), "link-local is skipped");
+        assert_eq!(None, base(None, Some(IpAddr::from([0, 0, 0, 0]))));
+        let global6 = IpAddr::from(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x20));
+        assert_eq!(
+            Some("http://[2001:db8::20]:8080".into()),
+            base(None, Some(global6))
+        );
+    }
+
+    #[actix::test]
+    async fn new_remote_address_rebuilds_the_artwork_url() {
+        let actor = idle_actor("art-remote", None);
+        let url = |actor: &Addr<AppleTvActor>| {
+            actor.send(Run(|act: &mut AppleTvActor| act.s.artwork_url.clone()))
+        };
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.cfg.address = None;
+                act.s.state = Some(PlaybackState::Playing);
+                act.s.artwork_fetch = true;
+                act.s.title = Some("Movie".into());
+                act.s.item_seq = 1;
+                let key = act.s.item_key();
+                let name = act
+                    .ctx
+                    .artwork
+                    .save(&act.key, "art", Some("image/png"), Bytes::new());
+                act.item_art.remember(key, name.clone());
+                // No address yet: the image could not be shown.
+                assert!(!act.show_file(name, 1));
+                assert!(act.ctx.set_remote_ip(IpAddr::from([192, 0, 2, 20])));
+            }))
+            .await
+            .expect("send");
+        actor.send(RemoteAddressChanged).await.expect("send");
+        let first = url(&actor)
+            .await
+            .expect("send")
+            .expect("cached image shown");
+        assert!(first.starts_with("http://192.0.2.20:0/artwork/"), "{first}");
+
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                // The shown image keeps its item and its kept flag.
+                act.s.artwork_item = 0;
+                act.s.artwork_kept = true;
+                assert!(act.ctx.set_remote_ip(IpAddr::from([192, 0, 2, 21])));
+            }))
+            .await
+            .expect("send");
+        actor.send(RemoteAddressChanged).await.expect("send");
+        let (second, item, kept) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let s = &act.s;
+                (s.artwork_url.clone(), s.artwork_item, s.artwork_kept)
+            }))
+            .await
+            .expect("send");
+        let second = second.expect("image");
+        assert!(
+            second.starts_with("http://192.0.2.21:0/artwork/"),
+            "{second}"
+        );
+        assert_eq!((0, true), (item, kept));
+
+        // A device URL is not a file of the driver: it stays.
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.shown_file = None;
+                act.s.artwork_url = Some("https://cdn.example/a.jpg".into());
+                assert!(act.ctx.set_remote_ip(IpAddr::from([192, 0, 2, 22])));
+            }))
+            .await
+            .expect("send");
+        actor.send(RemoteAddressChanged).await.expect("send");
+        let cdn = url(&actor).await.expect("send");
+        assert_eq!(Some("https://cdn.example/a.jpg".into()), cdn);
+
+        // An IPv4 address that comes as IPv6 is stored as IPv4.
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let mapped = |ip: Ipv4Addr| IpAddr::V6(ip.to_ipv6_mapped());
+                let lan = Ipv4Addr::new(192, 0, 2, 23);
+                assert!(act.ctx.set_remote_ip(mapped(lan)));
+                assert_eq!(Some(IpAddr::V4(lan)), act.ctx.remote_ip());
+                assert!(!act.ctx.set_remote_ip(IpAddr::V4(lan)), "same address");
+                assert!(
+                    !act.ctx.set_remote_ip(mapped(Ipv4Addr::LOCALHOST)),
+                    "loopback"
+                );
+            }))
+            .await
+            .expect("send");
+    }
+
+    #[actix::test]
+    async fn listen_address_ignores_the_remote_address() {
+        let actor = idle_actor("art-listen", Some(IpAddr::from([192, 0, 2, 9])));
+        let url = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let name = act
+                    .ctx
+                    .artwork
+                    .save(&act.key, "art", Some("image/png"), Bytes::new());
+                assert!(act.show_file(name, 1));
+                assert!(act.ctx.set_remote_ip(IpAddr::from([192, 0, 2, 20])));
+                act.s.artwork_url.clone()
+            }))
+            .await
+            .expect("send");
+        actor.send(RemoteAddressChanged).await.expect("send");
+        let after = actor
+            .send(Run(|act: &mut AppleTvActor| act.s.artwork_url.clone()))
+            .await
+            .expect("send");
+        assert_eq!(url, after);
+        let url = url.expect("image");
+        assert!(url.starts_with("http://192.0.2.9:0/artwork/"), "{url}");
     }
 
     /// Drops all device events.
@@ -3126,6 +3316,7 @@ mod tests {
             store: ConfigStore::new(&dir),
             artwork: ArtworkStore::new(dir.join("artwork")),
             siri_mode: AtomicU8::new(0),
+            remote_ip: Mutex::default(),
         });
         let cfg = crate::config_store::tests::device();
         AppleTvActor::new(
