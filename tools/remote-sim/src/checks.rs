@@ -531,7 +531,13 @@ fn now_playing_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
     let mp = ctx.mp();
     let np = oracle.now_playing();
     let shown = c.text(&mp, "media_title");
-    if let Some(title) = np.title.as_deref().filter(|t| !t.is_empty())
+    // Like the driver: an episode shows its own title, not the show name.
+    let title = np
+        .subtitle
+        .as_deref()
+        .filter(|_| np.episode.is_some())
+        .or(np.title.as_deref());
+    if let Some(title) = title.filter(|t| !t.is_empty())
         && !shown.contains(title)
     {
         out.push(format!("media_title {shown:?}, Apple TV {title:?}"));
