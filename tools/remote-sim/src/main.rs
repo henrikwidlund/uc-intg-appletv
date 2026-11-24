@@ -27,6 +27,49 @@ use std::path::PathBuf;
 use std::time::Instant;
 use ws::Client;
 
+/// All steps in the order of [`run`].
+const STEPS: [&str; 25] = [
+    "metadata",
+    "setup_input",
+    "setup",
+    "entities",
+    "states",
+    "values",
+    "remote_ui",
+    "standby",
+    "remote_wake",
+    "power",
+    "remote_commands",
+    "simple_commands",
+    "app_select",
+    "volume",
+    "playback",
+    "languages",
+    "artwork",
+    "abort_setup",
+    "configure",
+    "backup_restore",
+    "driver_restart",
+    "config_file",
+    "broken_config",
+    "restore_power",
+    "log",
+];
+/// Steps that set up the driver and connect it. The other checks need them.
+const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
+/// Steps at the end that set the Apple TV back and check the driver log.
+const END_STEPS: [&str; 2] = ["restore_power", "log"];
+
+/// A step runs if `--only` is empty or names it, or if it is in [`BASE_STEPS`] or
+/// [`END_STEPS`]. `--skip` wins.
+fn selected(only: &[String], skip: &[String], name: &str) -> bool {
+    (only.is_empty()
+        || BASE_STEPS.contains(&name)
+        || END_STEPS.contains(&name)
+        || only.iter().any(|n| n == name))
+        && !skip.iter().any(|n| n == name)
+}
+
 const USAGE: &str = "Usage:
   remote-sim pair <address> [--credentials <path>]
   remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--port <port>]
@@ -128,8 +171,7 @@ impl Ctx {
     }
 
     fn selected(&self, name: &str) -> bool {
-        (self.opt.only.is_empty() || self.opt.only.iter().any(|n| n == name))
-            && !self.opt.skip.iter().any(|n| n == name)
+        selected(&self.opt.only, &self.opt.skip, name)
     }
 
     /// Run a check and print the result. Returns false for a failure.
@@ -184,12 +226,6 @@ fn parse() -> Result<Options, String> {
     if opt.pair || opt.pair_driver {
         args.next();
     }
-    let list = |v: Option<String>| -> Vec<String> {
-        v.unwrap_or_default()
-            .split(',')
-            .map(str::to_owned)
-            .collect()
-    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => opt.config = args.next().ok_or("--config needs a path")?.into(),
@@ -197,8 +233,8 @@ fn parse() -> Result<Options, String> {
             "--credentials" => {
                 opt.credentials = args.next().ok_or("--credentials needs a path")?.into();
             }
-            "--only" => opt.only = list(args.next()),
-            "--skip" => opt.skip = list(args.next()),
+            "--only" => opt.only.extend(step_list("--only", args.next())?),
+            "--skip" => opt.skip.extend(step_list("--skip", args.next())?),
             "--no-power" => opt.no_power = true,
             "--port" => {
                 opt.port = args
@@ -220,6 +256,25 @@ fn parse() -> Result<Options, String> {
         return Err("the Apple TV address is missing".into());
     }
     Ok(opt)
+}
+
+/// Step names of `--only` or `--skip`, separated by commas. Refuses a missing value and unknown
+/// or empty names.
+fn step_list(flag: &str, value: Option<String>) -> Result<Vec<String>, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs step names"))?;
+    value
+        .split(',')
+        .map(|name| {
+            if STEPS.contains(&name) {
+                Ok(name.to_owned())
+            } else {
+                Err(format!(
+                    "{flag}: unknown step {name:?}. Steps: {}",
+                    STEPS.join(", ")
+                ))
+            }
+        })
+        .collect()
 }
 
 fn exit(message: &str) -> ! {
@@ -345,13 +400,19 @@ async fn pair_driver(ctx: &mut Ctx, stamp: u64) -> Result<(), Fail> {
 async fn run(ctx: &mut Ctx) {
     ctx.step("metadata", checks::metadata).await;
     ctx.step("setup_input", checks::setup_input).await;
-    // A failed setup or connect makes all other checks fail, so the run ends there.
-    if !ctx.step("setup", checks::setup_restore).await
-        || !ctx.step("entities", checks::entities).await
-        || !ctx.step("states", checks::states).await
+    // A failed setup or connect makes the other checks fail, so only the end steps run then.
+    if ctx.step("setup", checks::setup_restore).await
+        && ctx.step("entities", checks::entities).await
+        && ctx.step("states", checks::states).await
     {
-        return;
+        middle_steps(ctx).await;
     }
+    ctx.step("restore_power", checks::restore_power).await;
+    ctx.step("log", checks::log).await;
+}
+
+/// The checks between the base steps and the end steps.
+async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("values", checks::values).await;
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
@@ -370,6 +431,74 @@ async fn run(ctx: &mut Ctx) {
     ctx.step("driver_restart", checks::driver_restart).await;
     ctx.step("config_file", checks::config_file).await;
     ctx.step("broken_config", checks::broken_config).await;
-    ctx.step("restore_power", checks::restore_power).await;
-    ctx.step("log", checks::log).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_selection() {
+        let names = |v: &[&str]| v.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        assert!(selected(&[], &[], "playback"), "no --only runs all");
+        let only = names(&["playback"]);
+        for name in [
+            "playback",
+            "setup",
+            "entities",
+            "states",
+            "restore_power",
+            "log",
+        ] {
+            assert!(selected(&only, &[], name), "{name}");
+        }
+        assert!(!selected(&only, &[], "languages"));
+        assert!(!selected(&only, &names(&["setup"]), "setup"), "--skip wins");
+        assert!(!selected(&[], &names(&["log"]), "log"));
+    }
+
+    /// Body of the fn that starts with `head`.
+    fn body<'a>(src: &'a str, head: &str) -> &'a str {
+        let start = src.find(head).unwrap_or_else(|| panic!("{head}"));
+        let len = src[start..].find("\n}\n").expect("end of fn");
+        &src[start..start + len]
+    }
+
+    /// `STEPS` has the steps of `run` and `middle_steps` in the order they run.
+    #[test]
+    fn steps_match_run() {
+        let src = include_str!("main.rs");
+        let middle = body(src, "async fn middle_steps(");
+        let run = body(src, "async fn run(").replace("middle_steps(ctx).await", middle);
+        let mut last = 0;
+        for name in STEPS {
+            let at = run
+                .find(&format!("ctx.step(\"{name}\""))
+                .unwrap_or_else(|| panic!("{name} not in run"));
+            assert!(at > last, "{name} out of order");
+            last = at;
+        }
+        let in_run = run.matches("ctx.step(\"").count();
+        assert_eq!(STEPS.len(), in_run, "a step of run is not in STEPS");
+        // The base steps run before the middle steps; the end steps run last.
+        let middle_at = run.find("async fn middle_steps(").expect("middle_steps");
+        for name in BASE_STEPS {
+            let at = run.find(&format!("ctx.step(\"{name}\"")).expect(name);
+            assert!(at < middle_at, "{name} is not a base step");
+        }
+        assert!(STEPS.ends_with(&END_STEPS), "end steps are not last");
+    }
+
+    #[test]
+    fn step_names() {
+        let only = |v: &str| step_list("--only", Some(v.to_owned()));
+        assert_eq!(
+            Ok(vec!["playback".to_owned(), "log".to_owned()]),
+            only("playback,log")
+        );
+        assert!(step_list("--only", None).is_err(), "missing value");
+        for bad in ["", "playbak", "playback,", "a,,b"] {
+            assert!(only(bad).is_err(), "{bad:?}");
+        }
+    }
 }

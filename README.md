@@ -174,8 +174,12 @@ tools/remote-sim/target/debug/remote-sim 192.168.1.20
 ```
 
 Start a video with chapters and more than one audio language before the run to also test
-playback and languages. `--only a,b` and `--skip a,b` choose the checks, `--no-power` keeps the
-Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to
+playback and languages. `--only a,b` and `--skip a,b` choose the checks; both can be given more
+than once. `--only` also runs `setup`, `entities` and `states`, because the other checks need
+them, and `restore_power` and `log` at the end, unless `--skip` names them. Unknown step names
+are refused. If `setup`, `entities` or `states` fails, only `restore_power` and `log` run after
+it. With `--skip setup`, `entities` fails, because the driver has no device. `--no-power` keeps
+the Apple TV on. The results are saved to `remote-sim-results-<time>.md`. `RUST_LOG` is added to
 the driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`.
 
 ratv is a git dependency with a fixed commit. To test local ratv changes, add this to

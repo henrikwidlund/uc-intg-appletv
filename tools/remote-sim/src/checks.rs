@@ -1893,12 +1893,28 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
 
 pub async fn log(ctx: &mut Ctx) -> Check {
     let text = ctx.driver.log_text();
-    let credentials: Vec<String> = read_config(ctx)?
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|d| d["credentials"].as_str().map(str::to_owned))
-        .collect();
+    // After a failed setup the driver may have no config, so also use the source file.
+    let mut credentials = Vec::new();
+    for path in [ctx.driver.config_file(), ctx.opt.config.clone()] {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Fail::new(format!("{}: {e}", path.display()))),
+        };
+        let config: Value = serde_json::from_str(&text)
+            .map_err(|e| Fail::new(format!("{}: {e}", path.display())))?;
+        credentials.extend(
+            config
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d["credentials"].as_str().map(str::to_owned)),
+        );
+    }
+    ensure!(
+        !credentials.is_empty(),
+        "no credentials to search for in the log"
+    );
     // A part of the secret is enough to find it.
     ensure!(
         !credentials
