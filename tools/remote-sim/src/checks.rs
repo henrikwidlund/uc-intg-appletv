@@ -1334,6 +1334,35 @@ fn home_clear_active(ctx: &Ctx) -> bool {
 /// of now playing. A given app that is not in the source list is a skip.
 async fn bring_to_front(ctx: &mut Ctx, standby: bool, app: Option<String>) -> Result<String, Fail> {
     let mp = ctx.mp();
+    let app = front_app(ctx, &mp, app)?;
+    let title = ctx.client.text(&mp, "media_title");
+    let clear_at_start = standby && home_clear_active(ctx);
+    let front_mark = ctx.driver.log_len();
+    mp_command(ctx, "select_source", json!({ "source": app })).await?;
+    ctx.client.listen(1).await?;
+    ctx.client.wait_text(&mp, "source", 10, &app).await?;
+    // The steps below use the state after the app was opened.
+    wait_front_state(ctx, &app, clear_at_start, front_mark).await?;
+    // Some apps close a paused player when opened: the state stays, the item is gone. Only the
+    // second connection tells this apart. An empty title on the driver can also be an app that
+    // sends no title, or a driver error that this check must find.
+    if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
+        wait_item_cleared(ctx, &mp, &app, &title).await?;
+    }
+    let now = ctx.client.text(&mp, "media_title");
+    Ok(if now == title {
+        format!("{app} in front")
+    } else if title.is_empty() {
+        format!("{app} in front, item {now:?}")
+    } else {
+        format!("{app} in front, item changed from {title:?} to {now:?}")
+    })
+}
+
+/// The app for [`bring_to_front`]: `app`, else the app of now playing, else the source of the
+/// driver. An app that is not in the source list is a skip, or a FAIL when only the Apple TV
+/// names it and the list has entries.
+fn front_app(ctx: &Ctx, mp: &str, app: Option<String>) -> Result<String, Fail> {
     let device_app = app.clone().or_else(|| {
         ctx.oracle
             .as_ref()
@@ -1341,35 +1370,38 @@ async fn bring_to_front(ctx: &mut Ctx, standby: bool, app: Option<String>) -> Re
             .map(str::to_owned)
     });
     let from_driver = device_app.is_none() || app.is_some();
-    let app = device_app.unwrap_or_else(|| ctx.client.text(&mp, "source"));
+    let app = device_app.unwrap_or_else(|| ctx.client.text(mp, "source"));
     if app.is_empty() {
         return Err(Fail::skip(
             "no app to open: the Apple TV and the driver name no app that plays",
         ));
     }
-    if !has_value(ctx, &mp, "source_list", &app) {
-        let empty = ctx
-            .client
-            .attr(&mp, "source_list")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty);
-        if empty || from_driver {
-            return Err(Fail::skip(format!(
-                "no app to open: {app:?} is not in the source list"
-            )));
-        }
-        return Err(Fail::new(format!(
-            "{app} plays on the Apple TV but is not in the driver's source list"
+    if has_value(ctx, mp, "source_list", &app) {
+        return Ok(app);
+    }
+    let empty = ctx
+        .client
+        .attr(mp, "source_list")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if empty || from_driver {
+        return Err(Fail::skip(format!(
+            "no app to open: {app:?} is not in the source list"
         )));
     }
-    let title = ctx.client.text(&mp, "media_title");
-    let clear_at_start = standby && home_clear_active(ctx);
-    let front_mark = ctx.driver.log_len();
-    mp_command(ctx, "select_source", json!({ "source": app })).await?;
-    ctx.client.listen(1).await?;
-    ctx.client.wait_text(&mp, "source", 10, &app).await?;
-    // Opening the app can restart the item, for example a live channel. Wait until the
-    // states agree, then the steps below use the new state.
+    Err(Fail::new(format!(
+        "{app} plays on the Apple TV but is not in the driver's source list"
+    )))
+}
+
+/// Waits until the states agree on PLAYING or PAUSED after `app` was opened. Opening the app can
+/// restart the item, for example a live channel. A scan rate is set back to 1x once.
+async fn wait_front_state(
+    ctx: &mut Ctx,
+    app: &str,
+    clear_at_start: bool,
+    front_mark: usize,
+) -> Result<(), Fail> {
     let total = Duration::from_secs(15);
     let start = Instant::now();
     let deadline = start + total;
@@ -1380,105 +1412,99 @@ async fn bring_to_front(ctx: &mut Ctx, standby: bool, app: Option<String>) -> Re
             Ok(state) => state,
             Err(AgreeError::Other(e)) => return Err(e),
             Err(AgreeError::Timeout(e)) => {
-                let device = ctx.oracle.as_ref().map(Oracle::playback_state);
-                let shown = mp_state(ctx);
-                if shown == "BUFFERING" && device.is_none_or(|d| d == Some(PlaybackState::Seeking))
-                {
-                    return Err(Fail::skip("Apple TV stays in BUFFERING"));
-                }
-                // The Home Screen clear stays until an app has media controls or now playing
-                // changes.
-                if shown == "STANDBY"
-                    && device.is_some_and(|d| {
-                        matches!(d, Some(PlaybackState::Paused | PlaybackState::Interrupted))
-                    })
-                {
-                    if ctx.driver.log_since(front_mark).contains(HOME_CLEAR) {
-                        return Err(Fail::new(format!(
-                            "Home Screen clear fired with {app} in front"
-                        )));
-                    }
-                    if clear_at_start && home_clear_active(ctx) {
-                        return Err(Fail::skip(format!(
-                            "driver keeps the Home Screen clear: driver {shown}, Apple TV {}",
-                            device_text(device)
-                        )));
-                    }
-                }
-                return Err(Fail::new(format!("{app} in front: {}", e.msg)));
+                return Err(front_timeout(ctx, app, clear_at_start, front_mark, &e));
             }
         };
         match state.as_str() {
-            "PLAYING" | "PAUSED" => break,
+            "PLAYING" | "PAUSED" => return Ok(()),
             "STANDBY" => return Err(Fail::skip("app stopped playback when opened")),
             // BUFFERING: a scan rate, or the item loads.
             "BUFFERING" => {
                 if Instant::now() >= deadline {
                     return Err(Fail::skip("Apple TV stays in BUFFERING"));
                 }
-                let fast = ctx
-                    .oracle
-                    .as_ref()
-                    .and_then(Oracle::rate)
-                    .is_some_and(|r| r > 0.0 && (r - 1.0).abs() >= 0.01);
-                if fast && !rate_reset {
+                if !rate_reset && scan_rate(ctx) {
                     rate_reset = true;
-                    let speed = ctx.select("playback_speed");
-                    if has_value(ctx, &speed, "options", "1x") {
-                        ctx.client
-                            .command_ok(
-                                "select",
-                                &speed,
-                                "select_option",
-                                json!({ "option": "1x" }),
-                            )
-                            .await?;
-                    }
+                    speed_to_normal(ctx).await?;
                 }
             }
             _ => return Err(Fail::new(format!("{app} in front: state {state:?}"))),
         }
     }
-    // Some apps close a paused player when opened: the state stays, the item is gone. Only the
-    // second connection tells this apart. An empty title on the driver can also be an app that
-    // sends no title, or a driver error that this check must find.
-    if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
-        // The driver must clear the title and the image. It sends "" for both.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            // The Apple TV can send the item again: then check it as usual.
-            if ctx.oracle.as_ref().and_then(Oracle::has_item) != Some(false) {
-                break;
-            }
-            let no_title = cleared(ctx.client.attr(&mp, "media_title"));
-            let no_image = cleared(ctx.client.attr(&mp, "media_image_url"));
-            if no_title && no_image {
-                return Err(Fail::skip(if title.is_empty() {
-                    format!("{app} has no item")
-                } else {
-                    format!("{app} closed the player when opened")
-                }));
-            }
-            if Instant::now() >= deadline {
-                if !no_title {
-                    let shown = ctx.client.text(&mp, "media_title");
-                    return Err(Fail::new(format!(
-                        "driver shows {shown:?}, Apple TV has no item"
-                    )));
-                }
-                return Err(Fail::new("driver shows an image, Apple TV has no item"));
-            }
-            ctx.client.listen_ms(200).await?;
+}
+
+/// Result of [`wait_front_state`] when the states did not agree in time.
+fn front_timeout(ctx: &Ctx, app: &str, clear_at_start: bool, front_mark: usize, e: &Fail) -> Fail {
+    let device = ctx.oracle.as_ref().map(Oracle::playback_state);
+    let shown = mp_state(ctx);
+    if shown == "BUFFERING" && device.is_none_or(|d| d == Some(PlaybackState::Seeking)) {
+        return Fail::skip("Apple TV stays in BUFFERING");
+    }
+    // The Home Screen clear stays until an app has media controls or now playing changes.
+    let paused = device
+        .is_some_and(|d| matches!(d, Some(PlaybackState::Paused | PlaybackState::Interrupted)));
+    if shown == "STANDBY" && paused {
+        if ctx.driver.log_since(front_mark).contains(HOME_CLEAR) {
+            return Fail::new(format!("Home Screen clear fired with {app} in front"));
+        }
+        if clear_at_start && home_clear_active(ctx) {
+            return Fail::skip(format!(
+                "driver keeps the Home Screen clear: driver {shown}, Apple TV {}",
+                device_text(device)
+            ));
         }
     }
-    let now = ctx.client.text(&mp, "media_title");
-    Ok(if now == title {
-        format!("{app} in front")
-    } else if title.is_empty() {
-        format!("{app} in front, item {now:?}")
-    } else {
-        format!("{app} in front, item changed from {title:?} to {now:?}")
-    })
+    Fail::new(format!("{app} in front: {}", e.msg))
+}
+
+/// The Apple TV plays at a rate other than 1x, for example while it scans forward.
+fn scan_rate(ctx: &Ctx) -> bool {
+    ctx.oracle
+        .as_ref()
+        .and_then(Oracle::rate)
+        .is_some_and(|r| r > 0.0 && (r - 1.0).abs() >= 0.01)
+}
+
+/// Selects the 1x playback speed, if the driver offers it.
+async fn speed_to_normal(ctx: &mut Ctx) -> Result<(), Fail> {
+    let speed = ctx.select("playback_speed");
+    if has_value(ctx, &speed, "options", "1x") {
+        ctx.client
+            .command_ok("select", &speed, "select_option", json!({ "option": "1x" }))
+            .await?;
+    }
+    Ok(())
+}
+
+/// The Apple TV has no item: the driver must clear the title and the image within 3 seconds.
+/// It sends "" for both. A cleared driver is a skip, because the check cannot go on.
+async fn wait_item_cleared(ctx: &mut Ctx, mp: &str, app: &str, title: &str) -> Result<(), Fail> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // The Apple TV can send the item again: then check it as usual.
+        if ctx.oracle.as_ref().and_then(Oracle::has_item) != Some(false) {
+            return Ok(());
+        }
+        let no_title = cleared(ctx.client.attr(mp, "media_title"));
+        let no_image = cleared(ctx.client.attr(mp, "media_image_url"));
+        if no_title && no_image {
+            return Err(Fail::skip(if title.is_empty() {
+                format!("{app} has no item")
+            } else {
+                format!("{app} closed the player when opened")
+            }));
+        }
+        if Instant::now() >= deadline {
+            if !no_title {
+                let shown = ctx.client.text(mp, "media_title");
+                return Err(Fail::new(format!(
+                    "driver shows {shown:?}, Apple TV has no item"
+                )));
+            }
+            return Err(Fail::new("driver shows an image, Apple TV has no item"));
+        }
+        ctx.client.listen_ms(200).await?;
+    }
 }
 
 /// Media player state for a playback state of the Apple TV. Copy of the playback part of
@@ -1824,59 +1850,9 @@ pub async fn languages(ctx: &mut Ctx) -> Check {
     } else {
         sweep(ctx, "subtitles").await?
     };
-    // The driver sends each entity in its own message, the select first. The sensor can be one
-    // message behind, so wait for it.
-    let sensor_id = ctx.sensor("subtitles");
     let subtitles_id = ctx.select("subtitles");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let sensor = ctx.client.text(&sensor_id, "value");
-        let select = ctx.client.text(&subtitles_id, "current_option");
-        if sensor == select {
-            break;
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "subtitles sensor {sensor:?}, select {select:?}"
-        );
-        ctx.client.listen_ms(200).await?;
-    }
-    // The driver has one audio option for each audio language of the Apple TV. The subtitles
-    // select has no options without subtitles, else "Off" and one option for each subtitle (the
-    // Auto entry is renamed, not added). A driver that is behind shows other counts for a short
-    // time, so wait until the counts match.
-    let audio_id = ctx.select("audio_language");
-    let count = |c: &Client, id: &str| {
-        c.attr(id, "options")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-    };
-    let expected_subtitles = |n: usize| if n == 0 { 0 } else { n + 1 };
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let (device, audio, shown_subtitles) = loop {
-        let device = ctx.oracle.as_ref().and_then(Oracle::language_counts);
-        let audio = count(&ctx.client, &audio_id);
-        let shown_subtitles = count(&ctx.client, &subtitles_id);
-        let ok = device.is_none_or(|(a, s)| audio == a && shown_subtitles == expected_subtitles(s));
-        if ok || Instant::now() >= deadline {
-            break (device, audio, shown_subtitles);
-        }
-        ctx.client.listen_ms(200).await?;
-    };
-    if let Some((device_audio, device_subtitles)) = device {
-        let s = plural(device_audio);
-        ensure!(
-            device_audio == audio,
-            "Apple TV has {device_audio} audio language{s}, driver {audio} options"
-        );
-        let expected = expected_subtitles(device_subtitles);
-        let s = plural(device_subtitles);
-        ensure!(
-            shown_subtitles == expected,
-            "Apple TV has {device_subtitles} subtitle language{s}, driver {shown_subtitles} \
-             options, expected {expected}"
-        );
-    }
+    wait_subtitles_sensor(ctx, &subtitles_id).await?;
+    let (audio, shown_subtitles) = language_counts(ctx, &subtitles_id).await?;
     // Languages that came after the sweep were not tested.
     if !auto && subtitles == 0 && shown_subtitles > 0 {
         return Err(Fail::skip("subtitles came after the sweep"));
@@ -1914,6 +1890,66 @@ pub async fn languages(ctx: &mut Ctx) -> Check {
     } else {
         format!("{audio_note}, {subtitles} subtitle options")
     })
+}
+
+/// Waits until the subtitles sensor shows the option of the subtitles select. The driver sends
+/// each entity in its own message, the select first. The sensor can be one message behind.
+async fn wait_subtitles_sensor(ctx: &mut Ctx, subtitles_id: &str) -> Result<(), Fail> {
+    let sensor_id = ctx.sensor("subtitles");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let sensor = ctx.client.text(&sensor_id, "value");
+        let select = ctx.client.text(subtitles_id, "current_option");
+        if sensor == select {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "subtitles sensor {sensor:?}, select {select:?}"
+        );
+        ctx.client.listen_ms(200).await?;
+    }
+}
+
+/// Option counts of the audio and subtitles selects, checked against the Apple TV.
+async fn language_counts(ctx: &mut Ctx, subtitles_id: &str) -> Result<(usize, usize), Fail> {
+    // The driver has one audio option for each audio language of the Apple TV. The subtitles
+    // select has no options without subtitles, else "Off" and one option for each subtitle (the
+    // Auto entry is renamed, not added). A driver that is behind shows other counts for a short
+    // time, so wait until the counts match.
+    let audio_id = ctx.select("audio_language");
+    let count = |c: &Client, id: &str| {
+        c.attr(id, "options")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let expected_subtitles = |n: usize| if n == 0 { 0 } else { n + 1 };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (device, audio, shown_subtitles) = loop {
+        let device = ctx.oracle.as_ref().and_then(Oracle::language_counts);
+        let audio = count(&ctx.client, &audio_id);
+        let shown_subtitles = count(&ctx.client, subtitles_id);
+        let ok = device.is_none_or(|(a, s)| audio == a && shown_subtitles == expected_subtitles(s));
+        if ok || Instant::now() >= deadline {
+            break (device, audio, shown_subtitles);
+        }
+        ctx.client.listen_ms(200).await?;
+    };
+    if let Some((device_audio, device_subtitles)) = device {
+        let s = plural(device_audio);
+        ensure!(
+            device_audio == audio,
+            "Apple TV has {device_audio} audio language{s}, driver {audio} options"
+        );
+        let expected = expected_subtitles(device_subtitles);
+        let s = plural(device_subtitles);
+        ensure!(
+            shown_subtitles == expected,
+            "Apple TV has {device_subtitles} subtitle language{s}, driver {shown_subtitles} \
+             options, expected {expected}"
+        );
+    }
+    Ok((audio, shown_subtitles))
 }
 
 /// "s" for a count other than 1.
@@ -3630,7 +3666,7 @@ pub async fn log(ctx: &mut Ctx) -> Check {
     // After a failed setup the driver may have no config, so also use the source file.
     let mut credentials = Vec::new();
     for path in [ctx.driver.config_file(), ctx.opt.config.clone()] {
-        let text = match std::fs::read_to_string(&path) {
+        let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(Fail::new(format!("{}: {e}", path.display()))),

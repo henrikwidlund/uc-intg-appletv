@@ -3464,12 +3464,9 @@ mod tests {
             "send_cmd",
             Some(serde_json::json!({ "command": "CURSOR_UP" })),
         );
+        settle_store(&actor).await;
         let counts = actor
             .send(Run(move |act: &mut AppleTvActor| {
-                // The writer thread of the store allocates when it first waits. Let it handle a
-                // job and wait once, so this is not counted.
-                act.ctx.store.flush();
-                std::thread::sleep(Duration::from_millis(20));
                 act.s.power = Power::On;
                 let mut count = |msg: &Command| {
                     let (calls, blocks) = crate::util::alloc_count::blocks(|| {
@@ -3493,12 +3490,9 @@ mod tests {
     #[actix::test]
     async fn dhat_position_emit() {
         let actor = idle_actor("dhat-emit", None);
+        settle_store(&actor).await;
         let blocks = actor
             .send(Run(|act: &mut AppleTvActor| {
-                // The writer thread of the store allocates when it first waits. Let it handle a
-                // job and wait once, so this is not counted.
-                act.ctx.store.flush();
-                std::thread::sleep(Duration::from_millis(20));
                 act.s.power = Power::On;
                 act.s.state = Some(PlaybackState::Playing);
                 act.s.elapsed = Some(20.0);
@@ -3520,12 +3514,9 @@ mod tests {
     #[actix::test]
     async fn dhat_artwork_url() {
         let actor = idle_actor("dhat-artwork", Some(IpAddr::from([192, 0, 2, 9])));
+        settle_store(&actor).await;
         let blocks = actor
             .send(Run(|act: &mut AppleTvActor| {
-                // The writer thread of the store allocates when it first waits. Let it handle a
-                // job and wait once, so this is not counted.
-                act.ctx.store.flush();
-                std::thread::sleep(Duration::from_millis(20));
                 act.s.power = Power::On;
                 act.s.state = Some(PlaybackState::Playing);
                 let save = |act: &AppleTvActor, id: &str| {
@@ -3590,6 +3581,17 @@ mod tests {
     impl Handler<DeviceEvent> for NoController {
         type Result = ();
         fn handle(&mut self, _: DeviceEvent, _: &mut Context<Self>) {}
+    }
+
+    /// The writer thread of the store allocates when it first waits. Let it handle a job and
+    /// wait once, so this is not counted.
+    #[cfg(feature = "dhat-heap")]
+    async fn settle_store(actor: &Addr<AppleTvActor>) {
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.ctx.store.flush()))
+            .await
+            .expect("send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     /// An actor that is not connected. It does not connect until it gets `Connect`.
