@@ -10,8 +10,9 @@ use crate::controller::{
 use crate::errors::ServiceError;
 use crate::server::ws::{VoiceCount, WsConn};
 use actix::{Actor, ActorFutureExt, Addr, AsyncContext, Handler, WrapFuture};
-use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
+use actix_ws::{AggregatedMessage, CloseCode, CloseReason, ProtocolError, Session};
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use prost::Message;
 use std::borrow::Cow;
@@ -29,6 +30,8 @@ use uc_api::ws::{WsMessage, WsResultMsgData};
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Messages that can wait to be sent to one Remote.
 const MAILBOX_CAPACITY: usize = 1024;
+/// Longest wait for a close frame after a read error.
+const BUFFERED_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Keys with secret string values: the pairing PIN, and the backup with the pairing keys.
 const SECRET_KEYS: [&str; 3] = ["\"pin\"", "\"restore_data\"", "\"backup_data\""];
 
@@ -112,7 +115,6 @@ impl WsConn {
         mut stream: actix_ws::AggregatedMessageStream,
     ) {
         use actix_web::rt::time;
-        use futures::StreamExt;
 
         // The driver does not check the auth token, so the authentication message is sent right away.
         let _ = session.text(self.authentication.clone()).await;
@@ -180,8 +182,19 @@ impl WsConn {
                             }
                         }
                         Some(Err(e)) => {
-                            info!("[{}] Closing WebSocket: {e:?}", self.id);
-                            close(session, None).await;
+                            let reply = if let Some(reason) = buffered_close(&mut stream).await {
+                                debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                info!(
+                                    "[{}] Remote closed connection. Reason: {reason:?}",
+                                    self.id
+                                );
+                                // Answered like a close in `handle_stream_message`.
+                                Some(reason.unwrap_or_else(|| CloseCode::Normal.into()))
+                            } else {
+                                info!("[{}] Closing WebSocket: {e:?}", self.id);
+                                None
+                            };
+                            close(session, reply).await;
                             break;
                         }
                         None => {
@@ -533,6 +546,29 @@ fn string_values(text: &str, key: &str, ranges: &mut Vec<(usize, usize)>) {
             ranges.push((start, start + end));
         }
     }
+}
+
+/// The close frame that the Remote sent just before the connection ended, if any.
+///
+/// When a close frame and the end of the connection arrive together, actix-ws returns the read
+/// error first and the close frame on the next read. The Remote closes its socket right after its
+/// close frame, so this is the normal case for a close by the Remote.
+///
+/// Other messages are skipped. Stops at an error, at the end of the stream, or after
+/// [`BUFFERED_CLOSE_TIMEOUT`]. `Some(None)` is a close frame without a reason.
+async fn buffered_close<S>(stream: &mut S) -> Option<Option<CloseReason>>
+where
+    S: Stream<Item = Result<AggregatedMessage, ProtocolError>> + Unpin,
+{
+    let find = async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let AggregatedMessage::Close(reason) = msg {
+                return Some(reason);
+            }
+        }
+        None
+    };
+    timeout(BUFFERED_CLOSE_TIMEOUT, find).await.ok().flatten()
 }
 
 /// Close the session. Does not wait long if the Remote does not read.
@@ -948,6 +984,33 @@ mod tests {
         assert_eq!(Some(server_addr.ip()), stored);
         drop(client);
         handle.stop(false).await;
+    }
+
+    #[actix::test]
+    async fn buffered_close_finds_close_or_stops() {
+        use super::buffered_close;
+        use actix_ws::{AggregatedMessage, CloseCode, ProtocolError};
+        use futures::stream;
+
+        let close = AggregatedMessage::Close(Some(CloseCode::Normal.into()));
+        let ping = AggregatedMessage::Ping(bytes::Bytes::new());
+        let mut s = stream::iter([Ok(ping), Ok(close)]);
+        assert_eq!(
+            Some(Some(CloseCode::Normal.into())),
+            buffered_close(&mut s).await
+        );
+        let mut s = stream::iter([Ok(AggregatedMessage::Close(None))]);
+        assert_eq!(Some(None), buffered_close(&mut s).await);
+        let mut s = stream::iter(Vec::<Result<AggregatedMessage, ProtocolError>>::new());
+        assert_eq!(None, buffered_close(&mut s).await);
+        let mut s = stream::iter([
+            Err(ProtocolError::Overflow),
+            Ok(AggregatedMessage::Close(None)),
+        ]);
+        assert_eq!(None, buffered_close(&mut s).await);
+        // `buffered_close` stops at the time limit for a stream that does not end.
+        let mut s = stream::pending::<Result<AggregatedMessage, ProtocolError>>();
+        assert_eq!(None, buffered_close(&mut s).await);
     }
 
     #[actix::test]

@@ -3312,10 +3312,9 @@ pub async fn ws_idle(ctx: &mut Ctx) -> Check {
     Ok("45 s without messages".into())
 }
 
-/// A Remote that closes the connection. The driver must end the session. The note says whether
-/// the driver read the close frame. The Remote's client closes the socket right after the close
-/// frame. actix-ws then returns the read error before that close frame, and the driver stops
-/// reading at the first error, so the driver usually logs a read error.
+/// A Remote that closes the connection. The driver must read the close frame and end the session.
+/// The Remote's client closes the socket right after the close frame. actix-ws then returns a read
+/// error before that close frame, and the driver reads on to find it.
 pub async fn ws_close(ctx: &mut Ctx) -> Check {
     const NEW: &str = "New WebSocket connection from: ";
     let mark = ctx.driver.log_len();
@@ -3350,7 +3349,9 @@ pub async fn ws_close(ctx: &mut Ctx) -> Check {
                 .map_or("no close line", |l| {
                     l.split_once(&id).map_or(l, |(_, rest)| rest.trim())
                 });
-            return Ok(format!("session ended without the close frame: {how}"));
+            return Err(Fail::new(format!(
+                "the session ended without the close frame: {how}"
+            )));
         }
         ensure!(
             Instant::now() < deadline,
