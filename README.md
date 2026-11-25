@@ -98,7 +98,7 @@ cargo run --release
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                  |
 | `UC_SETUP_TIMEOUT`         | `3600`              | Setup timeout in seconds. `0` disables it.                             |
 | `UC_CLIENT_NAME`           | host name           | Name shown on the Apple TV for the pairing.                            |
-| `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. Can contain PINs.        |
+| `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. PINs and backups hidden. |
 | `RUST_LOG`                 | `info`              | Log level, for example `info,uc_intg_appletv=debug`.                   |
 
 `config.json` contains the pairing keys. Only the owner can read it.
@@ -136,7 +136,7 @@ To restore, choose _Restore configuration from backup_ in the setup, or tick _Re
 _Restore_ page of a new setup. Paste the data. It replaces all configured devices.
 
 The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never writes the backup
-data to the log. With `UC_API_MSG_TRACING`, the messages with backup data are hidden.
+data to the log. With `UC_API_MSG_TRACING`, the backup data and the PIN are shown as `***`.
 
 ## Build
 

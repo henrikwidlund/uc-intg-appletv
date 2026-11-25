@@ -33,9 +33,9 @@ struct WsConn {
     /// [`Controller`] address for sending events and requests.
     controller_addr: Addr<Controller>,
     heartbeat: HeartbeatSettings,
-    /// Log every incoming message. Messages can contain PINs!
+    /// Log every incoming message. PINs and backup data are hidden.
     msg_tracing_in: bool,
-    /// Log every outgoing message.
+    /// Log every outgoing message. PINs and backup data are hidden.
     msg_tracing_out: bool,
     /// Audio received in the last voice session.
     voice: VoiceCount,

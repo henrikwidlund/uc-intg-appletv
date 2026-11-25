@@ -14,6 +14,7 @@ use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use prost::Message;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -28,6 +29,8 @@ use uc_api::ws::{WsMessage, WsResultMsgData};
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Messages that can wait to be sent to one Remote.
 const MAILBOX_CAPACITY: usize = 1024;
+/// Keys with secret string values: the pairing PIN, and the backup with the pairing keys.
+const SECRET_KEYS: [&str; 3] = ["\"pin\"", "\"restore_data\"", "\"backup_data\""];
 
 /// Sends messages from the controller to the WebSocket connection.
 ///
@@ -38,6 +41,9 @@ struct WsSender {
     id: Arc<str>,
     session: Session,
     msg_tracing_out: bool,
+    /// Start of the last send, for the trace. `handle` runs only after the previous send is done,
+    /// because `wait` blocks the mailbox.
+    last_send: Option<Instant>,
 }
 
 impl Actor for WsSender {
@@ -56,7 +62,12 @@ impl Handler<SendWsMessage> for WsSender {
 
     fn handle(&mut self, msg: SendWsMessage, ctx: &mut Self::Context) {
         let id = Arc::clone(&self.id);
-        let msg_tracing_out = self.msg_tracing_out;
+        let trace = self.msg_tracing_out.then(|| {
+            let now = Instant::now();
+            self.last_send
+                .replace(now)
+                .map_or(Duration::ZERO, |last| now.duration_since(last))
+        });
         let mut session = self.session.clone();
 
         // `wait` blocks the mailbox until the message is sent: keeps the order.
@@ -64,12 +75,10 @@ impl Handler<SendWsMessage> for WsSender {
             async move {
                 let send = async {
                     match msg {
-                        SendWsMessage::Msg(m) => {
-                            WsConn::send(&id, msg_tracing_out, &m, &mut session).await
-                        }
+                        SendWsMessage::Msg(m) => WsConn::send(&id, trace, &m, &mut session).await,
                         SendWsMessage::Text(text) => {
-                            if msg_tracing_out {
-                                debug!("[{id}] <- {text}");
+                            if let Some(gap) = trace {
+                                trace_out(&id, gap, &text);
                             }
                             session.text(text).await.map_err(|e| {
                                 error!("[{id}] WebSocket send error: {e}");
@@ -112,6 +121,7 @@ impl WsConn {
             id: Arc::clone(&self.id),
             session: session.clone(),
             msg_tracing_out: self.msg_tracing_out,
+            last_send: None,
         }
         .start();
 
@@ -203,11 +213,7 @@ impl WsConn {
         match msg {
             AggregatedMessage::Text(text) => {
                 if self.msg_tracing_in {
-                    if is_backup_message(&text) {
-                        debug!("[{}] -> <backup data hidden>", self.id);
-                    } else {
-                        debug!("[{}] -> {text}", self.id);
-                    }
+                    debug!("[{}] -> {}", self.id, redact(&text));
                 }
                 self.handle_text_message(&text, sender);
                 Ok(())
@@ -390,20 +396,19 @@ impl WsConn {
     }
 
     /// Send a message to the WebSocket session. Returns `Err` if the session is closed.
+    ///
+    /// `trace` is the time since the previous outgoing message. `None` if outgoing messages are not
+    /// traced.
     async fn send(
         id: &str,
-        msg_tracing_out: bool,
+        trace: Option<Duration>,
         msg: &WsMessage,
         session: &mut Session,
     ) -> Result<(), Option<CloseReason>> {
         match serde_json::to_string(msg) {
             Ok(text) => {
-                if msg_tracing_out {
-                    if is_backup_message(&text) {
-                        debug!("[{id}] <- <backup data hidden>");
-                    } else {
-                        debug!("[{id}] <- {text}");
-                    }
+                if let Some(gap) = trace {
+                    trace_out(id, gap, &text);
                 }
                 session.text(text).await.map_err(|e| {
                     error!("[{id}] WebSocket send error: {e}");
@@ -470,9 +475,64 @@ struct RequestId<'a> {
     id: Option<u32>,
 }
 
-/// Returns `true` for a setup message with backup data. It contains the pairing credentials.
-fn is_backup_message(text: &str) -> bool {
-    text.contains("\"backup_data\"") || text.contains("\"restore_data\"")
+/// Logs an outgoing message with the time since the previous one. Secrets are hidden.
+fn trace_out(id: &str, gap: Duration, text: &str) {
+    debug!("[{id}] <- (+{} ms) {}", gap.as_millis(), redact(text));
+}
+
+/// `text` with secret string values replaced by `***`, for the message trace. Empty values stay,
+/// so the trace shows that a field was empty. The backup page has the backup in a `value` field,
+/// so in a message with `backup_data` every `value` string is replaced too.
+fn redact(text: &str) -> Cow<'_, str> {
+    let mut ranges = Vec::new();
+    for key in SECRET_KEYS {
+        string_values(text, key, &mut ranges);
+    }
+    if text.contains("\"backup_data\"") {
+        string_values(text, "\"value\"", &mut ranges);
+    }
+    if ranges.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end) in ranges {
+        if start < at {
+            continue;
+        }
+        out.push_str(&text[at..start]);
+        out.push_str("***");
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Cow::Owned(out)
+}
+
+/// Adds the byte ranges of the non-empty string values of `key` in the JSON `text`. A range is the
+/// part between the quotes, or up to the end of `text` if the closing quote is missing. `key`
+/// includes its quotes.
+fn string_values(text: &str, key: &str, ranges: &mut Vec<(usize, usize)>) {
+    for (pos, _) in text.match_indices(key) {
+        let Some(value) = text[pos + key.len()..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(content) = value.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let start = text.len() - content.len();
+        let mut escaped = false;
+        let end = content.bytes().position(|b| {
+            let quote = !escaped && b == b'"';
+            escaped = !escaped && b == b'\\';
+            quote
+        });
+        // Without a closing quote, the rest of the text is hidden.
+        let end = end.unwrap_or(content.len());
+        if end > 0 {
+            ranges.push((start, start + end));
+        }
+    }
 }
 
 /// Close the session. Does not wait long if the Remote does not read.
@@ -534,7 +594,7 @@ fn log_voice_end(id: &str, session_id: u32, count: VoiceCount) {
 }
 #[cfg(test)]
 mod tests {
-    use super::{RequestId, Route, invalid_message_response, is_backup_message, route, supported};
+    use super::{RequestId, Route, invalid_message_response, redact, route, supported};
     use crate::configuration::HeartbeatSettings;
     use crate::controller::R2AudioChunkMsg;
     use crate::controller::test_util::controller;
@@ -542,6 +602,7 @@ mod tests {
     use actix::{Actor, Handler, MessageResult};
     use bytestring::ByteString;
     use prost::Message;
+    use std::borrow::Cow;
     use uc_api::intg::proto::{
         AudioConfiguration, AudioFormat, IntegrationMessage, RemoteVoiceBegin, RemoteVoiceData,
         RemoteVoiceEnd, SampleFormat, integration_message::Message as ProtoMsg,
@@ -726,12 +787,65 @@ mod tests {
     }
 
     #[test]
-    fn backup_messages_are_found() {
-        assert!(is_backup_message(
-            r#"{"input_values":{"restore_data":"x"}}"#
-        ));
-        assert!(is_backup_message(r#"{"settings":[{"id":"backup_data"}]}"#));
-        assert!(!is_backup_message(r#"{"input_values":{"pin":"1234"}}"#));
+    fn trace_hides_pin_and_backup() {
+        assert_eq!(
+            r#"{"kind":"req","msg":"set_driver_user_data","msg_data":{"input_values":{"pin":"***"}}}"#,
+            redact(
+                r#"{"kind":"req","msg":"set_driver_user_data","msg_data":{"input_values":{"pin":"1234"}}}"#
+            )
+        );
+        assert_eq!(
+            r#"{"input_values": {"restore_data" : "***", "address":"10.0.0.2"}}"#,
+            redact(
+                r#"{"input_values": {"restore_data" : "[{\"credentials\":\"k\"}]", "address":"10.0.0.2"}}"#
+            )
+        );
+        // Keys are sorted: the backup `value` comes before `"id":"backup_data"`.
+        assert_eq!(
+            r#"{"settings":[{"field":{"textarea":{"value":"***"}},"id":"backup_data"}]}"#,
+            redact(
+                r#"{"settings":[{"field":{"textarea":{"value":"[{\"a\":1}]"}},"id":"backup_data"}]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn trace_hides_escapes_utf8_and_cut_values() {
+        assert_eq!(r#"{"pin":"***","a":1}"#, redact(r#"{"pin":"12\\","a":1}"#));
+        assert_eq!(
+            r#"{"pin":"***","a":1}"#,
+            redact(r#"{"pin":"1\\\"2","a":1}"#)
+        );
+        assert_eq!(
+            r#"{"pin":"***","ä":"€"}"#,
+            redact(r#"{"pin":"ü€x","ä":"€"}"#)
+        );
+        assert_eq!(
+            r#"{"input_values":{"pin":"***"#,
+            redact(r#"{"input_values":{"pin":"1234"#)
+        );
+        let page = r#"{"msg_data":{"error_message":{"en":"no"},"page":{"settings":[{"field":{"label":{"value":{"en":"Copy"}}},"id":"info"},{"field":{"textarea":{"value":"[{\"k\":\"s\"}]"}},"id":"backup_data"}]}}}"#;
+        let hidden = r#"{"msg_data":{"error_message":{"en":"no"},"page":{"settings":[{"field":{"label":{"value":{"en":"Copy"}}},"id":"info"},{"field":{"textarea":{"value":"***"}},"id":"backup_data"}]}}}"#;
+        assert_eq!(hidden, redact(page));
+    }
+
+    #[test]
+    fn trace_keeps_other_values() {
+        let page = r#"{"settings":[{"field":{"text":{"value":""}},"id":"pin"}]}"#;
+        assert!(
+            matches!(redact(page), Cow::Borrowed(_)),
+            "empty PIN field and the id stay"
+        );
+        let text = r#"{"msg":"entity_change","msg_data":{"attributes":{"media_title":"pin"}}}"#;
+        assert!(matches!(redact(text), Cow::Borrowed(_)));
+        // Text with `\"pin\":\"x\"` inside another string stays.
+        let text = r#"{"msg":"x","text":"a \"pin\":\"x\" b"}"#;
+        assert!(matches!(redact(text), Cow::Borrowed(_)));
+        // An empty value stays, so the trace shows that the field was empty.
+        assert_eq!(
+            r#"{"input_values":{"pin":""}}"#,
+            redact(r#"{"input_values":{"pin":""}}"#)
+        );
     }
 
     /// A WebSocket client over a plain TCP stream, for the close handshake.
