@@ -35,7 +35,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 32] = [
+const STEPS: [&str; 36] = [
     "metadata",
     "setup_input",
     "setup",
@@ -62,6 +62,10 @@ const STEPS: [&str; 32] = [
     "abort_setup",
     "configure",
     "backup_restore",
+    "ws_keepalive",
+    "ws_idle",
+    "ws_close",
+    "ws_driver_restart",
     "driver_restart",
     "config_file",
     "broken_config",
@@ -331,7 +335,8 @@ fn exit(message: &str) -> ! {
     std::process::exit(2);
 }
 
-#[tokio::main(flavor = "current_thread")]
+// The WebSocket client is an actix actor and needs an actix system.
+#[actix::main]
 async fn main() {
     let opt = parse().unwrap_or_else(|e| exit(&format!("{e}\n{USAGE}")));
     let Some(address) = opt.address else {
@@ -554,6 +559,12 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("abort_setup", checks::abort_setup).await;
     ctx.step("configure", checks::configure).await;
     ctx.step("backup_restore", checks::backup_restore).await;
+    // WebSocket behavior of the Remote's client.
+    ctx.step("ws_keepalive", checks::ws_keepalive).await;
+    ctx.step("ws_idle", checks::ws_idle).await;
+    ctx.step("ws_close", checks::ws_close).await;
+    ctx.step("ws_driver_restart", checks::ws_driver_restart)
+        .await;
     ctx.step("driver_restart", checks::driver_restart).await;
     ctx.step("config_file", checks::config_file).await;
     ctx.step("broken_config", checks::broken_config).await;

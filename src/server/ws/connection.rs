@@ -124,13 +124,17 @@ impl WsConn {
             })
             .await
         {
-            error!("Error registering new WebSocket connection: {e}");
+            error!(
+                "[{}] Error registering new WebSocket connection: {e}",
+                self.id
+            );
             let _ = session
                 .close(Some(CloseReason {
                     code: CloseCode::Error,
                     description: Some("internal error".into()),
                 }))
                 .await;
+            debug!("[{}] stopped", self.id);
             return;
         }
 

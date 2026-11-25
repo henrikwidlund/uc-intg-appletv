@@ -1,27 +1,57 @@
 // Copyright (c) 2026 Henrik Widlund
 // SPDX-License-Identifier: MPL-2.0
 
-//! WebSocket client that acts as the Remote.
+//! WebSocket client that acts as the Remote. It uses the WebSocket client of the Remote's core
+//! service (`actix-ws-client`).
 
 use crate::Fail;
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use actix::{Actor, Addr};
+use actix_ws_client::{
+    Connect, Disconnect, DisconnectReason, GenericWebSocketClient, HandlerAction, IsConnected,
+    SendBinary, SendText, WebSocketConfig, WebSocketMessageHandler,
+};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Longest time to wait for the answer to a request. The driver must answer in less than 10 s.
 const ANSWER_LIMIT: Duration = Duration::from_secs(15);
 
+/// What the WebSocket client reports to [`Client`].
+enum Inbound {
+    /// Time of the connect.
+    Connected(Instant),
+    Text(String),
+    Closed(DisconnectReason),
+}
+
+/// Sends the callbacks of the WebSocket client to [`Client`].
+struct Bridge(mpsc::UnboundedSender<Inbound>);
+
+impl WebSocketMessageHandler for Bridge {
+    fn on_text(&mut self, text: String) -> Vec<HandlerAction> {
+        let _ = self.0.send(Inbound::Text(text));
+        Vec::new()
+    }
+
+    fn on_connected(&mut self) -> Vec<HandlerAction> {
+        let _ = self.0.send(Inbound::Connected(Instant::now()));
+        Vec::new()
+    }
+
+    fn on_closed(&mut self, reason: &DisconnectReason) {
+        let _ = self.0.send(Inbound::Closed(reason.clone()));
+    }
+}
+
 pub struct Client {
-    sink: SplitSink<Ws, Message>,
-    stream: SplitStream<Ws>,
+    ws: Addr<GenericWebSocketClient<Bridge>>,
+    inbound: mpsc::UnboundedReceiver<Inbound>,
+    /// Why the connection closed. `None` until a close is read, and again when
+    /// [`Self::wait_connected`] gets a new connection.
+    closed: Option<DisconnectReason>,
     next_id: u32,
     /// Latest attributes of each entity, from `entity_change` events and entity states.
     attrs: HashMap<String, Map<String, Value>>,
@@ -33,13 +63,46 @@ pub struct Client {
     unavailable: Vec<String>,
 }
 
+impl Drop for Client {
+    /// The client keeps its connection, or keeps reconnecting, when all addresses are dropped,
+    /// so close it.
+    fn drop(&mut self) {
+        self.ws.do_send(Disconnect);
+    }
+}
+
+/// Settings of the main client: it does not reconnect, so a closed connection fails the check.
+pub fn no_reconnect() -> WebSocketConfig {
+    WebSocketConfig::builder()
+        .max_reconnect_attempts(0u32)
+        .build()
+        .expect("valid WebSocket settings")
+}
+
 impl Client {
     pub async fn connect(port: u16) -> Result<Self, Fail> {
-        let (ws, _) = connect_async(format!("ws://127.0.0.1:{port}/")).await?;
-        let (sink, stream) = ws.split();
+        Self::connect_with(port, no_reconnect()).await
+    }
+
+    /// Connect with the WebSocket client settings in `config`.
+    pub async fn connect_with(port: u16, config: WebSocketConfig) -> Result<Self, Fail> {
+        let (tx, inbound) = mpsc::unbounded_channel();
+        let ws = GenericWebSocketClient::new(
+            "remote-sim",
+            format!("ws://127.0.0.1:{port}/"),
+            config,
+            Bridge(tx),
+        )?
+        .start();
+        if let Err(e) = ws.send(Connect).await? {
+            // A client that reconnects would keep trying without an owner.
+            ws.do_send(Disconnect);
+            return Err(e.into());
+        }
         let mut client = Self {
-            sink,
-            stream,
+            ws,
+            inbound,
+            closed: None,
             next_id: 0,
             attrs: HashMap::new(),
             setup: VecDeque::new(),
@@ -53,26 +116,78 @@ impl Client {
         Ok(client)
     }
 
-    /// Read messages until `deadline`. Returns the first text message.
+    /// Read messages until `deadline`. Returns the first text message. Fails if the connection is
+    /// closed.
     async fn pump(&mut self, deadline: Instant) -> Result<Option<Value>, Fail> {
         loop {
+            if let Some(reason) = &self.closed {
+                return Err(Fail::new(format!("connection closed: {reason:?}")));
+            }
             let wait = deadline.saturating_duration_since(Instant::now());
-            let Ok(frame) = timeout(wait, self.stream.next()).await else {
+            let Ok(inbound) = timeout(wait, self.inbound.recv()).await else {
                 return Ok(None);
             };
-            match frame {
-                None | Some(Ok(Message::Close(_))) => return Err(Fail::new("connection closed")),
-                Some(Err(e)) => return Err(e.into()),
-                Some(Ok(Message::Text(text))) => {
-                    let value: Value = serde_json::from_str(text.as_str())
+            match inbound {
+                // The client actor stopped.
+                None => self.closed = Some(DisconnectReason::ClosedLocally),
+                Some(Inbound::Closed(reason)) => self.closed = Some(reason),
+                Some(Inbound::Connected(_)) => {}
+                Some(Inbound::Text(text)) => {
+                    let value: Value = serde_json::from_str(&text)
                         .map_err(|e| Fail::new(format!("invalid JSON from the driver: {e}")))?;
                     self.record(&value);
                     return Ok(Some(value));
                 }
-                // Pings are answered by the library.
-                Some(Ok(_)) => {}
             }
         }
+    }
+
+    /// Wait until the connection closes. Returns the reason, or `None` after `secs`. Other
+    /// messages are read.
+    pub async fn wait_closed(&mut self, secs: u64) -> Option<DisconnectReason> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self.closed.is_none() && Instant::now() < deadline {
+            let _ = self.pump(deadline).await;
+        }
+        self.closed.clone()
+    }
+
+    /// Wait for a new connection after a close. Only a client that reconnects gets one. Returns
+    /// the time of the connect. Fails after `secs`.
+    pub async fn wait_connected(&mut self, secs: u64) -> Result<Instant, Fail> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match timeout(wait, self.inbound.recv()).await {
+                Ok(Some(Inbound::Connected(at))) => {
+                    self.closed = None;
+                    return Ok(at);
+                }
+                Ok(Some(Inbound::Closed(reason))) => self.closed = Some(reason),
+                Ok(Some(Inbound::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text)
+                        .map_err(|e| Fail::new(format!("invalid JSON from the driver: {e}")))?;
+                    self.record(&value);
+                }
+                Ok(None) => return Err(Fail::new("the WebSocket client stopped")),
+                Err(_) => {
+                    return Err(Fail::new(format!(
+                        "no new connection in {secs} s, last close: {:?}",
+                        self.closed
+                    )));
+                }
+            }
+        }
+    }
+
+    /// True while the WebSocket client is connected.
+    pub async fn is_connected(&self) -> bool {
+        self.ws.send(IsConnected).await.unwrap_or(false)
+    }
+
+    /// Close the connection with status 1000.
+    pub async fn close(&self) {
+        let _ = self.ws.send(Disconnect).await;
     }
 
     fn record(&mut self, message: &Value) {
@@ -103,12 +218,12 @@ impl Client {
     }
 
     pub async fn send(&mut self, value: Value) -> Result<(), Fail> {
-        self.sink.send(Message::text(value.to_string())).await?;
+        self.ws.send(SendText::new(value.to_string())).await??;
         Ok(())
     }
 
     pub async fn send_binary(&mut self, data: Vec<u8>) -> Result<(), Fail> {
-        self.sink.send(Message::binary(data)).await?;
+        self.ws.send(SendBinary::new(data)).await??;
         Ok(())
     }
 

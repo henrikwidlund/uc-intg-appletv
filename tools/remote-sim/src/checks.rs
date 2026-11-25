@@ -10,6 +10,7 @@
 use crate::oracle::{self, Content, Oracle};
 use crate::ws::{Client, field_ids, field_value};
 use crate::{Check, Ctx, Fail};
+use actix_ws_client::WebSocketConfig;
 use ratv::mrp::PlaybackState;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -345,7 +346,7 @@ fn drop_typed_lines(ctx: &mut Ctx) {
 }
 
 /// Read a line from the terminal. `None` at the end of the input. The WebSocket is read
-/// meanwhile, so the pings of the driver get an answer and the driver keeps the connection.
+/// meanwhile, so a closed connection fails the check and the states stay current.
 async fn read_line(ctx: &mut Ctx) -> Result<Option<String>, Fail> {
     let rx = ctx.stdin.get_or_insert_with(stdin_lines);
     loop {
@@ -2846,7 +2847,8 @@ pub async fn siri_direct(ctx: &mut Ctx) -> Check {
             .ok_or_else(|| Fail::skip("no second connection to compare with"))?;
         let send = oracle.ask_siri(&samples);
         tokio::pin!(send);
-        // Read the WebSocket meanwhile, so the driver keeps the connection.
+        // Read the WebSocket meanwhile, so a closed connection fails the check and the states stay
+        // current.
         loop {
             tokio::select! {
                 sent = &mut send => break sent,
@@ -3282,6 +3284,121 @@ fn cached_apps(ctx: &Ctx) -> Option<usize> {
     cache.get("apps")?.as_array().map(Vec::len)
 }
 
+/// The driver answers the pings of the Remote's client. The client pings every second and closes
+/// after 2 missed answers.
+pub async fn ws_keepalive(ctx: &mut Ctx) -> Check {
+    let config = WebSocketConfig::builder()
+        .ping_interval(Duration::from_secs(1))
+        .max_missed_pongs(2u32)
+        .max_reconnect_attempts(0u32)
+        .build()?;
+    let mut client = Client::connect_with(ctx.driver.port, config).await?;
+    client.listen(5).await?;
+    ensure!(client.is_connected().await, "not connected after 5 s");
+    Ok("5 s with a ping every second".into())
+}
+
+/// A Remote that sends nothing stays connected: the driver pings every 20 s and closes after 40 s
+/// without a message. The client sends no pings, so only its answers to the driver keep the
+/// connection.
+pub async fn ws_idle(ctx: &mut Ctx) -> Check {
+    let config = WebSocketConfig::builder()
+        .ping_enabled(false)
+        .max_reconnect_attempts(0u32)
+        .build()?;
+    let mut client = Client::connect_with(ctx.driver.port, config).await?;
+    client.listen(45).await?;
+    ensure!(client.is_connected().await, "not connected after 45 s");
+    Ok("45 s without messages".into())
+}
+
+/// A Remote that closes the connection. The driver must end the session. The note says whether
+/// the driver read the close frame. The Remote's client closes the socket right after the close
+/// frame. actix-ws then returns the read error before that close frame, and the driver stops
+/// reading at the first error, so the driver usually logs a read error.
+pub async fn ws_close(ctx: &mut Ctx) -> Check {
+    const NEW: &str = "New WebSocket connection from: ";
+    let mark = ctx.driver.log_len();
+    let client = Client::connect(ctx.driver.port).await?;
+    // The driver logs lines of a connection with its peer address as `[id]`.
+    let log = ctx.driver.log_since(mark);
+    let Some(id) = log
+        .lines()
+        .find_map(|l| l.split_once(NEW).map(|(_, id)| format!("[{}]", id.trim())))
+    else {
+        return Err(Fail::new("the driver logged no new connection"));
+    };
+    let stopped = format!("{id} stopped");
+    client.close().await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let log = ctx.driver.log_since(mark);
+        let lines = log.lines().filter(|l| l.contains(&id));
+        if lines.clone().any(|l| l.contains(&stopped)) {
+            if lines
+                .clone()
+                .any(|l| l.contains("Remote closed connection"))
+            {
+                return Ok("the driver read the close frame".into());
+            }
+            // The connection logs why it closes in its last line before `stopped`. The controller
+            // logs "Remote disconnected" on another thread, so that line can come between them.
+            let how = lines
+                .take_while(|l| !l.contains(&stopped))
+                .filter(|l| !l.contains("Remote disconnected"))
+                .last()
+                .map_or("no close line", |l| {
+                    l.split_once(&id).map_or(l, |(_, rest)| rest.trim())
+                });
+            return Ok(format!("session ended without the close frame: {how}"));
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the driver did not end the session in 3 s"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The Remote's client connects again after the driver restarts, like a Remote after a driver
+/// update.
+pub async fn ws_driver_restart(ctx: &mut Ctx) -> Check {
+    let config = WebSocketConfig::builder()
+        .initial_backoff(Duration::from_millis(500))
+        .build()?;
+    let mut client = Client::connect_with(ctx.driver.port, config).await?;
+    let stopped = Instant::now();
+    ctx.driver.stop().await;
+    let reason = client.wait_closed(5).await;
+    // Start the driver also when the check fails, so the next steps have a driver.
+    restart(ctx).await?;
+    ctx.client.forget_states();
+    subscribe_all(ctx).await?;
+    let result = async {
+        let Some(reason) = reason else {
+            return Err(Fail::new("the client saw no close in 5 s"));
+        };
+        let connected = client.wait_connected(10).await?;
+        client.send_event("connect").await?;
+        let states = client.request_ok("get_entity_states", Value::Null).await?;
+        ensure!(
+            states.as_array().is_some_and(|s| !s.is_empty()),
+            "no entity states after the reconnect: {states}"
+        );
+        Ok((connected.duration_since(stopped), reason))
+    }
+    .await;
+    // The next step stops the driver again: let it connect to the Apple TV first. The check error
+    // is reported before an error of this wait.
+    let ready = wait_available(ctx, 30).await;
+    let (took, reason) = result?;
+    ready?;
+    Ok(format!(
+        "close: {reason:?}, connected again {} ms after the driver stop",
+        took.as_millis()
+    ))
+}
+
 pub async fn driver_restart(ctx: &mut Ctx) -> Check {
     let ids = entity_ids(ctx).await?;
     // Wait for the app list, then for the driver to save it to the cache file before the stop.
@@ -3418,8 +3535,11 @@ pub async fn broken_config(ctx: &mut Ctx) -> Check {
     restart(ctx).await?;
     ctx.client.forget_states();
     subscribe_all(ctx).await?;
-    wait_available(ctx, 30).await?;
-    result
+    // The check error is reported before an error of this wait.
+    let ready = wait_available(ctx, 30).await;
+    let note = result?;
+    ready?;
+    Ok(note)
 }
 
 fn bad_files(ctx: &Ctx) -> Vec<std::path::PathBuf> {
