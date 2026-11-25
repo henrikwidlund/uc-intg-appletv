@@ -39,11 +39,19 @@ use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent, IntgRemot
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// The list time is taken at the reply, so the next poll comes a bit early.
 const POLL_MARGIN: Duration = Duration::from_secs(30);
-/// Interval to connect a missing protocol. Each try uses the known endpoints first. The device can
-/// change the port of a service when it restarts, so a refused connect or a missing endpoint scans
-/// for the new one.
-const MISSING_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// Waits between tries to connect a missing protocol. The last wait repeats. Each try uses the
+/// known endpoints first. The device can change the port of a service when it restarts, so a
+/// refused connect or a missing endpoint scans for the new one.
+const MISSING_RETRY_STEPS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A disconnect waits at most this long for a command that is running.
+const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Waits before asking again when a request fails. Right after wake the device is not ready
 /// and answers with an error or not at all.
 const NOT_READY_RETRY: [Duration; 3] = [
@@ -183,7 +191,7 @@ struct Timers {
     reconnect: Option<SpawnHandle>,
     poll: Option<SpawnHandle>,
     chapter: Option<SpawnHandle>,
-    /// Interval to connect a missing protocol.
+    /// Next try to connect a missing protocol.
     missing: Option<SpawnHandle>,
     /// Waits until one of the open protocols closes.
     closed: Option<SpawnHandle>,
@@ -236,7 +244,8 @@ pub struct AppleTvActor {
     status: DeviceStatus,
     /// Sends each status change. Commands wait on it while a connect runs.
     status_tx: watch::Sender<DeviceStatus>,
-    /// The controller wants a connection.
+    /// The controller or a command wants a connection. False while `Connected` only in the wait
+    /// of a [`Disconnect`].
     want: bool,
     /// Delete the cache file in [`Actor::stopped`]. Set by [`Stop`].
     remove_cache: bool,
@@ -247,6 +256,12 @@ pub struct AppleTvActor {
     connected_at: Option<Instant>,
     /// Incremented on each connect and disconnect. Results of older connections are ignored.
     generation: u64,
+    /// Incremented by each [`Disconnect`]. A command from before is not sent, unless it runs (see
+    /// [`Start::running`]).
+    disconnects: u64,
+    /// Set when the address, pairing or device ids change during the wait of a [`Disconnect`].
+    /// A connect or command in the wait then connects again with them.
+    stale_config: bool,
     /// Incremented when Companion connects or closes. Results of older Companion requests are
     /// ignored. A handle from `connect_missing` that keeps Companion keeps this value.
     companion_gen: u64,
@@ -264,6 +279,8 @@ pub struct AppleTvActor {
     siri_lock: Arc<tokio::sync::Mutex<()>>,
     /// Commands run one after the other.
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Commands without the lock that wait for the connect or for `cmd_lock`.
+    waiting_cmds: usize,
     /// Counter of `stop_send` commands. A change stops the running and the waiting commands.
     stop: watch::Sender<u64>,
     timers: Timers,
@@ -294,6 +311,8 @@ pub struct AppleTvActor {
     endpoints: Option<Endpoints>,
     /// A try to connect a missing protocol runs.
     missing_running: bool,
+    /// Index of the next wait in [`MISSING_RETRY_STEPS`].
+    missing_step: usize,
     /// End of the fast retries of a missing protocol while the network is not ready.
     missing_network_end: Option<Instant>,
     /// Mute and power set by the last commands. Used for toggles until the device reports them.
@@ -337,6 +356,8 @@ impl AppleTvActor {
             attempt: 0,
             connected_at: None,
             generation: 0,
+            disconnects: 0,
+            stale_config: false,
             companion_gen: 0,
             mrp_join: watch::Sender::new(None),
             artwork_after_mrp: false,
@@ -357,12 +378,14 @@ impl AppleTvActor {
             http_base: None,
             endpoints: None,
             missing_running: false,
+            missing_step: 0,
             missing_network_end: None,
             expected_mute: None,
             expected_power: None,
             network_retry_end: None,
             command_timeouts: VecDeque::with_capacity(MAX_COMMAND_TIMEOUTS),
             cmd_lock: Arc::default(),
+            waiting_cmds: 0,
             stop: watch::Sender::new(0),
             timers: Timers::default(),
             apps_fetched: None,
@@ -806,20 +829,42 @@ impl AppleTvActor {
         }
     }
 
-    /// Try the missing protocols now and then at each [`MISSING_RETRY_INTERVAL`].
-    /// Now, because after a restart of the device the connect is refused and a scan finds the new
-    /// port in about 2 s.
-    /// `ep` is used for this try instead of the known endpoints.
+    /// Try the missing protocols at once, then after each wait in [`MISSING_RETRY_STEPS`], from
+    /// the first wait. At once, because after a restart of the device the connect is refused, and
+    /// a scan finds the new port in about 2 s. `ep` is used for this try instead of the known
+    /// endpoints.
     fn start_missing(&mut self, ep: Option<Endpoints>, ctx: &mut Context<Self>) {
-        if self.timers.missing.is_none() {
-            self.timers.missing =
-                Some(ctx.run_interval(MISSING_RETRY_INTERVAL, Self::retry_missing));
-        }
+        self.missing_step = 0;
+        self.schedule_missing(ctx);
         self.retry_missing_at(ep, ctx);
     }
 
-    /// Drop the connection and mark the entities unavailable.
+    /// Try the missing protocols after the next wait in [`MISSING_RETRY_STEPS`], then again. A
+    /// running timer is stopped.
+    fn schedule_missing(&mut self, ctx: &mut Context<Self>) {
+        if let Some(handle) = self.timers.missing.take() {
+            ctx.cancel_future(handle);
+        }
+        let wait = missing_retry_wait(self.missing_step);
+        self.timers.missing = Some(ctx.run_later(wait, |act, ctx| {
+            act.timers.missing = None;
+            // A try that still runs, or the wait of a `Disconnect`, does not use up the step.
+            if !act.missing_running && act.want {
+                act.missing_step = act.missing_step.saturating_add(1);
+            }
+            act.schedule_missing(ctx);
+            act.retry_missing(ctx);
+        }));
+    }
+
+    /// Drop the connection and mark the entities unavailable. Without `want`, a [`Disconnect`]
+    /// waits for a running command: the loss is handled as that disconnect, and the entities
+    /// keep their state.
     fn lost_connection(&mut self, ctx: &mut Context<Self>) {
+        if !self.want {
+            self.disconnect(ctx);
+            return;
+        }
         self.close(ctx);
         self.set_status(DeviceStatus::Disconnected);
         if self.s.connected {
@@ -857,6 +902,8 @@ impl AppleTvActor {
         self.expected_mute = None;
         self.expected_power = None;
         self.missing_running = false;
+        self.missing_step = 0;
+        self.stale_config = false;
         self.missing_network_end = None;
         self.end_mrp_join();
         self.artwork_after_mrp = false;
@@ -951,17 +998,23 @@ impl AppleTvActor {
             return;
         }
         warn!(
-            "[{}] {MAX_COMMAND_TIMEOUTS} command timeouts in {} s, reconnecting",
+            "[{}] {MAX_COMMAND_TIMEOUTS} command timeouts in {} s, {}",
             self.cfg.name,
-            COMMAND_TIMEOUT_WINDOW.as_secs()
+            COMMAND_TIMEOUT_WINDOW.as_secs(),
+            if self.want { "reconnecting" } else { "closing" }
         );
         self.command_timeouts.clear();
         self.lost_connection(ctx);
         self.connect(ctx);
     }
 
-    /// Start a connect if none runs. A failed pairing is tried again.
+    /// Start a connect if none runs. A failed pairing is tried again. During the wait of a
+    /// [`Disconnect`], keeps the connection.
     fn start_connect(&mut self, ctx: &mut Context<Self>) {
+        if !self.want && self.status == DeviceStatus::Connected {
+            self.want_again(ctx);
+            return;
+        }
         self.want = true;
         if self.status == DeviceStatus::AuthError {
             self.set_status(DeviceStatus::Disconnected);
@@ -974,6 +1027,23 @@ impl AppleTvActor {
             // A running fast network retry keeps its end, so key presses cannot extend it.
             self.network_retry_end = running_window(self.network_retry_end, Instant::now());
             self.connect(ctx);
+        }
+    }
+
+    /// Keep the connection during the wait of a [`Disconnect`]. The missing protocols are tried
+    /// at once, because their timer can have skipped tries in the wait. After a change of
+    /// address, pairing or device ids in the wait, connects again with the new values.
+    fn want_again(&mut self, ctx: &mut Context<Self>) {
+        self.want = true;
+        if self.stale_config {
+            info!("[{}] configuration changed, reconnecting", self.cfg.name);
+            self.lost_connection(ctx);
+            self.attempts = 0;
+            self.connect(ctx);
+            return;
+        }
+        if self.timers.missing.is_some() {
+            self.retry_missing(ctx);
         }
     }
 
@@ -991,10 +1061,12 @@ impl AppleTvActor {
 
     /// [`Self::retry_missing`] with `ep` instead of the known endpoints, if set.
     fn retry_missing_at(&mut self, ep: Option<Endpoints>, ctx: &mut Context<Self>) {
-        let Some(tv) = self.tv.clone() else { return };
-        if self.missing_running {
+        // Not while a try runs, or in the wait of a `Disconnect`: the timer goes on, for a
+        // `Connect` in the wait.
+        if self.missing_running || !self.want {
             return;
         }
+        let Some(tv) = self.tv.clone() else { return };
         if !self.joining() && (self.siri.is_some() || self.seek.is_some()) {
             debug!(
                 "[{}] missing protocol retry skipped: device is busy",
@@ -1119,13 +1191,13 @@ impl AppleTvActor {
     }
 
     /// Try the missing protocols again soon while the network is not ready, for example right
-    /// after wake-up. When the time for this is over, the next try comes from the interval.
+    /// after wake-up. When the time for this is over, the next try comes from
+    /// [`Self::schedule_missing`].
     fn missing_network_retry(&mut self, ctx: &mut Context<Self>) {
         if !retry_window_open(&mut self.missing_network_end, Instant::now()) {
             debug!(
-                "[{}] network not ready, missing protocols are tried again in {} s",
-                self.cfg.name,
-                MISSING_RETRY_INTERVAL.as_secs()
+                "[{}] network not ready, missing protocols are tried again later",
+                self.cfg.name
             );
             self.missing_network_end = None;
             return;
@@ -1189,6 +1261,7 @@ impl AppleTvActor {
         self.tv = None;
         self.np = None;
         self.volume = None;
+        self.missing_step = 0;
         let connected_at = self.connected_at;
         let link = Link::Missing {
             added,
@@ -2474,6 +2547,44 @@ impl Handler<Disconnect> for AppleTvActor {
 
     fn handle(&mut self, _: Disconnect, ctx: &mut Self::Context) {
         self.want = false;
+        self.disconnects = self.disconnects.wrapping_add(1);
+        // The other timers stop at the end of the wait: a connect that is asked for during the
+        // wait keeps the connection and needs them.
+        if let Some(handle) = self.timers.reconnect.take() {
+            ctx.cancel_future(handle);
+        }
+        // Without a connection no command is being sent. `close` also drops the result of a running
+        // connect.
+        if self.status != DeviceStatus::Connected {
+            self.disconnect(ctx);
+            return;
+        }
+        // A command that holds the command lock, for example power off before standby, is sent
+        // first. A command takes the lock when it comes, if no other command waits.
+        let lock = self.cmd_lock.clone();
+        let disconnects = self.disconnects;
+        ctx.spawn(
+            async move {
+                tokio::time::timeout(DISCONNECT_WAIT, lock.lock_owned())
+                    .await
+                    .ok()
+            }
+            .into_actor(self)
+            .map(move |guard, act, ctx| {
+                drop(guard);
+                // A connect that was asked for meanwhile keeps the connection. A later
+                // `Disconnect` has its own wait.
+                if !act.want && act.disconnects == disconnects {
+                    act.disconnect(ctx);
+                }
+            }),
+        );
+    }
+}
+
+impl AppleTvActor {
+    /// Close the connection that is not wanted anymore.
+    fn disconnect(&mut self, ctx: &mut Context<Self>) {
         self.cancel_timers(ctx);
         // Asked for, for example at standby: the entities keep their state. Only a lost
         // connection makes them unavailable.
@@ -2570,6 +2681,10 @@ impl Handler<UpdateConfig> for AppleTvActor {
             self.lost_connection(ctx);
             self.attempts = 0;
             self.connect(ctx);
+        } else if reconnect && self.status == DeviceStatus::Connected {
+            // During the wait of a `Disconnect`. The running command is sent first, unless a
+            // connect or command comes in the wait.
+            self.stale_config = true;
         } else if reconnect && self.status == DeviceStatus::AuthError {
             // The new configuration may work. The next connect request tries it.
             self.set_status(DeviceStatus::Disconnected);
@@ -2622,23 +2737,32 @@ impl AppleTvActor {
         let start = Start {
             queued: Instant::now(),
             epoch,
+            disconnects: self.disconnects,
             again: false,
+            running: false,
         };
         self.start_run(msg, run, start, ctx)
     }
 
     /// Start a connect for a command if there is no connection. The core can send a command
-    /// before `exit_standby`.
+    /// before `exit_standby`. While a [`Disconnect`] waits for a running command, the
+    /// connection is kept.
     fn connect_for_command(&mut self, ctx: &mut Context<Self>) {
         if self.tv.is_none() && self.status == DeviceStatus::Disconnected {
             debug!("[{}] command while disconnected, connecting", self.cfg.name);
             self.start_connect(ctx);
+        } else if !self.want && self.status == DeviceStatus::Connected {
+            debug!(
+                "[{}] command during disconnect, connection kept",
+                self.cfg.name
+            );
+            self.want_again(ctx);
         }
     }
 
     /// Run a checked command in the background, after the connect and the command before.
     fn start_run(
-        &self,
+        &mut self,
         msg: Command,
         run: remote::RemoteRun,
         start: Start,
@@ -2652,25 +2776,52 @@ impl AppleTvActor {
         // The Remote core waits at most 10 s for the answer, so the command runs in the
         // background. Later errors are only logged.
         // Plan after the command before has ended, so toggles see its result.
+        // A command that gets the lock here, while connected, counts as running: a later
+        // `Disconnect` waits for it. Only when no command waits, so the order stays.
+        let held = if self.waiting_cmds == 0 && self.status == DeviceStatus::Connected {
+            self.cmd_lock.clone().try_lock_owned().ok()
+        } else {
+            None
+        };
+        let at_once = held.is_some();
+        if !at_once {
+            self.waiting_cmds += 1;
+        }
         let lock = self.cmd_lock.clone();
         let fut = async move {
             connect_ended(connecting, JoinWait::Deadline).await;
-            lock.lock_owned().await
+            match held {
+                Some(guard) => guard,
+                None => lock.lock_owned().await,
+            }
         }
         .into_actor(self)
         .then(move |guard, act, _| {
-            if let Some(reason) = act.skip_reason(start) {
+            if !at_once {
+                act.waiting_cmds -= 1;
+            }
+            // A `Disconnect` after the command waits for it if it runs (see `Start::running`).
+            // Other commands from before a `Disconnect` are not sent.
+            let check = Start {
+                running: at_once && act.status == DeviceStatus::Connected,
+                ..start
+            };
+            if let Some(reason) = act.skip_reason(check) {
                 info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
                 return Either::Left(fut::ready(()));
             }
             let generation = act.generation;
+            let check = Start {
+                running: act.status == DeviceStatus::Connected,
+                ..check
+            };
             Either::Right(
-                act.run_command(&msg, &run, guard, start)
+                act.run_command(&msg, &run, guard, check)
                     .then(move |end, act, _| match end.first_error {
                         None => Either::Left(fut::ready(())),
                         // The lock is kept, so a later command cannot run before this one.
                         Some(e) => {
-                            Either::Right(act.send_again(msg, run, start, generation, e, end.guard))
+                            Either::Right(act.send_again(msg, run, check, generation, e, end.guard))
                         }
                     }),
             )
@@ -2683,6 +2834,8 @@ impl AppleTvActor {
     fn skip_reason(&self, start: Start) -> Option<Skip> {
         if start.epoch.is_some_and(|e| *self.stop.borrow() != e) {
             Some(Skip::Stopped)
+        } else if !start.running && start.disconnects != self.disconnects {
+            Some(Skip::Disconnect)
         } else if start.queued.elapsed() > COMMAND_MAX_WAIT {
             Some(Skip::TooLate)
         } else {
@@ -2711,10 +2864,14 @@ impl AppleTvActor {
         tokio::time::sleep(SEND_AGAIN_DELAY)
             .into_actor(self)
             .then(move |(), act, ctx| {
-                // A `Disconnect` came: the Remote does not want the device now.
+                if let Some(reason @ (Skip::Stopped | Skip::Disconnect)) = act.skip_reason(start) {
+                    info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
+                    return fut::ready(()).boxed_local();
+                }
+                // The Remote does not want the device now.
                 if !act.want {
                     warn!(
-                        "[{}] {} failed: {error} (device disconnected)",
+                        "[{}] {} failed: {error} (device not wanted)",
                         act.cfg.name, msg.cmd_id
                     );
                     return fut::ready(()).boxed_local();
@@ -2741,9 +2898,16 @@ impl AppleTvActor {
                     .into_actor(act)
                     .then(move |(), act, _| {
                         match act.skip_reason(start) {
-                            // The user asked for the stop, so it is no failure.
-                            Some(reason @ Skip::Stopped) => {
+                            // The user asked for the stop or the disconnect, so it is no failure.
+                            Some(reason @ (Skip::Stopped | Skip::Disconnect)) => {
                                 info!("[{}] {} not sent: {reason}", act.cfg.name, msg.cmd_id);
+                                return fut::ready(()).boxed_local();
+                            }
+                            _ if !act.want => {
+                                warn!(
+                                    "[{}] {} failed: {error} (device not wanted)",
+                                    act.cfg.name, msg.cmd_id
+                                );
                                 return fut::ready(()).boxed_local();
                             }
                             Some(reason @ Skip::TooLate) => {
@@ -2793,6 +2957,8 @@ struct RunEnd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Skip {
     Stopped,
+    /// A [`Disconnect`] came after the command, and the command is not [`Start::running`].
+    Disconnect,
     TooLate,
 }
 
@@ -2800,9 +2966,15 @@ impl std::fmt::Display for Skip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Stopped => "stopped by stop_send",
+            Self::Disconnect => "device not wanted",
             Self::TooLate => "waited too long",
         })
     }
+}
+
+/// The wait at `step` in [`MISSING_RETRY_STEPS`]. The last wait repeats.
+fn missing_retry_wait(step: usize) -> Duration {
+    MISSING_RETRY_STEPS[step.min(MISSING_RETRY_STEPS.len() - 1)]
 }
 
 /// A protocol that the handle has no client for (`missing`) comes back only with a connect.
@@ -2818,12 +2990,18 @@ fn sends_again(unsent: bool, stays_missing: bool, start: Start, waited: Duration
     unsent && !stays_missing && !start.again && waited < COMMAND_MAX_WAIT
 }
 
-/// When a command was queued, its `stop_send` epoch, and whether it is sent again.
+/// When a command was queued, its `stop_send` epoch, the [`AppleTvActor::disconnects`] count
+/// then, and whether it is sent again.
 #[derive(Clone, Copy)]
 struct Start {
     queued: Instant,
     epoch: Option<u64>,
+    disconnects: u64,
     again: bool,
+    /// Its run started while connected. A [`Disconnect`] waits for it and does not skip it:
+    /// `want` decides about a second try. A command that took the command lock while connected
+    /// is not skipped before its run either.
+    running: bool,
 }
 
 /// Error text for a Siri session whose connect failed on the pairing. `None` keeps the text of
@@ -2928,25 +3106,27 @@ impl AppleTvActor {
         };
         let fut = async move {
             // `missing`: the handle has no client for the protocol of the call.
-            let (result, unsent, missing) = match prepared {
+            // `timed_out`: no answer, or the Apple TV does not read.
+            let (result, unsent, missing, timed_out) = match prepared {
                 // Dropping the run releases held keys.
                 Ok((tv, calls)) => tokio::select! {
                     r = exec_all(&tv, calls) => match r {
-                        Ok(()) => (Ok(true), false, false),
+                        Ok(()) => (Ok(true), false, false, false),
                         Err(e) => {
                             let missing = matches!(e.error, ratv::Error::NotConnected(_));
-                            (Err(ServiceError::from(e.error)), e.unsent, missing)
+                            let timed_out = crate::errors::timed_out(&e.error);
+                            (Err(ServiceError::from(e.error)), e.unsent, missing, timed_out)
                         }
                     },
-                    () = stopped(stop, epoch) => (Ok(false), false, false),
+                    () = stopped(stop, epoch) => (Ok(false), false, false, false),
                 },
-                Err(e) => (Err(e), no_tv, false),
+                Err(e) => (Err(e), no_tv, false, false),
             };
-            (result, unsent, missing, guard)
+            (result, unsent, missing, timed_out, guard)
         };
         let cmd_id = msg.cmd_id.clone();
-        fut.into_actor(self)
-            .map(move |(result, unsent, missing, guard), act, ctx| {
+        fut.into_actor(self).map(
+            move |(result, unsent, missing, timed_out, guard), act, ctx| {
                 let stays_missing = stays_missing(
                     missing,
                     act.generation == generation && act.tv.is_some(),
@@ -2966,7 +3146,7 @@ impl AppleTvActor {
                     }
                 };
                 let ok = result.is_ok();
-                if act.generation == generation && matches!(result, Err(ServiceError::Timeout)) {
+                if act.generation == generation && timed_out {
                     act.command_timed_out(ctx);
                 }
                 if act.generation == generation {
@@ -2998,7 +3178,8 @@ impl AppleTvActor {
                     first_error: None,
                     guard,
                 }
-            })
+            },
+        )
     }
 }
 
@@ -3491,6 +3672,10 @@ mod tests {
         Close,
         CancelTimers,
         StopMissing,
+        LostConnection,
+        WantAgain,
+        StartMissing,
+        ScheduleMissing,
         Nothing,
     }
 
@@ -3501,6 +3686,10 @@ mod tests {
                 Step::Close => self.close(ctx),
                 Step::CancelTimers => self.cancel_timers(ctx),
                 Step::StopMissing => self.stop_missing(&ratv::Error::NoEndpoints, false, ctx),
+                Step::LostConnection => self.lost_connection(ctx),
+                Step::WantAgain => self.want_again(ctx),
+                Step::StartMissing => self.start_missing(None, ctx),
+                Step::ScheduleMissing => self.schedule_missing(ctx),
                 Step::Nothing => {}
             }
             self.missing_network_end.is_some()
@@ -3678,6 +3867,23 @@ mod tests {
         assert!(siri.await.expect("send"), "not changed");
     }
 
+    /// Without a connection, `want_again` starts no retry and keeps the retry timer.
+    #[actix::test]
+    async fn want_again_keeps_the_retry_timer() {
+        let actor = idle_actor("want-again", None);
+        let retry = task(&actor, Slot::Missing).await;
+        let _ = step(&actor, Step::WantAgain).await;
+        let (want, running, timer) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                (act.want, act.missing_running, act.timers.missing.is_some())
+            }))
+            .await
+            .unwrap();
+        assert!(want);
+        assert!(!running, "no retry");
+        assert!(timer && !retry.load(Ordering::Relaxed), "timer kept");
+    }
+
     #[actix::test]
     async fn stop_missing_ends_the_retries() {
         let actor = idle_actor("stop-missing", None);
@@ -3750,11 +3956,81 @@ mod tests {
     }
 
     #[test]
+    fn missing_retry_waits_grow_to_30_s() {
+        let waits: Vec<u64> = (0..7).map(|i| missing_retry_wait(i).as_secs()).collect();
+        assert_eq!(vec![1, 2, 5, 10, 30, 30, 30], waits);
+        assert_eq!(Duration::from_secs(30), missing_retry_wait(usize::MAX));
+    }
+
+    #[actix::test]
+    async fn running_missing_try_keeps_the_retry_step() {
+        tokio::time::pause();
+        let actor = idle_actor("missing-step", None);
+        let missing_step = || actor.send(Run(|act: &mut AppleTvActor| act.missing_step));
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.missing_running = true;
+            }))
+            .await
+            .unwrap();
+        actor.send(Step::ScheduleMissing).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(0, missing_step().await.unwrap(), "try still runs");
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.missing_running = false))
+            .await
+            .unwrap();
+        // The tick at 2 s uses up step 0. The next wait is 2 s.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(1, missing_step().await.unwrap());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(1, missing_step().await.unwrap());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(2, missing_step().await.unwrap());
+    }
+
+    #[actix::test]
+    async fn new_missing_retries_start_at_the_first_step() {
+        let actor = idle_actor("missing-restart", None);
+        let old_timer = task(&actor, Slot::Missing).await;
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.missing_step = 4))
+            .await
+            .unwrap();
+        actor.send(Step::StartMissing).await.unwrap();
+        let step = actor.send(Run(|act: &mut AppleTvActor| {
+            (act.missing_step, act.timers.missing.is_some())
+        }));
+        assert_eq!((0, true), step.await.unwrap());
+        assert!(old_timer.load(Ordering::Relaxed), "old timer stopped");
+    }
+
+    #[actix::test]
+    async fn missing_tick_in_the_disconnect_wait_keeps_the_retry_step() {
+        tokio::time::pause();
+        let actor = idle_actor("missing-step-wait", None);
+        actor.send(Step::ScheduleMissing).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let step = actor.send(Run(|act: &mut AppleTvActor| act.missing_step));
+        assert_eq!(0, step.await.unwrap(), "no step used without want");
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.want = true))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let step = actor.send(Run(|act: &mut AppleTvActor| act.missing_step));
+        assert_eq!(1, step.await.unwrap());
+    }
+
+    #[test]
     fn retry_decision() {
         let start = Start {
             queued: Instant::now(),
             epoch: None,
+            disconnects: 0,
             again: false,
+            running: false,
         };
         let again = Start {
             again: true,
@@ -3783,9 +4059,9 @@ mod tests {
     }
 
     /// A command without a connection waits to be sent again and holds the command lock.
-    /// `Disconnect` ends the wait and frees the lock.
+    /// Without `want` it is not sent again and frees the lock.
     #[actix::test]
-    async fn unsent_command_keeps_lock_until_disconnect_ends_it() {
+    async fn unsent_command_keeps_lock_until_it_is_dropped() {
         let actor = idle_actor("send-again", None);
         let free = || {
             actor.send(Run(|act: &mut AppleTvActor| {
@@ -3805,14 +4081,498 @@ mod tests {
             serde_json::json!({ "command": "CURSOR_UP" }),
         );
         actor.send(cmd).await.unwrap().expect("accepted");
-        actor.send(Disconnect).await.unwrap();
+        // Tests the check for `want` in `send_again`. In use, a running command reaches this
+        // check after a `Disconnect`. Here the test sets `want` to false by hand, without a
+        // `Disconnect`, so `Skip::Disconnect` does not apply.
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = false;
+                act.set_status(DeviceStatus::Disconnected);
+            }))
+            .await
+            .unwrap();
         tokio::time::sleep(SEND_AGAIN_DELAY / 2).await;
         assert!(
             !free().await.unwrap(),
             "lock held while waiting to send again"
         );
         tokio::time::sleep(SEND_AGAIN_DELAY * 2).await;
-        assert!(free().await.unwrap(), "lock released after Disconnect");
+        assert!(free().await.unwrap(), "lock released");
+    }
+
+    /// A command that waits for the connect is not sent after a `Disconnect`, also not again.
+    #[actix::test]
+    async fn command_before_disconnect_is_not_sent() {
+        let actor = idle_actor("disconnect-skip", None);
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connecting);
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        actor.send(Disconnect).await.unwrap();
+        assert_eq!(
+            (DeviceStatus::Disconnected, false),
+            status_and_want(&actor).await,
+            "closed at once"
+        );
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        let free = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.cmd_lock.clone().try_lock_owned().is_ok()
+            }))
+            .await
+            .unwrap();
+        assert!(free, "skipped at once, no second try");
+    }
+
+    /// A command and a `Disconnect` in the same mailbox run, while MRP joins: the command takes
+    /// the lock when it comes, so the `Disconnect` waits for it and the command runs.
+    #[actix::test]
+    async fn command_in_the_same_run_as_disconnect_runs() {
+        let actor = idle_actor("disconnect-same-run", None);
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connected);
+                act.mrp_join
+                    .send_replace(Some(tokio::time::Instant::now() + LONG));
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.do_send(cmd);
+        actor.do_send(Disconnect);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            (DeviceStatus::Connected, false),
+            status_and_want(&actor).await,
+            "the wait keeps the connection"
+        );
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.end_mrp_join()))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        let (free, status) = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                (act.cmd_lock.clone().try_lock_owned().is_ok(), act.status)
+            }))
+            .await
+            .unwrap();
+        // Without a real connection the command fails and waits to be sent again.
+        assert!(!free, "the command ran");
+        assert_eq!(DeviceStatus::Connected, status);
+        // The resend is not sent, then the wait closes.
+        tokio::time::sleep(SEND_AGAIN_DELAY * 2).await;
+        assert_eq!(
+            (DeviceStatus::Disconnected, false),
+            status_and_want(&actor).await
+        );
+    }
+
+    /// A running command that failed is sent again after a `Disconnect` and a `Connect` in the
+    /// wait.
+    #[actix::test]
+    async fn running_command_is_sent_again_after_disconnect_and_connect() {
+        let actor = idle_actor("disconnect-resend", None);
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connected);
+                act.mrp_join
+                    .send_replace(Some(tokio::time::Instant::now() + LONG));
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        actor.send(Disconnect).await.unwrap();
+        actor.send(Connect).await.unwrap();
+        // Without a real connection the command fails and waits to be sent again.
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.end_mrp_join()))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        // Like a lost connection.
+        let attempt = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.set_status(DeviceStatus::Disconnected);
+                act.attempt
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY).await;
+        let now = actor.send(Run(|act: &mut AppleTvActor| act.attempt));
+        assert!(now.await.unwrap() > attempt, "the second try connects");
+    }
+
+    /// A command that waited for the lock runs once it has it: after a `Disconnect` and a
+    /// `Connect` in the wait, it is sent again.
+    #[actix::test]
+    async fn waiting_command_runs_once_it_has_the_lock() {
+        let actor = idle_actor("disconnect-waited", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.mrp_join
+                    .send_replace(Some(tokio::time::Instant::now() + LONG));
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        drop(guard);
+        // Without a real connection the command fails and waits to be sent again.
+        actor
+            .send(Run(|act: &mut AppleTvActor| act.end_mrp_join()))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        actor.send(Disconnect).await.unwrap();
+        actor.send(Connect).await.unwrap();
+        // Like a lost connection.
+        let attempt = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.set_status(DeviceStatus::Disconnected);
+                act.attempt
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY).await;
+        let now = actor.send(Run(|act: &mut AppleTvActor| act.attempt));
+        assert!(now.await.unwrap() > attempt, "the second try connects");
+    }
+
+    /// A command during a connect does not count as running: a `Disconnect` closes at once, and
+    /// the command is not sent after the next connect.
+    #[actix::test]
+    async fn command_during_connect_is_not_sent_after_disconnect_and_connect() {
+        let actor = idle_actor("disconnect-reconnect", None);
+        let connecting = || {
+            Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connecting);
+            })
+        };
+        actor.send(connecting()).await.unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        actor.do_send(Disconnect);
+        actor.do_send(connecting());
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.set_status(DeviceStatus::Connected);
+            }))
+            .await
+            .unwrap();
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        let free = actor.send(Run(|act: &mut AppleTvActor| {
+            act.cmd_lock.clone().try_lock_owned().is_ok()
+        }));
+        assert!(free.await.unwrap(), "not sent");
+    }
+
+    /// A new command does not take the free lock while an older one waits for it.
+    #[actix::test]
+    async fn waiting_command_keeps_its_place() {
+        let actor = idle_actor("command-order", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.mrp_join
+                    .send_replace(Some(tokio::time::Instant::now() + LONG));
+            }))
+            .await
+            .unwrap();
+        let cmd = || {
+            command(
+                EntityKind::Remote,
+                "send_cmd",
+                serde_json::json!({ "command": "CURSOR_UP" }),
+            )
+        };
+        actor.send(cmd()).await.unwrap().expect("accepted");
+        drop(guard);
+        actor.send(cmd()).await.unwrap().expect("accepted");
+        let state = actor.send(Run(|act: &mut AppleTvActor| {
+            (
+                act.waiting_cmds,
+                act.cmd_lock.clone().try_lock_owned().is_ok(),
+            )
+        }));
+        assert_eq!((2, true), state.await.unwrap(), "both wait, lock free");
+    }
+
+    /// The actor looks connected, and the test holds the command lock like a running command.
+    async fn connected_with_running_command(
+        actor: &Addr<AppleTvActor>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.set_status(DeviceStatus::Connected);
+                act.cmd_lock.clone().try_lock_owned().expect("free")
+            }))
+            .await
+            .unwrap()
+    }
+
+    async fn status_and_want(actor: &Addr<AppleTvActor>) -> (DeviceStatus, bool) {
+        actor
+            .send(Run(|act: &mut AppleTvActor| (act.status, act.want)))
+            .await
+            .unwrap()
+    }
+
+    #[actix::test]
+    async fn disconnect_waits_for_the_running_command() {
+        let actor = idle_actor("disconnect-wait", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            (DeviceStatus::Connected, false),
+            status_and_want(&actor).await
+        );
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            (DeviceStatus::Disconnected, false),
+            status_and_want(&actor).await
+        );
+    }
+
+    #[actix::test]
+    async fn disconnect_waits_at_most_disconnect_wait() {
+        tokio::time::pause();
+        let actor = idle_actor("disconnect-limit", None);
+        let _guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        tokio::time::sleep(DISCONNECT_WAIT.saturating_sub(Duration::from_millis(10))).await;
+        assert_eq!(DeviceStatus::Connected, status_and_want(&actor).await.0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(DeviceStatus::Disconnected, status_and_want(&actor).await.0);
+    }
+
+    /// A command queued before `Disconnect` gets the lock first, but is not sent.
+    #[actix::test]
+    async fn queued_command_does_not_delay_the_disconnect() {
+        let actor = idle_actor("disconnect-queued", None);
+        let guard = connected_with_running_command(&actor).await;
+        // A join that has ended its wait lets the command go on to the lock.
+        actor
+            .send(Run(|act: &mut AppleTvActor| {
+                act.mrp_join.send_replace(Some(tokio::time::Instant::now()));
+            }))
+            .await
+            .unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        actor.send(cmd).await.unwrap().expect("accepted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        actor.send(Disconnect).await.unwrap();
+        drop(guard);
+        // A command that runs keeps the lock for `SEND_AGAIN_DELAY`.
+        tokio::time::sleep(SEND_AGAIN_DELAY / 4).await;
+        assert_eq!(
+            (DeviceStatus::Disconnected, false),
+            status_and_want(&actor).await
+        );
+    }
+
+    /// A loss during the `Disconnect` wait is the disconnect: the entities keep their state.
+    #[actix::test]
+    async fn loss_during_the_disconnect_wait_keeps_the_state() {
+        let actor = idle_actor("disconnect-loss", None);
+        let guard = connected_with_running_command(&actor).await;
+        let connected = || {
+            actor.send(Run(|act: &mut AppleTvActor| {
+                act.want = true;
+                act.s.connected = true;
+                act.set_status(DeviceStatus::Connected);
+            }))
+        };
+        let state = || actor.send(Run(|act: &mut AppleTvActor| (act.s.connected, act.status)));
+        connected().await.unwrap();
+        step(&actor, Step::LostConnection).await;
+        assert_eq!(
+            (false, DeviceStatus::Disconnected),
+            state().await.unwrap(),
+            "a loss while wanted"
+        );
+
+        connected().await.unwrap();
+        actor.send(Disconnect).await.unwrap();
+        assert_eq!(
+            (true, DeviceStatus::Connected),
+            state().await.unwrap(),
+            "waits for the command"
+        );
+        step(&actor, Step::LostConnection).await;
+        assert_eq!(
+            (true, DeviceStatus::Disconnected),
+            state().await.unwrap(),
+            "a loss during the wait"
+        );
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            (true, DeviceStatus::Disconnected),
+            state().await.unwrap(),
+            "the end of the wait changes nothing"
+        );
+    }
+
+    /// Only the wait of the last `Disconnect` closes the connection.
+    #[actix::test]
+    async fn older_disconnect_wait_does_not_close() {
+        tokio::time::pause();
+        let actor = idle_actor("disconnect-twice", None);
+        let _guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        tokio::time::sleep(DISCONNECT_WAIT / 2).await;
+        actor.send(Connect).await.unwrap();
+        actor.send(Disconnect).await.unwrap();
+        // The wait of the first `Disconnect` has ended.
+        tokio::time::sleep(DISCONNECT_WAIT / 2 + Duration::from_millis(10)).await;
+        assert_eq!(DeviceStatus::Connected, status_and_want(&actor).await.0);
+        tokio::time::sleep(DISCONNECT_WAIT / 2).await;
+        assert_eq!(DeviceStatus::Disconnected, status_and_want(&actor).await.0);
+    }
+
+    #[actix::test]
+    async fn connect_during_the_disconnect_wait_keeps_the_connection() {
+        let actor = idle_actor("disconnect-connect", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        actor.send(Connect).await.unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            (DeviceStatus::Connected, true),
+            status_and_want(&actor).await
+        );
+    }
+
+    #[actix::test]
+    async fn config_change_during_the_disconnect_wait_reconnects_on_connect() {
+        let actor = idle_actor("disconnect-config", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        let mut cfg = crate::config_store::tests::device();
+        cfg.address = Some("192.0.2.7".parse().expect("ip"));
+        actor.send(UpdateConfig(cfg)).await.unwrap();
+        let stale = actor
+            .send(Run(|act: &mut AppleTvActor| (act.status, act.stale_config)))
+            .await
+            .unwrap();
+        assert_eq!((DeviceStatus::Connected, true), stale);
+        actor.send(Connect).await.unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                (*act.status_tx.borrow(), act.want, act.stale_config)
+            }))
+            .await
+            .unwrap();
+        // The shown status stays Connecting also when the network is not reachable.
+        assert_eq!((DeviceStatus::Connecting, true, false), after);
+    }
+
+    #[actix::test]
+    async fn config_change_during_the_disconnect_wait_closes_after_it() {
+        let actor = idle_actor("disconnect-config-close", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        let mut cfg = crate::config_store::tests::device();
+        cfg.address = Some("192.0.2.7".parse().expect("ip"));
+        actor.send(UpdateConfig(cfg)).await.unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                (act.status, act.want, act.stale_config)
+            }))
+            .await
+            .unwrap();
+        assert_eq!((DeviceStatus::Disconnected, false, false), after);
+    }
+
+    #[actix::test]
+    async fn command_during_the_disconnect_wait_keeps_the_connection() {
+        let actor = idle_actor("disconnect-command", None);
+        let guard = connected_with_running_command(&actor).await;
+        actor.send(Disconnect).await.unwrap();
+        let cmd = command(
+            EntityKind::Remote,
+            "send_cmd",
+            serde_json::json!({ "command": "CURSOR_UP" }),
+        );
+        // Without a real connection the command itself fails.
+        let _ = actor.send(cmd).await.unwrap();
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            (DeviceStatus::Connected, true),
+            status_and_want(&actor).await
+        );
+    }
+
+    #[actix::test]
+    async fn skip_reason_after_disconnect() {
+        let actor = idle_actor("disconnect-reason", None);
+        let reasons = actor
+            .send(Run(|act: &mut AppleTvActor| {
+                let start = Start {
+                    queued: Instant::now(),
+                    epoch: None,
+                    disconnects: act.disconnects,
+                    again: false,
+                    running: false,
+                };
+                let before = act.skip_reason(start);
+                // A normal reconnect does not count.
+                act.generation += 1;
+                let reconnect = act.skip_reason(start);
+                act.disconnects += 1;
+                let running = act.skip_reason(Start {
+                    running: true,
+                    ..start
+                });
+                (before, reconnect, act.skip_reason(start), running)
+            }))
+            .await
+            .unwrap();
+        assert_eq!((None, None, Some(Skip::Disconnect), None), reasons);
     }
 
     #[test]

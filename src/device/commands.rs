@@ -396,8 +396,8 @@ pub async fn exec_all(tv: &AppleTv, calls: Vec<Call>) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Nothing of a call was sent: it had no connection, or the connection was closed before its
-/// only message was sent.
+/// Nothing of a call was sent and a new connection can help: it had no connection, or the
+/// connection was closed before its only message was sent.
 const fn not_sent(e: &ratv::Error, one_message: bool) -> bool {
     match e {
         ratv::Error::NotConnected(_) => true,

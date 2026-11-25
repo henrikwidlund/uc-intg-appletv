@@ -12,7 +12,7 @@ use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, SendWsMessage, operation_mode, response_text};
 use crate::device::{DeviceCache, SiriModeChanged, discovery, pairing_not_valid};
 use crate::entities::EntityKind;
-use crate::errors::ServiceError;
+use crate::errors::{NOT_SENT, ServiceError, not_read};
 use crate::logging;
 use actix::{ActorFutureExt, AsyncContext, Context, Handler, Message, WrapFuture};
 use log::{debug, error, info, warn};
@@ -896,7 +896,7 @@ impl Controller {
                             act.request_input(&ws_id, page, ctx);
                         }
                         Err(e) => {
-                            warn!("[{ws_id}] pairing failed: {e}");
+                            log_pairing_failure(&ws_id, &e);
                             act.finish_setup(&ws_id, Some(setup_error(&e)), ctx);
                         }
                     }
@@ -932,7 +932,7 @@ impl Controller {
                     let credentials = match result {
                         Ok(c) => c,
                         Err(e) => {
-                            warn!("[{ws_id}] pairing failed: {e}");
+                            log_pairing_failure(&ws_id, &e);
                             act.finish_setup(&ws_id, Some(setup_error(&e)), ctx);
                             return;
                         }
@@ -1405,14 +1405,30 @@ fn parse_bool(values: &HashMap<String, String>, key: &str, default: bool) -> boo
     values.get(key).map_or(default, |v| v == "true")
 }
 
+fn log_pairing_failure(ws_id: &str, e: &ratv::Error) {
+    if not_read(pairing_cause(e)) {
+        warn!("[{ws_id}] pairing failed: {NOT_SENT} ({e})");
+    } else {
+        warn!("[{ws_id}] pairing failed: {e}");
+    }
+}
+
+/// The error inside [`ratv::Error::PairingStep`], else `e`.
+fn pairing_cause(e: &ratv::Error) -> &ratv::Error {
+    match e {
+        ratv::Error::PairingStep { source, .. } => pairing_cause(source),
+        e => e,
+    }
+}
+
 fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
     match e {
         e if pairing_not_valid(e) => IntegrationSetupError::AuthorizationError,
         ratv::Error::PairingStep { source, .. } => setup_error(source),
         ratv::Error::Hap(_) => IntegrationSetupError::AuthorizationError,
-        ratv::Error::Timeout | ratv::Error::NoAnswer(_) | ratv::Error::SendTimeout(_) => {
-            IntegrationSetupError::Timeout
-        }
+        ratv::Error::Timeout | ratv::Error::NoAnswer(_) => IntegrationSetupError::Timeout,
+        // Not sent: like the `ServiceUnavailable` of a command, which has no setup error code.
+        e if not_read(e) => IntegrationSetupError::Other,
         ratv::Error::Io(_) | ratv::Error::NoEndpoints => IntegrationSetupError::ConnectionRefused,
         _ => IntegrationSetupError::Other,
     }
@@ -1423,14 +1439,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_error_timeouts() {
-        for e in [
-            ratv::Error::Timeout,
-            ratv::Error::NoAnswer("x"),
-            ratv::Error::SendTimeout("x"),
-        ] {
+    fn setup_error_timeouts_and_not_read() {
+        for e in [ratv::Error::Timeout, ratv::Error::NoAnswer("x")] {
             assert_eq!(IntegrationSetupError::Timeout, setup_error(&e), "{e}");
         }
+        for e in [ratv::Error::SendTimeout("x"), ratv::Error::QueueFull] {
+            assert_eq!(IntegrationSetupError::Other, setup_error(&e), "{e}");
+        }
+        let step = ratv::Error::PairingStep {
+            step: "pair-setup M2",
+            skipped: Vec::new(),
+            source: Box::new(ratv::Error::SendTimeout("x")),
+        };
+        assert!(not_read(pairing_cause(&step)), "same cause as setup_error");
+        assert_eq!(IntegrationSetupError::Other, setup_error(&step));
     }
 
     #[test]

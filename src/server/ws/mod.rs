@@ -43,6 +43,8 @@ struct WsConn {
     audio: Recipient<R2AudioChunkMsg>,
     /// The `authentication` message, sent first.
     authentication: ByteString,
+    /// Messages that are not a JSON object, to close the connection after too many.
+    invalid: connection::InvalidMessages,
 }
 
 /// The `authentication` message with the driver version. It is the same for each connection.
@@ -89,6 +91,7 @@ impl WsConn {
             voice: VoiceCount::default(),
             audio: controller_addr.clone().recipient(),
             controller_addr,
+            invalid: connection::InvalidMessages::new(),
         }
     }
 }

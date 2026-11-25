@@ -136,7 +136,8 @@ pub enum DeviceEvent {
 #[rtype(result = "()")]
 pub struct Connect;
 
-/// Disconnect, and stay disconnected until the next `Connect` or command.
+/// Disconnect, and stay disconnected until the next `Connect` or command. When connected, waits
+/// up to 2 s for a command that is running.
 #[derive(Debug, Message)]
 #[rtype(result = "()")]
 pub struct Disconnect;

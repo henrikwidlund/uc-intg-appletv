@@ -8,6 +8,19 @@ use actix::MailboxError;
 use log::error;
 use std::io::ErrorKind;
 
+/// Text for a request that was not sent because the Apple TV does not read.
+pub const NOT_SENT: &str = "Apple TV does not read, not sent";
+
+/// The Apple TV does not read: the request was not queued, or was removed from the queue.
+pub const fn not_read(e: &ratv::Error) -> bool {
+    matches!(e, ratv::Error::SendTimeout(_) | ratv::Error::QueueFull)
+}
+
+/// No answer, or the Apple TV does not read. Counts toward a reconnect.
+pub const fn timed_out(e: &ratv::Error) -> bool {
+    matches!(e, ratv::Error::Timeout | ratv::Error::NoAnswer(_)) || not_read(e)
+}
+
 /// Errors returned to the Remote as WebSocket error responses.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ServiceError {
@@ -88,10 +101,8 @@ impl From<ratv::Error> for ServiceError {
         match e {
             ratv::Error::NotConnected(p) => Self::ServiceUnavailable(format!("{p} not connected")),
             ratv::Error::Disconnected | ratv::Error::Closed => Self::NotConnected,
-            // `SendTimeout`: the device does not read, so it is counted like no answer.
-            ratv::Error::Timeout | ratv::Error::NoAnswer(_) | ratv::Error::SendTimeout(_) => {
-                Self::Timeout
-            }
+            ratv::Error::Timeout | ratv::Error::NoAnswer(_) => Self::Timeout,
+            e if not_read(&e) => Self::ServiceUnavailable(NOT_SENT.into()),
             ratv::Error::InvalidArgument(_) | ratv::Error::NoTextField | ratv::Error::NoChapter => {
                 Self::BadRequest(e.to_string())
             }
@@ -122,6 +133,24 @@ impl From<ratv::Error> for ServiceError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timed_out_and_not_read() {
+        let not_read_errors = [ratv::Error::SendTimeout("press"), ratv::Error::QueueFull];
+        for e in &not_read_errors {
+            assert!(not_read(e) && timed_out(e), "{e}");
+        }
+        for e in [ratv::Error::Timeout, ratv::Error::NoAnswer("x")] {
+            assert!(!not_read(&e) && timed_out(&e), "{e}");
+        }
+        for e in [
+            ratv::Error::Closed,
+            ratv::Error::Disconnected,
+            ratv::Error::NotConnected("MRP"),
+        ] {
+            assert!(!not_read(&e) && !timed_out(&e), "{e}");
+        }
+    }
+
     fn io(kind: ErrorKind) -> ratv::Error {
         ratv::Error::Io(std::io::Error::from(kind))
     }
@@ -131,11 +160,9 @@ mod tests {
         for e in [ratv::Error::Closed, ratv::Error::Disconnected] {
             assert_eq!(ServiceError::NotConnected, e.into());
         }
-        for e in [
-            ratv::Error::SendTimeout("press"),
-            ratv::Error::NoAnswer("x"),
-        ] {
-            assert_eq!(ServiceError::Timeout, e.into());
+        assert_eq!(ServiceError::Timeout, ratv::Error::NoAnswer("x").into());
+        for e in [ratv::Error::SendTimeout("press"), ratv::Error::QueueFull] {
+            assert_eq!(ServiceError::ServiceUnavailable(NOT_SENT.into()), e.into());
         }
     }
 

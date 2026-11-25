@@ -32,6 +32,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAILBOX_CAPACITY: usize = 1024;
 /// Longest wait for a close frame after a read error.
 const BUFFERED_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+/// This many messages that are not a JSON object within [`INVALID_WINDOW`] close the connection.
+/// A Remote does not send them: many of them are a bug or another client.
+const INVALID_LIMIT: u8 = 5;
+/// Starts at the first message that is not a JSON object.
+const INVALID_WINDOW: Duration = Duration::from_secs(60);
 /// Keys with secret string values: the pairing PIN, and the backup with the pairing keys.
 const SECRET_KEYS: [&str; 3] = ["\"pin\"", "\"restore_data\"", "\"backup_data\""];
 
@@ -47,6 +52,8 @@ struct WsSender {
     /// Start of the last send, for the trace. `handle` runs only after the previous send is done,
     /// because `wait` blocks the mailbox.
     last_send: Option<Instant>,
+    /// The session is closed: the messages that wait are dropped.
+    closed: bool,
 }
 
 impl Actor for WsSender {
@@ -64,6 +71,9 @@ impl Handler<SendWsMessage> for WsSender {
     type Result = ();
 
     fn handle(&mut self, msg: SendWsMessage, ctx: &mut Self::Context) {
+        if self.closed {
+            return;
+        }
         let id = Arc::clone(&self.id);
         let trace = self.msg_tracing_out.then(|| {
             let now = Instant::now();
@@ -83,23 +93,72 @@ impl Handler<SendWsMessage> for WsSender {
                             if let Some(gap) = trace {
                                 trace_out(&id, gap, &text);
                             }
-                            session.text(text).await.map_err(|e| {
-                                error!("[{id}] WebSocket send error: {e}");
-                                None
-                            })
+                            session.text(text).await.map_err(|_| None)
                         }
                     }
                 };
-                if timeout(SEND_TIMEOUT, send).await.is_err() {
+                let Ok(result) = timeout(SEND_TIMEOUT, send).await else {
                     // A lost message leaves an old state on the Remote. After a new connection,
                     // the Remote gets the full state again.
                     warn!("[{id}] Remote does not read, closing the connection");
                     close(session, None).await;
-                }
+                    return true;
+                };
+                result.is_err()
             }
             .into_actor(self)
-            .map(|(), _, _| ()),
+            .map(|closed, act, _| {
+                if closed && !act.closed {
+                    act.closed = true;
+                    debug!(
+                        "[{}] WebSocket closed, waiting messages are dropped",
+                        act.id
+                    );
+                }
+            }),
         );
+    }
+}
+
+/// Counts messages that are not a JSON object within [`INVALID_WINDOW`].
+#[derive(Debug)]
+pub(super) struct InvalidMessages {
+    count: u8,
+    since: Instant,
+}
+
+impl InvalidMessages {
+    pub(super) fn new() -> Self {
+        Self {
+            count: 0,
+            since: Instant::now(),
+        }
+    }
+
+    /// Count one invalid message. True if the connection must be closed. The window starts at
+    /// the first invalid message.
+    fn add(&mut self, now: Instant) -> bool {
+        if self.count == 0 || now.duration_since(self.since) > INVALID_WINDOW {
+            self.since = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count >= INVALID_LIMIT
+    }
+}
+
+/// Returns [`WsSender::closed`].
+#[cfg(test)]
+#[derive(actix::Message)]
+#[rtype(result = "bool")]
+struct IsClosed;
+
+#[cfg(test)]
+impl Handler<IsClosed> for WsSender {
+    type Result = bool;
+
+    fn handle(&mut self, _: IsClosed, _: &mut Self::Context) -> bool {
+        self.closed
     }
 }
 
@@ -124,6 +183,7 @@ impl WsConn {
             session: session.clone(),
             msg_tracing_out: self.msg_tracing_out,
             last_send: None,
+            closed: false,
         }
         .start();
 
@@ -228,8 +288,7 @@ impl WsConn {
                 if self.msg_tracing_in {
                     debug!("[{}] -> {}", self.id, redact(&text));
                 }
-                self.handle_text_message(&text, sender);
-                Ok(())
+                self.handle_text_message(&text, sender)
             }
             AggregatedMessage::Binary(data) => {
                 self.handle_binary_message(data);
@@ -251,19 +310,44 @@ impl WsConn {
         }
     }
 
-    /// Handle a JSON text message. A message that cannot be parsed is skipped. The connection
-    /// stays open. A request with a readable id gets an error response.
-    fn handle_text_message(&self, text: &str, sender: &Addr<WsSender>) {
-        match serde_json::from_str::<WsMessage>(text) {
-            Ok(msg) => self.process_intg_api_message(msg, sender),
-            Err(e) => {
-                // The error text has no part of `msg_data`, where PINs are.
-                warn!("[{}] Invalid JSON message, skipped: {e}", self.id);
-                if let Some(response) = invalid_message_response(&self.id, text, &e) {
-                    sender.do_send(SendWsMessage::Msg(response));
-                }
+    /// Handle a JSON text message. A message that cannot be parsed is skipped. A request with a
+    /// readable id gets an error response. The connection is closed after [`INVALID_LIMIT`]
+    /// messages that are not a JSON object within [`INVALID_WINDOW`]. A JSON object of an unknown
+    /// form is not counted: a newer Remote can send it.
+    fn handle_text_message(
+        &mut self,
+        text: &str,
+        sender: &Addr<WsSender>,
+    ) -> Result<(), Option<CloseReason>> {
+        let e = match serde_json::from_str::<WsMessage>(text) {
+            Ok(msg) => {
+                self.process_intg_api_message(msg, sender);
+                return Ok(());
             }
+            Err(e) => e,
+        };
+        let json = text.trim_start().starts_with('{')
+            && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok();
+        if !json && self.invalid.add(Instant::now()) {
+            warn!(
+                "[{}] {INVALID_LIMIT} invalid messages, closing the connection: {e}",
+                self.id
+            );
+            return Err(Some(CloseReason {
+                code: CloseCode::Policy,
+                description: Some("Invalid messages".into()),
+            }));
         }
+        // The error text has no part of `msg_data`, where PINs are.
+        if json {
+            warn!("[{}] Unknown message, skipped: {e}", self.id);
+        } else {
+            warn!("[{}] Invalid message, skipped: {e}", self.id);
+        }
+        if json && let Some(response) = invalid_message_response(&self.id, text, &e) {
+            sender.do_send(SendWsMessage::Msg(response));
+        }
+        Ok(())
     }
 
     /// Process a received Integration-API request, response or event message.
@@ -423,10 +507,8 @@ impl WsConn {
                 if let Some(gap) = trace {
                     trace_out(id, gap, &text);
                 }
-                session.text(text).await.map_err(|e| {
-                    error!("[{id}] WebSocket send error: {e}");
-                    None
-                })
+                // The only error is a closed session. The caller logs it once.
+                session.text(text).await.map_err(|_| None)
             }
             Err(e) => {
                 error!("[{id}] Error serializing outgoing message: {e}");
@@ -630,7 +712,10 @@ fn log_voice_end(id: &str, session_id: u32, count: VoiceCount) {
 }
 #[cfg(test)]
 mod tests {
-    use super::{RequestId, Route, invalid_message_response, redact, route, supported};
+    use super::{
+        INVALID_LIMIT, INVALID_WINDOW, InvalidMessages, RequestId, Route, invalid_message_response,
+        redact, route, supported,
+    };
     use crate::configuration::HeartbeatSettings;
     use crate::controller::R2AudioChunkMsg;
     use crate::controller::test_util::controller;
@@ -810,6 +895,42 @@ mod tests {
         assert!(response(r#"{"kind":"event","id":5,"cat":"x"}"#).is_none());
         assert!(response(r#"{"kind":"req","cat":"x"}"#).is_none());
         assert!(response("{not json").is_none());
+    }
+
+    #[test]
+    fn invalid_messages_reach_the_limit() {
+        let mut invalid = InvalidMessages::new();
+        let start = std::time::Instant::now();
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(start));
+        }
+        assert!(invalid.add(start));
+    }
+
+    #[test]
+    fn invalid_messages_are_counted_again_after_the_window() {
+        let mut invalid = InvalidMessages::new();
+        let start = std::time::Instant::now();
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(start));
+        }
+        let later = start + INVALID_WINDOW + std::time::Duration::from_secs(1);
+        for _ in 1..INVALID_LIMIT {
+            assert!(!invalid.add(later));
+        }
+        assert!(invalid.add(later), "new window full");
+    }
+
+    #[test]
+    fn invalid_window_starts_at_the_first_invalid_message() {
+        let mut invalid = InvalidMessages::new();
+        let first = std::time::Instant::now() + std::time::Duration::from_secs(50);
+        assert!(!invalid.add(first));
+        let later = first + std::time::Duration::from_secs(15);
+        for _ in 2..INVALID_LIMIT {
+            assert!(!invalid.add(later));
+        }
+        assert!(invalid.add(later), "within the window of the first message");
     }
 
     #[test]
@@ -1011,6 +1132,134 @@ mod tests {
         // `buffered_close` stops at the time limit for a stream that does not end.
         let mut s = stream::pending::<Result<AggregatedMessage, ProtocolError>>();
         assert_eq!(None, buffered_close(&mut s).await);
+    }
+
+    #[actix::test]
+    async fn invalid_messages_get_errors_and_close_the_connection() {
+        use crate::server::{Authentication, ws_index};
+        use actix_web::{App, HttpServer, web};
+
+        let controller = web::Data::new(controller("ws-invalid"));
+        let heartbeat = web::Data::new(HeartbeatSettings::default());
+        let metadata = serde_json::from_value(serde_json::json!({})).expect("metadata");
+        let auth = web::Data::new(Authentication::new(&metadata));
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(heartbeat.clone())
+                .app_data(auth.clone())
+                .app_data(controller.clone())
+                .service(ws_index)
+        })
+        .workers(1)
+        .disable_signals()
+        .bind(("127.0.0.1", 0))
+        .expect("bind");
+        let addr = server.addrs()[0];
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let (answers, close) = tokio::task::spawn_blocking(move || {
+            let mut s = raw::connect(addr);
+            // The authentication message.
+            assert_eq!(1, raw::read(&mut s).0);
+            for text in [
+                // Not a JSON object: counted, no response.
+                "{not json",
+                "[1,",
+                "[]",
+                // A JSON object of an unknown form: not counted. With an id: an error response.
+                r#"{"kind":"event","cat":"x"}"#,
+                r#"{"kind":"req","cat":"x"}"#,
+                r#"{"kind":"req","id":8,"msg":"x","cat":"x"}"#,
+                // Valid with an id: a response.
+                r#"{"kind":"req","id":7,"msg":"get_driver_version"}"#,
+                // The 4th message that is not a JSON object.
+                "{",
+            ] {
+                raw::send(&mut s, 0x1, text.as_bytes());
+            }
+            let keep = |answers: &mut Vec<serde_json::Value>, payload: &[u8]| {
+                let value: serde_json::Value = serde_json::from_slice(payload).expect("json");
+                if value["kind"] == "resp" {
+                    answers.push(value);
+                }
+            };
+            let mut answers = Vec::new();
+            while answers.len() < 2 {
+                let (opcode, payload) = raw::read(&mut s);
+                if opcode == 0x1 {
+                    keep(&mut answers, &payload);
+                }
+            }
+            // The 5th message that is not a JSON object closes the connection.
+            raw::send(&mut s, 0x1, b"]");
+            loop {
+                let (opcode, payload) = raw::read(&mut s);
+                match opcode {
+                    0x1 => keep(&mut answers, &payload),
+                    0x8 => {
+                        let code = payload
+                            .first_chunk::<2>()
+                            .map(|code| u16::from_be_bytes(*code));
+                        return (answers, code);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("client");
+        handle.stop(false).await;
+
+        assert_eq!(Some(1008), close, "policy close code");
+        let mut ids: Vec<_> = answers
+            .iter()
+            .filter_map(|a| a["req_id"].as_u64())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(2, answers.len(), "{answers:?}");
+        assert_eq!(vec![7, 8], ids, "{answers:?}");
+        let error = answers.iter().find(|a| a["req_id"] == 8).expect("error");
+        assert_eq!(400, error["code"]);
+    }
+
+    /// After a failed send, the sender is marked closed.
+    #[actix::test]
+    async fn sender_stops_after_a_failed_send() {
+        use super::{IsClosed, WsSender};
+        use crate::controller::SendWsMessage;
+        use actix_web::{FromRequest, test::TestRequest, web};
+
+        let (req, mut payload) = TestRequest::default()
+            .insert_header(("upgrade", "websocket"))
+            .insert_header(("connection", "upgrade"))
+            .insert_header(("sec-websocket-version", "13"))
+            .insert_header(("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="))
+            .to_http_parts();
+        let body = web::Payload::from_request(&req, &mut payload)
+            .await
+            .expect("payload");
+        let (response, session, _stream) = actix_ws::handle(&req, body).expect("upgrade");
+        // The response holds the receiving end: without it each send fails.
+        drop(response);
+        let sender = WsSender {
+            id: "test".into(),
+            session,
+            msg_tracing_out: false,
+            last_send: None,
+            closed: false,
+        }
+        .start();
+        assert!(!sender.send(IsClosed).await.expect("send"));
+        sender
+            .send(SendWsMessage::Text("{}".into()))
+            .await
+            .expect("send");
+        assert!(
+            sender.send(IsClosed).await.expect("send"),
+            "closed after the error"
+        );
     }
 
     #[actix::test]

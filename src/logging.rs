@@ -50,10 +50,15 @@ impl Log for SwitchLogger {
 
 /// Start the logger. Call it once, before anything is logged.
 pub fn init(debug: bool) {
-    let normal = Builder::from_env(Env::default().default_filter_or(DEFAULT_FILTER)).build();
-    let debug_logger = std::env::var_os("RUST_LOG")
-        .is_none()
-        .then(|| Builder::new().parse_filters(DEBUG_FILTER).build());
+    let normal = Builder::from_env(Env::default().default_filter_or(DEFAULT_FILTER))
+        .format_timestamp_millis()
+        .build();
+    let debug_logger = std::env::var_os("RUST_LOG").is_none().then(|| {
+        Builder::new()
+            .parse_filters(DEBUG_FILTER)
+            .format_timestamp_millis()
+            .build()
+    });
     let logger = LOGGER.get_or_init(|| SwitchLogger {
         normal,
         debug: debug_logger,
@@ -79,4 +84,57 @@ pub fn env_filter() -> bool {
 
 fn set_max_level(logger: &SwitchLogger) {
     log::set_max_level(logger.active().filter());
+}
+
+#[cfg(test)]
+mod tests {
+    use log::{Level, Log, Metadata, Record};
+    use std::sync::Mutex;
+
+    /// Keeps the log records of ratv.
+    struct Capture(Mutex<Vec<String>>);
+
+    impl Log for Capture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if record.target().starts_with("ratv")
+                && let Ok(mut lines) = self.0.lock()
+            {
+                lines.push(format!("{} {}", record.level(), record.args()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+    /// ratv logs with `tracing`. The driver needs these lines in its log. The only test that sets
+    /// the global logger.
+    #[tokio::test]
+    async fn ratv_log_lines_reach_the_log() {
+        log::set_logger(&CAPTURE).expect("logger");
+        log::set_max_level(Level::Debug.to_level_filter());
+        // Nothing listens on this port, so the connect fails at once and ratv logs it. A fixed
+        // port can be in use on a test machine.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let endpoints = ratv::Endpoints {
+            companion: Some(addr),
+            airplay: None,
+        };
+        let credentials = crate::config_store::tests::device().credentials;
+        let result =
+            ratv::AppleTv::connect(&endpoints, &credentials, &ratv::ClientOptions::default()).await;
+        assert!(result.is_err());
+        let lines = CAPTURE.0.lock().expect("lock").clone();
+        assert!(
+            lines.iter().any(|l| l.contains("connection failed")),
+            "{lines:?}"
+        );
+    }
 }

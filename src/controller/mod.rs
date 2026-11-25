@@ -996,6 +996,44 @@ mod tests {
         }
 
         #[actix::test]
+        async fn unsubscribe_empty_ids_does_nothing() {
+            let (controller, key, a) = single("unsubscribe-empty").await;
+            let player = EntityKind::MediaPlayer.entity_id(&key);
+            let data = |ids: Value| Some(json!({ "entity_ids": ids }));
+            request_data(
+                &controller,
+                "a",
+                R2Request::SubscribeEvents,
+                data(json!([])),
+            )
+            .await;
+            request(&controller, "a", R2Request::GetEntityStates).await;
+            let response = request_data(
+                &controller,
+                "a",
+                R2Request::UnsubscribeEvents,
+                data(json!([])),
+            )
+            .await;
+            assert_eq!(
+                Some(200),
+                response.map(|r| r["code"].clone()).and_then(|c| c.as_u64())
+            );
+            controller.send(change(&key, "ON")).await.expect("send");
+            settle(&controller, &[&a]).await;
+            assert_eq!(1, changes(&a, &player).len(), "still subscribed to all");
+
+            request(&controller, "a", R2Request::UnsubscribeEvents).await;
+            controller.send(change(&key, "OFF")).await.expect("send");
+            settle(&controller, &[&a]).await;
+            assert_eq!(
+                1,
+                changes(&a, &player).len(),
+                "no msg_data unsubscribes all"
+            );
+        }
+
+        #[actix::test]
         async fn no_missed_states_before_states_read() {
             let (controller, key, a) = single("standby-unread").await;
             let player = EntityKind::MediaPlayer.entity_id(&key);

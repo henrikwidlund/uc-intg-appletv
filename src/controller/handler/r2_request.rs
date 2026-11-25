@@ -170,7 +170,7 @@ impl Handler<R2RequestMsg> for Controller {
             R2Request::UnsubscribeEvents => {
                 let ws_id = msg.ws_id.clone();
                 match entity_ids(msg.msg_data) {
-                    Ok(ids) => self.unsubscribe(&ws_id, &ids),
+                    Ok(ids) => self.unsubscribe(&ws_id, ids.as_deref()),
                     Err(e) => return_fut_err!(e.into()),
                 }
                 return_fut_ok!(Some(WsMessage::response(req_id, resp_msg, Value::Null)));
@@ -196,20 +196,19 @@ impl Handler<R2RequestMsg> for Controller {
 }
 
 /// `msg_data` of `subscribe_events` and `unsubscribe_events`.
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 struct EntityIds {
     entity_ids: Option<Vec<String>>,
 }
 
-/// Entity ids of a (un)subscribe request. No `msg_data` or no ids means all entities.
-fn entity_ids(msg_data: Option<Value>) -> Result<Vec<String>, serde_json::Error> {
+/// Entity ids of a (un)subscribe request. `None` (no `msg_data`, no ids or `null` ids) means all
+/// entities.
+fn entity_ids(msg_data: Option<Value>) -> Result<Option<Vec<String>>, serde_json::Error> {
     Ok(msg_data
         .filter(|v| !v.is_null())
         .map(serde_json::from_value::<EntityIds>)
         .transpose()?
-        .unwrap_or_default()
-        .entity_ids
-        .unwrap_or_default())
+        .and_then(|ids| ids.entity_ids))
 }
 
 #[cfg(test)]
@@ -219,20 +218,19 @@ mod tests {
 
     #[test]
     fn entity_ids_missing_means_all() {
-        let none: Vec<String> = Vec::new();
-        assert_eq!(none, entity_ids(None).expect("ok"));
-        assert_eq!(none, entity_ids(Some(Value::Null)).expect("ok"));
-        assert_eq!(none, entity_ids(Some(json!({}))).expect("ok"));
+        assert_eq!(None, entity_ids(None).expect("ok"));
+        assert_eq!(None, entity_ids(Some(Value::Null)).expect("ok"));
+        assert_eq!(None, entity_ids(Some(json!({}))).expect("ok"));
         assert_eq!(
-            none,
+            None,
             entity_ids(Some(json!({ "entity_ids": null }))).expect("ok")
         );
         assert_eq!(
-            none,
+            Some(Vec::new()),
             entity_ids(Some(json!({ "entity_ids": [] }))).expect("ok")
         );
         assert_eq!(
-            vec!["a".to_string()],
+            Some(vec!["a".to_string()]),
             entity_ids(Some(json!({ "entity_ids": ["a"] }))).expect("ok")
         );
         assert!(entity_ids(Some(json!({ "entity_ids": "a" }))).is_err());

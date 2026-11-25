@@ -286,14 +286,15 @@ impl Controller {
         (send_rank(ty), name, key, id)
     }
 
-    /// Subscribe entities. No ids means all entities.
+    /// Subscribe entities. `None` or no ids means all entities.
     ///
     /// Sends only the entities that changed after the Remote read the states. The Remote reads
     /// the states itself, and one event per entity can fill the mailbox of the Remote core.
-    pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Vec<String>) {
+    pub(super) fn subscribe(&mut self, ws_id: &str, entity_ids: Option<Vec<String>>) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
+        let entity_ids = entity_ids.unwrap_or_default();
         let all = entity_ids.is_empty();
         let stale: Vec<String> = if all {
             session.subscribe_all = true;
@@ -353,27 +354,31 @@ impl Controller {
         }
     }
 
-    /// Unsubscribe entities. No ids means all entities.
-    pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: &[String]) {
+    /// Unsubscribe entities. `None` means all entities, no ids means none.
+    pub(super) fn unsubscribe(&mut self, ws_id: &str, entity_ids: Option<&[String]>) {
         let Some(session) = self.sessions.get_mut(ws_id) else {
             return;
         };
-        if entity_ids.is_empty() {
-            session.subscribe_all = false;
-            session.subscribed_entities.clear();
-        } else {
-            if session.subscribe_all {
-                // "All" becomes the list of all configured entities, so single ids can be
-                // removed. Also entities without a state yet.
+        match entity_ids {
+            None => {
                 session.subscribe_all = false;
-                for key in self.devices.keys() {
-                    session
-                        .subscribed_entities
-                        .extend(EntityKind::all().map(|kind| kind.entity_id(key)));
-                }
+                session.subscribed_entities.clear();
             }
-            for id in entity_ids {
-                session.subscribed_entities.remove(id);
+            Some([]) => return,
+            Some(entity_ids) => {
+                if session.subscribe_all {
+                    // "All" becomes the list of all configured entities, so single ids can be
+                    // removed. Also entities without a state yet.
+                    session.subscribe_all = false;
+                    for key in self.devices.keys() {
+                        session
+                            .subscribed_entities
+                            .extend(EntityKind::all().map(|kind| kind.entity_id(key)));
+                    }
+                }
+                for id in entity_ids {
+                    session.subscribed_entities.remove(id);
+                }
             }
         }
         self.update_connections(Trigger::Change);
