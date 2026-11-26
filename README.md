@@ -7,10 +7,13 @@ The driver id is `appletv_rs`, so it can run next to the Apple TV integration th
 
 ## Features
 
-- **Media player**: power, playback, seek, fast forward and rewind, volume and mute, repeat and shuffle,
-  audio track and subtitles, navigation, app list, audio outputs, browse (apps and Up Next).
-  Title, artist, album, artwork, position and media type.
-- **Remote**: buttons, hold, repeat and button sequences.
+- **Media player**: power, playback, seek, fast forward and rewind, skip, chapters, volume and mute,
+  repeat and shuffle, audio track and subtitles, navigation, swipes, channel up and down, Guide,
+  Context Menu, App Switcher, Control Center, Screensaver, like and dislike, app list,
+  audio outputs, browse (apps and Up Next) and play media.
+  Title, artist, album, artwork, position, duration and media type.
+- **Remote**: buttons, hold, repeat and button sequences. It has a UI page with App Switcher, Screensaver,
+  Control Center and Guide.
 - **Selects**: app, audio output, audio language, subtitles, account, chapter, Up Next, playback speed,
   shuffle and repeat.
 - **Sensors**: app, audio output, audio language, subtitles, playback speed, shuffle and repeat (the same
@@ -23,11 +26,26 @@ One pairing with one PIN covers all features.
 
 - One PIN for the pairing instead of two.
 - Siri with the voice button.
-- Repeat, shuffle, audio track, subtitles, browse and play media on the media player.
-- Mute and unmute as separate commands. The built-in integration has only mute toggle.
+- Repeat, shuffle, audio track, subtitles, browse and play media on the media player. The built-in
+  integration has repeat and shuffle turned off.
+- Mute and unmute as separate commands, and the mute state is shown. The built-in integration has
+  only mute toggle and does not report the mute state.
 - More selects and sensors. The built-in integration has only the app and the audio output.
-- Updates come only when the Apple TV sends them. There is no poll every 10 seconds.
+- A hold time and a delay for remote commands. The built-in integration has only repeat.
+- Playback updates come only when the Apple TV sends them. The built-in integration also asks the
+  Apple TV every 10 seconds what plays.
 - Entities keep their state while the Remote sleeps. They do not show as unavailable when it wakes up.
+- Backup and restore of the configuration, and _Pair selected device again_ in the setup.
+- _Debug log_ and _Siri protocol_ settings in the setup.
+
+The built-in integration has some things that this driver does not have:
+
+- It comes with the Remote firmware and is updated with it.
+- The setup is in more languages. The setup of this driver is in English only.
+- A Top Menu command.
+
+The driver id and the entity ids are different, so activities must be set up again after a change
+from one integration to the other.
 
 ## Network and wake-up
 
@@ -37,14 +55,18 @@ One pairing with one PIN covers all features.
 - After the Remote wakes up, the driver connects to the last address first. While the network of the
   Remote starts, it tries again every 50 ms for up to 3 seconds. A connect step without an answer in
   0.5 seconds is started again once.
-- A command that comes while the driver connects waits for the connection. It does not fail.
-  The driver connects Companion first. Commands wait at most 0.5 seconds for MRP.
+- A command that comes while the driver connects waits up to 10 seconds for the connection.
+  After that, the command is dropped.
+  The driver connects Companion first. Commands wait at most 0.5 seconds for MRP. Siri in the
+  _MRP only_ mode waits for the MRP connect, also at most 10 seconds.
 - If 3 commands time out within 60 seconds, the driver connects again.
 
 ## Requirements
 
-- Apple TV HD (4th generation) or Apple TV 4K (all generations). Older models are not shown in the setup.
-  Tested with an Apple TV 4K (1st generation) on tvOS 26.6.1.
+- Apple TV HD (4th generation) or Apple TV 4K (all generations). Older models, and devices that do not
+  report a model, are not shown in the setup.
+  Tested with an Apple TV 4K (1st generation) on tvOS 26.6.1 and an Apple TV from 2026 (AppleTV18,1)
+  on tvOS 27.2.1.
 - The Apple TV and the Remote are on the same network or use a mDNS reflector. Multicast DNS (mDNS) must not be blocked.
 - On the Apple TV, in the AirPlay settings: set _Allow Access_ to _Anyone on the Same Network_.
 - For the voice assistant, Siri must be on in the Apple TV settings: Settings > General > Siri.
@@ -72,8 +94,13 @@ One pairing with one PIN covers all features.
 
 1. Download `uc-intg-appletv-rs-<version>-aarch64.tar.gz` from the [releases](https://github.com/henrikwidlund/uc-intg-appletv/releases).
 2. Web configurator: Integrations > Add new > Install custom. Choose the file.
-3. Start the setup of _Apple TV (Rust)_. Leave the IP address empty to search the network.
-4. Choose the Apple TV and enter the PIN that the TV shows.
+3. Start the setup of _Apple TV (Rust)_. On the _Restore_ page, leave _Restore from backup_ off.
+4. Leave the IP address empty to search the network.
+5. Choose the Apple TV and enter the PIN that the TV shows.
+
+In the setup, _Change volume on all connected devices_ is on by default. The volume slider then
+changes all AirPlay outputs that play with the Apple TV, and the volume shows their average.
+Turn it off to change only the Apple TV.
 
 Start the setup again to add, remove, configure or pair a device again.
 If the Apple TV is not found after a tvOS update, use _Configure selected device_ and choose it in
@@ -98,10 +125,12 @@ cargo run --release
 | `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                  |
 | `UC_SETUP_TIMEOUT`         | `3600`              | Setup timeout in seconds. `0` disables it.                             |
 | `UC_CLIENT_NAME`           | host name           | Name shown on the Apple TV for the pairing.                            |
-| `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. PINs and backups hidden. |
+| `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. Needs debug log level.   |
 | `RUST_LOG`                 | `info`              | Log level, for example `info,uc_intg_appletv=debug`.                   |
 
-`config.json` contains the pairing keys. Only the owner can read it.
+`config.json` contains the pairing keys. On Linux and macOS, only the owner can read it.
+The folder also holds `settings.json` (debug log and Siri protocol), the cache files and the
+`artwork` folder. A `config.json` that cannot be read is moved to `config.json.bad-<time>`.
 
 ### Docker
 
@@ -145,7 +174,8 @@ cargo build --release
 ```
 
 The release build for the Remote uses the [UCR2 toolchain](https://github.com/unfoldedcircle/ucr2-toolchain).
-See `.github/workflows/build.yml`. A `v*` tag creates a GitHub release with the archive.
+See `.github/workflows/build.yml`. A tag like `v1.2.3` creates a GitHub release with the archive.
+A tag with `-`, like `v1.2.3-beta.1`, creates a pre-release.
 
 ### Development
 
@@ -211,10 +241,12 @@ Siri through ratv directly, without the driver, to compare with Siri through the
 runs `setup`, `entities` and `states`, because the other checks need them, and `restore_power`
 and `log` at the end, unless `--skip` names them. Unknown step names are refused. If `setup`,
 `entities` or `states` fails, only `restore_power` and `log` run after it. With `--skip setup`,
-`entities` fails, because the driver has no device. `--no-power` keeps the Apple TV on. The
-results are saved to `test-results/remote-sim-results-<time>.md`. `RUST_LOG` is added to the
-driver log filter, and its values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read
-debug lines of the driver, so a `RUST_LOG` must keep `uc_intg_appletv=debug`.
+`entities` fails, because the driver has no device. `--no-power` skips the `power` check.
+`restore_power` still turns the Apple TV off at the end if it was off at the start. To keep the
+Apple TV on, add `--skip restore_power`. The results are saved to
+`test-results/remote-sim-results-<time>.md`. `RUST_LOG` is added to the driver log filter, and its
+values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read debug lines of the driver, so a
+`RUST_LOG` must keep `uc_intg_appletv` at debug or trace.
 
 CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks
 against an Apple TV.

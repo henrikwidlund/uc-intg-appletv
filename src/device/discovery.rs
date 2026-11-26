@@ -256,7 +256,13 @@ mod tests {
 
     #[test]
     fn supported_models() {
-        for model in ["AppleTV5,3", "AppleTV6,2", "AppleTV11,1", "AppleTV14,1"] {
+        for model in [
+            "AppleTV5,3",
+            "AppleTV6,2",
+            "AppleTV11,1",
+            "AppleTV14,1",
+            "AppleTV18,1",
+        ] {
             assert!(is_supported_model(model), "{model}");
         }
         for model in [

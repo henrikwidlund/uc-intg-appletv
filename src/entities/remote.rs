@@ -29,6 +29,7 @@ const MEDIA_PLAYER_COMMANDS: &[&str] = &[
     "VOLUME_UP",
     "VOLUME_DOWN",
     "MUTE",
+    "UNMUTE",
     "MUTE_TOGGLE",
     "CURSOR_UP",
     "CURSOR_DOWN",
@@ -279,6 +280,42 @@ mod tests {
 
     fn params(v: Value) -> Map<String, Value> {
         v.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn ui_page_commands_are_known() {
+        let page = main_page();
+        let items = page["items"].as_array().expect("items");
+        assert_eq!(page["grid"]["height"].as_u64(), Some(items.len() as u64));
+        for item in items {
+            let cmd = item["command"]["cmd_id"].as_str().expect("cmd_id");
+            assert!(map_command(cmd).is_ok(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn advertised_commands_are_known() {
+        let cfg = crate::config_store::tests::device();
+        let entity = crate::entities::definition(&cfg, crate::entities::EntityKind::Remote);
+        let options = entity.options.expect("options");
+        let simple = options["simple_commands"]
+            .as_array()
+            .expect("simple_commands");
+        let mut names: Vec<&str> = simple.iter().map(|c| c.as_str().expect("name")).collect();
+        for cmd in &names {
+            assert!(map_command(cmd).is_ok(), "{cmd}");
+        }
+        assert!(names.contains(&"UNMUTE"));
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(count, names.len(), "repeated simple command");
+        assert_eq!(Action::Mute(false), map_command("UNMUTE").expect("ok"));
+        let mapping = button_mapping();
+        for entry in mapping.as_array().expect("mapping") {
+            let cmd = entry["short_press"]["cmd_id"].as_str().expect("cmd_id");
+            assert!(map_command(cmd).is_ok(), "{cmd}");
+        }
     }
 
     #[test]
