@@ -46,9 +46,9 @@ dependencies = [
 
 [[package]]
 name = "actix-http"
-version = "3.22.0"
+version = "3.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50f98f47b03911915aa3f0b856749aa3d3915033afabb295ab6ac5ff3b8bd5c1"
+checksum = "ef789744a2e6e678dd2dee90b2aecc084022709378f28d9d0eee6d7d299e36b8"
 dependencies = [
  "actix-codec",
  "actix-service",
@@ -1748,7 +1748,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "ratv"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "bytes",
  "getrandom",
@@ -1768,7 +1768,7 @@ dependencies = [
 [[package]]
 name = "ratv-airplay"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "bytes",
  "ratv-codec",
@@ -1779,7 +1779,7 @@ dependencies = [
 [[package]]
 name = "ratv-codec"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "thiserror",
 ]
@@ -1787,7 +1787,7 @@ dependencies = [
 [[package]]
 name = "ratv-companion"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "bytes",
  "ratv-codec",
@@ -1798,7 +1798,7 @@ dependencies = [
 [[package]]
 name = "ratv-discovery"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "thiserror",
 ]
@@ -1806,7 +1806,7 @@ dependencies = [
 [[package]]
 name = "ratv-hap"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "base16ct",
  "chacha20poly1305",
@@ -1826,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "ratv-mrp"
 version = "0.1.0"
-source = "git+https://github.com/henrikwidlund/ratv?rev=4eba8a20c4951285710898312c79fa2fcbc7deaa#4eba8a20c4951285710898312c79fa2fcbc7deaa"
+source = "git+https://github.com/henrikwidlund/ratv?rev=c41987256c578dad604657f4d37f7e81285e3033#c41987256c578dad604657f4d37f7e81285e3033"
 dependencies = [
  "bytes",
  "prost",
@@ -2118,9 +2118,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
 dependencies = [
  "cfg-if",
  "cpufeatures",
@@ -2398,9 +2398,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.2+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+checksum = "26b1f26e9485c1fa43ee89fe76e9f3fb9e2e52bb227f8594b4d687496b83d073"
 dependencies = [
  "indexmap 2.14.2",
  "serde_core",
@@ -2422,9 +2422,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.6+spec-1.1.0"
+version = "1.1.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
+checksum = "0bb28d6e049a9766c3bd91a8326e6179f5b132dec87906bb97018ef7a2f3431a"
 dependencies = [
  "winnow",
 ]
