@@ -3349,8 +3349,9 @@ pub async fn ws_idle(ctx: &mut Ctx) -> Check {
 }
 
 /// A Remote that closes the connection. The driver must read the close frame and end the session.
-/// The Remote's client closes the socket right after the close frame. actix-ws then returns a read
-/// error before that close frame, and the driver reads on to find it.
+/// This client waits until the driver closes the connection. The client of older Remote firmware
+/// closes the socket right after its close frame; the driver test
+/// `close_frame_before_end_of_connection_is_read` covers that case.
 pub async fn ws_close(ctx: &mut Ctx) -> Check {
     const NEW: &str = "New WebSocket connection from: ";
     let mark = ctx.driver.log_len();

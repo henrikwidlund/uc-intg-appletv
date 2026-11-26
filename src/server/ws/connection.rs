@@ -633,8 +633,8 @@ fn string_values(text: &str, key: &str, ranges: &mut Vec<(usize, usize)>) {
 /// The close frame that the Remote sent just before the connection ended, if any.
 ///
 /// When a close frame and the end of the connection arrive together, actix-ws returns the read
-/// error first and the close frame on the next read. The Remote closes its socket right after its
-/// close frame, so this is the normal case for a close by the Remote.
+/// error first and the close frame on the next read. A Remote with an older WebSocket client closes
+/// its socket right after its close frame, so this is the normal case for a close by such a Remote.
 ///
 /// Other messages are skipped. Stops at an error, at the end of the stream, or after
 /// [`BUFFERED_CLOSE_TIMEOUT`]. `Some(None)` is a close frame without a reason.
@@ -1008,19 +1008,29 @@ mod tests {
     /// A WebSocket client over a plain TCP stream, for the close handshake.
     mod raw {
         use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
+        use std::net::{Shutdown, SocketAddr, TcpStream};
         use std::time::Duration;
 
+        const UPGRADE: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+            Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            Sec-WebSocket-Version: 13\r\n\r\n";
+
         pub fn connect(addr: SocketAddr) -> TcpStream {
+            connect_with(addr, None)
+        }
+
+        /// Connect. With `Some(frames)`, send the frames in the same write as the upgrade
+        /// request, then end the write side before the response is read.
+        pub fn connect_with(addr: SocketAddr, frames: Option<&[u8]>) -> TcpStream {
             let mut s = TcpStream::connect(addr).expect("connect");
             s.set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("timeout");
-            s.write_all(
-                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                  Sec-WebSocket-Version: 13\r\n\r\n",
-            )
-            .expect("write");
+            if let Some(frames) = frames {
+                s.write_all(&[UPGRADE, frames].concat()).expect("write");
+                s.shutdown(Shutdown::Write).expect("shutdown");
+            } else {
+                s.write_all(UPGRADE).expect("write");
+            }
             let mut head = Vec::new();
             let mut b = [0u8];
             while !head.ends_with(b"\r\n\r\n") {
@@ -1049,15 +1059,20 @@ mod tests {
             (h[0] & 0x0f, payload)
         }
 
-        /// Send a masked frame from the client, as the protocol requires.
-        pub fn send(s: &mut TcpStream, opcode: u8, payload: &[u8]) {
+        /// A masked frame from the client, as the protocol requires.
+        pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
             let mask = [1u8, 2, 3, 4];
             let len = u8::try_from(payload.len()).expect("short");
             assert!(len < 126);
             let mut frame = vec![0x80 | opcode, 0x80 | len];
             frame.extend_from_slice(&mask);
             frame.extend(payload.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
-            s.write_all(&frame).expect("write");
+            frame
+        }
+
+        /// Send a masked frame from the client.
+        pub fn send(s: &mut TcpStream, opcode: u8, payload: &[u8]) {
+            s.write_all(&frame(opcode, payload)).expect("write");
         }
     }
 
@@ -1222,6 +1237,62 @@ mod tests {
         assert_eq!(vec![7, 8], ids, "{answers:?}");
         let error = answers.iter().find(|a| a["req_id"] == 8).expect("error");
         assert_eq!(400, error["code"]);
+    }
+
+    /// A Remote that ends its side of the connection right after its close frame: the driver
+    /// reads the close frame and answers with the same code and reason. If it misses the close
+    /// frame, the answer is an empty close frame. The close frame and the end of the connection
+    /// are sent before the server reads, so it almost always reads them together. Otherwise the
+    /// normal close path gives the same answer.
+    #[actix::test]
+    async fn close_frame_before_end_of_connection_is_read() {
+        use crate::server::{Authentication, ws_index};
+        use actix_web::{App, HttpServer, web};
+
+        let controller = web::Data::new(controller("ws-close-end"));
+        let heartbeat = web::Data::new(HeartbeatSettings::default());
+        let metadata = serde_json::from_value(serde_json::json!({})).expect("metadata");
+        let auth = web::Data::new(Authentication::new(&metadata));
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(heartbeat.clone())
+                .app_data(auth.clone())
+                .app_data(controller.clone())
+                .service(ws_index)
+        })
+        .workers(1)
+        .disable_signals()
+        .bind(("127.0.0.1", 0))
+        .expect("bind");
+        let addr = server.addrs()[0];
+        let server = server.run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let close = tokio::task::spawn_blocking(move || {
+            let mut payload = 4001u16.to_be_bytes().to_vec();
+            payload.extend_from_slice(b"bye");
+            // The read side stays open for the answer.
+            let mut s = raw::connect_with(addr, Some(&raw::frame(0x8, &payload)));
+            loop {
+                let (opcode, payload) = raw::read(&mut s);
+                if opcode == 0x8 {
+                    return payload;
+                }
+            }
+        })
+        .await
+        .expect("client");
+        handle.stop(false).await;
+
+        assert_eq!(
+            Some(4001),
+            close
+                .first_chunk::<2>()
+                .map(|code| u16::from_be_bytes(*code)),
+            "close answer: {close:?}"
+        );
+        assert_eq!(Some(&b"bye"[..]), close.get(2..), "close reason");
     }
 
     /// After a failed send, the sender is marked closed.

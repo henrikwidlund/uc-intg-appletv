@@ -41,12 +41,14 @@ impl WebSocketMessageHandler for Bridge {
         Vec::new()
     }
 
-    fn on_closed(&mut self, reason: &DisconnectReason) {
+    fn on_closed(&mut self, reason: &DisconnectReason) -> Vec<HandlerAction> {
         let _ = self.0.send(Inbound::Closed(reason.clone()));
+        Vec::new()
     }
 }
 
 pub struct Client {
+    /// The only address of the client: dropping it closes the connection and stops the client.
     ws: Addr<GenericWebSocketClient<Bridge>>,
     inbound: mpsc::UnboundedReceiver<Inbound>,
     /// Why the connection closed. `None` until a close is read, and again when
@@ -61,14 +63,6 @@ pub struct Client {
     assistant: VecDeque<Value>,
     /// Entities that had the state `UNAVAILABLE` in an `entity_change` event.
     unavailable: Vec<String>,
-}
-
-impl Drop for Client {
-    /// The client keeps its connection, or keeps reconnecting, when all addresses are dropped,
-    /// so close it.
-    fn drop(&mut self) {
-        self.ws.do_send(Disconnect);
-    }
 }
 
 /// Settings of the main client: it does not reconnect, so a closed connection fails the check.
@@ -94,11 +88,8 @@ impl Client {
             Bridge(tx),
         )?
         .start();
-        if let Err(e) = ws.send(Connect).await? {
-            // A client that reconnects would keep trying without an owner.
-            ws.do_send(Disconnect);
-            return Err(e.into());
-        }
+        // Dropping the last address on an error stops the client.
+        ws.send(Connect).await??;
         let mut client = Self {
             ws,
             inbound,
@@ -185,7 +176,8 @@ impl Client {
         self.ws.send(IsConnected).await.unwrap_or(false)
     }
 
-    /// Close the connection with status 1000.
+    /// Close the connection with status 1000. Waits until the driver has closed the connection, at
+    /// most the close timeout of the settings (5 s by default).
     pub async fn close(&self) {
         let _ = self.ws.send(Disconnect).await;
     }

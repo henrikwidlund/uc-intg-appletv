@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "actix-ws-client"
 version = "0.2.0"
-source = "git+https://github.com/unfoldedcircle/actix-ws-client?rev=b13926af70ab173343a7631960ade8ff51b81d1c#b13926af70ab173343a7631960ade8ff51b81d1c"
+source = "git+https://github.com/unfoldedcircle/actix-ws-client?rev=e3bf55bb19f06f5be5ab4b096500d6a3bbd1ad38#e3bf55bb19f06f5be5ab4b096500d6a3bbd1ad38"
 dependencies = [
  "actix",
  "bytes",
