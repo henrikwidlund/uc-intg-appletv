@@ -22,46 +22,46 @@ uc_api = { git = "https://github.com/unfoldedcircle/api-model-rs", rev = "336beb
 ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "c177245f790e84591035c22ecae02f809d493591", features = ["opus"] }
 
 # WebSocket server
-actix = "0.13"
-actix-web = { version = "4.20", default-features = false, features = ["macros"] }
-actix-ws = "0.4"
-bytes = "1.12"
-futures = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1.54", features = ["fs", "macros", "sync", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-prost = "0.14"
+actix = "0"
+actix-web = { version = "4", default-features = false, features = ["macros"] }
+actix-ws = "0"
+bytes = "1"
+futures = { version = "0", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["fs", "macros", "sync", "time"] }
+tokio-stream = { version = "0", features = ["sync"] }
+prost = "0"
 
 # mDNS publishing
-hostname = "0.4"
+hostname = "0"
 
 # JSON (de)serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-rust-fsm = "0.8"
-const_format = "0.2"
-strum = { version = "0.28", features = ["derive"] }
-thiserror = "2.0"
-jiff = { version = "1.0", default-features = false, features = ["serde", "std"] }
-bytestring = "1.6"
-uuid = { version = "1.29", features = ["v4"] }
+rust-fsm = "0"
+const_format = "0"
+strum = { version = "0", features = ["derive"] }
+thiserror = "2"
+jiff = { version = "1", default-features = false, features = ["serde", "std"] }
+bytestring = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # Logging. ratv logs with tracing. The driver and other crates log with `log`: tracing-log
 # forwards these records to the tracing subscriber.
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "parking_lot", "smallvec", "tracing-log"] }
-tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
-log = "0.4"
-mdns-sd = { version = "0.22", optional = true }
+tracing = { version = "0", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0", default-features = false, features = ["env-filter", "fmt", "parking_lot", "smallvec", "tracing-log"] }
+tracing-log = { version = "0", default-features = false, features = ["log-tracer", "std"] }
+log = "0"
+mdns-sd = { version = "0", optional = true }
 # Only for tests. A feature cannot enable a dev-dependency.
-dhat = { version = "0.3.3", optional = true }
+dhat = { version = "0", optional = true }
 
 [dev-dependencies]
 # Paused time in tests.
-tokio = { version = "1.54", features = ["rt", "test-util"] }
+tokio = { version = "1", features = ["rt", "test-util"] }
 
 [build-dependencies]
-built = { version = "0.9", features = ["cargo-lock"] }
+built = { version = "0", features = ["cargo-lock"] }
 
 [lints.rust]
 unsafe_code = "forbid"
