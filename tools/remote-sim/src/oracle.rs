@@ -340,6 +340,11 @@ impl Oracle {
         })
     }
 
+    /// The media control flags from Companion. `None` if Companion does not say.
+    pub fn media_flags(&self) -> Option<u32> {
+        self.tv.media_controls().map(|f| f.0)
+    }
+
     /// True if the Apple TV shows the Home Screen (no app shows a player) and nothing plays. The
     /// driver then clears an old paused item. False if Companion does not say.
     pub fn home_screen(&self) -> bool {

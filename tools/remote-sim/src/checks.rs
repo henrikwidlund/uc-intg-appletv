@@ -2763,13 +2763,21 @@ async fn wake_home_steps(ctx: &mut Ctx) -> Check {
 /// Skips if the second connection shows that the Apple TV left the Home Screen, plays, or gives
 /// no media control flags. Without a second connection it does not skip.
 fn home_screen_or_skip(ctx: &Ctx) -> Result<(), Fail> {
-    if ctx.oracle.as_ref().is_some_and(|o| !o.home_screen()) {
-        return Err(Fail::skip(
+    match ctx.oracle.as_ref() {
+        Some(o) if !o.home_screen() => Err(Fail::skip(format!(
             "the Apple TV left the Home Screen, plays again, or gives no media control flags \
-             after the wake",
-        ));
+             after the wake (media control flags {})",
+            flags_text(o)
+        ))),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// The media control flags of the second connection as `0x..`, or `none`.
+fn flags_text(oracle: &Oracle) -> String {
+    oracle
+        .media_flags()
+        .map_or_else(|| "none".to_owned(), |f| format!("{f:#x}"))
 }
 
 /// True if the last Home Screen clear in `log` ended (now playing again, or the connection
@@ -2795,13 +2803,14 @@ async fn wait_home(ctx: &mut Ctx, mark: usize) -> Result<String, Fail> {
                 .oracle
                 .as_ref()
                 .is_some_and(|o| o.playback_state() == Some(PlaybackState::Playing));
-            return Err(Fail::skip(if plays {
-                "the app plays on the Home Screen"
-            } else if ctx.oracle.is_some() {
-                "no Home Screen 10 s after HOME: no clear in the driver log and no Home Screen \
-                 on the second connection"
-            } else {
-                "no Home Screen 10 s after HOME: no clear in the driver log"
+            return Err(Fail::skip(match ctx.oracle.as_ref() {
+                _ if plays => "the app plays on the Home Screen".to_owned(),
+                Some(o) => format!(
+                    "no Home Screen 10 s after HOME: no clear in the driver log and no Home \
+                     Screen on the second connection (media control flags {})",
+                    flags_text(o)
+                ),
+                None => "no Home Screen 10 s after HOME: no clear in the driver log".to_owned(),
             }));
         }
         ctx.client.listen_ms(200).await?;

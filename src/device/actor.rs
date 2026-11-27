@@ -1483,18 +1483,25 @@ impl AppleTvActor {
     /// paused item. Called for each new handle. Each one adds Companion or MRP, and a new MRP
     /// connection sends now playing again.
     fn check_no_player(&mut self, ctx: &mut Context<Self>) {
-        let no_player = self
-            .tv
-            .as_ref()
-            .and_then(AppleTv::media_controls)
-            .is_some_and(|f| f.0 == 0);
-        if no_player {
+        let flags = self.log_media_flags("at the connect");
+        if flags.is_some_and(|f| f.0 == 0) {
             debug!(
                 "[{}] no player at the connect, checking for the Home Screen",
                 self.cfg.name
             );
             self.screen_changed(ctx);
         }
+    }
+
+    /// Read the live media control flags, log them as "media control flags {when}: ..." and
+    /// return them.
+    fn log_media_flags(&self, when: &str) -> Option<ratv::companion::MediaControlFlags> {
+        let flags = self.tv.as_ref().and_then(AppleTv::media_controls);
+        match flags {
+            Some(f) => debug!("[{}] media control flags {when}: {:#x}", self.cfg.name, f.0),
+            None => debug!("[{}] media control flags {when}: none", self.cfg.name),
+        }
+        flags
     }
 
     /// Returns `true` if an app shows a player, also when it is paused. ratv keeps the last media
@@ -2595,7 +2602,8 @@ impl Handler<CompanionEvent> for AppleTvActor {
             }
             // ratv stores the flags before it sends the event, so the live flags are as new or
             // newer.
-            Some(Event::MediaControl(_)) => {
+            Some(Event::MediaControl(flags)) => {
+                debug!("[{}] media control flags: {:#x}", self.cfg.name, flags.0);
                 if self.player_shown() {
                     self.leave_home(ctx);
                 }
@@ -2603,6 +2611,7 @@ impl Handler<CompanionEvent> for AppleTvActor {
             Some(_) => {}
             // Events were lost: ask again. ratv keeps the media control flags of a lost event.
             None => {
+                self.log_media_flags("after lost events");
                 self.query_power(ctx, 0, false);
                 if self.player_shown() {
                     self.leave_home(ctx);
