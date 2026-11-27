@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::Instrument;
 use uc_api::intg::{AssistantError, AssistantErrorCode, AssistantEvent, IntgRemoteCommand};
 
 /// Interval for the app, account and AirPlay polls.
@@ -222,6 +223,35 @@ where
             })
             .finish(),
     )
+}
+
+/// Makes an actor future of a future, like `into_actor`, that runs inside a new device log span.
+/// ratv puts its connection spans inside it.
+trait IntoSpan: Future + Sized {
+    fn into_span(
+        self,
+        act: &AppleTvActor,
+    ) -> fut::future::FutureWrap<tracing::instrument::Instrumented<Self>, AppleTvActor> {
+        self.instrument(device_span(&act.cfg.name)).into_actor(act)
+    }
+}
+
+impl<F: Future> IntoSpan for F {}
+
+/// Close `tv` in the background, inside `span`.
+fn close_later(tv: AppleTv, span: tracing::Span) {
+    actix::spawn(
+        async move {
+            let _ = tv.close().await;
+        }
+        .instrument(span),
+    );
+}
+
+/// Log span of one Apple TV. Debug level: it costs very little while debug logs are off. Make a
+/// new one for each piece of work, so that it follows the debug log setting.
+fn device_span(name: &str) -> tracing::Span {
+    tracing::debug_span!("device", name)
 }
 
 /// Keep `new` in `slot` and stop the stream that was there.
@@ -514,7 +544,7 @@ impl AppleTvActor {
         let known = self.endpoints;
         let start = Instant::now();
         let fut = connect_device(known, cfg, options);
-        ctx.spawn(fut.into_actor(self).map(move |(cfg, result), act, ctx| {
+        ctx.spawn(fut.into_span(self).map(move |(cfg, result), act, ctx| {
             // What discovery found is valid also for an old attempt.
             if let Some(cfg) = cfg
                 && act.cfg_version == version
@@ -532,9 +562,7 @@ impl AppleTvActor {
                     act.cfg.name
                 );
                 if let Ok(Connected { tv, .. }) = result {
-                    actix::spawn(async move {
-                        let _ = tv.close().await;
-                    });
+                    close_later(tv, device_span(&act.cfg.name));
                 }
                 return;
             }
@@ -548,9 +576,7 @@ impl AppleTvActor {
                     act.on_connected(tv, Link::New { via, join }, start, ctx);
                 }
                 Ok(Connected { tv, .. }) => {
-                    actix::spawn(async move {
-                        let _ = tv.close().await;
-                    });
+                    close_later(tv, device_span(&act.cfg.name));
                 }
                 Err(ConnectError::Failed(e)) if pairing_not_valid(&e) => {
                     act.endpoints = None;
@@ -760,7 +786,7 @@ impl AppleTvActor {
             }
         };
         let handle = ctx.spawn(
-            fut.into_actor(self)
+            fut.into_span(self)
                 .map(move |(protocol, reason), act, ctx| {
                     if act.generation != generation {
                         return;
@@ -929,9 +955,7 @@ impl AppleTvActor {
             ctx.cancel_future(handle);
         }
         if let Some(tv) = self.tv.take() {
-            actix::spawn(async move {
-                let _ = tv.close().await;
-            });
+            close_later(tv, device_span(&self.cfg.name));
         }
     }
 
@@ -1115,54 +1139,49 @@ impl AppleTvActor {
             let result = tv.connect_missing(&ep, &cfg.credentials, &options).await;
             (changed.then_some(cfg), ep, result)
         };
-        ctx.spawn(
-            fut.into_actor(self)
-                .map(move |(cfg, ep, result), act, ctx| {
-                    if let Some(cfg) = cfg
-                        && act.cfg_version == version
-                    {
-                        act.set_config(cfg.clone());
-                        act.controller.do_send(DeviceEvent::Config {
-                            key: act.key.clone(),
-                            cfg,
-                            version,
-                        });
+        ctx.spawn(fut.into_span(self).map(move |(cfg, ep, result), act, ctx| {
+            if let Some(cfg) = cfg
+                && act.cfg_version == version
+            {
+                act.set_config(cfg.clone());
+                act.controller.do_send(DeviceEvent::Config {
+                    key: act.key.clone(),
+                    cfg,
+                    version,
+                });
+            }
+            if act.generation != generation {
+                if let Ok(Some(tv)) = result {
+                    close_later(tv, device_span(&act.cfg.name));
+                }
+                return;
+            }
+            act.missing_running = false;
+            if act.cfg_version == version {
+                act.endpoints = Some(ep);
+            }
+            let joined = act.end_mrp_join();
+            if joined && let Err(e) = &result {
+                act.mrp_join_failed(e, ctx);
+            }
+            match result {
+                Err(e) if network_not_ready(&e) => act.missing_network_retry(ctx),
+                // Retries cannot fix the pairing. The next connect tries again.
+                Err(e) if pairing_not_valid(&e) => act.stop_missing(&e, joined, ctx),
+                Err(e) => {
+                    act.missing_network_end = None;
+                    // `mrp_join_failed` has logged it.
+                    if !joined {
+                        debug!("[{}] missing protocols did not connect: {e}", act.cfg.name);
                     }
-                    if act.generation != generation {
-                        if let Ok(Some(tv)) = result {
-                            actix::spawn(async move {
-                                let _ = tv.close().await;
-                            });
-                        }
-                        return;
-                    }
-                    act.missing_running = false;
-                    if act.cfg_version == version {
-                        act.endpoints = Some(ep);
-                    }
-                    let joined = act.end_mrp_join();
-                    if joined && let Err(e) = &result {
-                        act.mrp_join_failed(e, ctx);
-                    }
-                    match result {
-                        Err(e) if network_not_ready(&e) => act.missing_network_retry(ctx),
-                        // Retries cannot fix the pairing. The next connect tries again.
-                        Err(e) if pairing_not_valid(&e) => act.stop_missing(&e, joined, ctx),
-                        Err(e) => {
-                            act.missing_network_end = None;
-                            // `mrp_join_failed` has logged it.
-                            if !joined {
-                                debug!("[{}] missing protocols did not connect: {e}", act.cfg.name);
-                            }
-                        }
-                        Ok(Some(tv)) => {
-                            act.missing_network_end = None;
-                            act.use_handle(tv, start, ctx);
-                        }
-                        Ok(None) => act.missing_network_end = None,
-                    }
-                }),
-        );
+                }
+                Ok(Some(tv)) => {
+                    act.missing_network_end = None;
+                    act.use_handle(tv, start, ctx);
+                }
+                Ok(None) => act.missing_network_end = None,
+            }
+        }));
     }
 
     /// MRP did not connect after a connect with Companion only. Show what is missing and clear
@@ -1292,7 +1311,7 @@ impl AppleTvActor {
                     None => Err(ratv::Error::NotConnected("Companion")),
                 }
             }
-            .into_actor(self)
+            .into_span(self)
             .map(move |result, act, ctx| {
                 if act.companion_gen != companion_gen {
                     return;
@@ -1586,7 +1605,7 @@ impl AppleTvActor {
         // The Apple TV scales the image.
         ctx.spawn(
             async move { tv.artwork(ARTWORK_SIZE, 0).await }
-                .into_actor(self)
+                .into_span(self)
                 .map(move |result, act, _| {
                     if act.generation != generation || act.artwork_seq != seq {
                         return;
@@ -1787,7 +1806,7 @@ impl AppleTvActor {
             };
             (apps, tv.accounts().await)
         };
-        ctx.spawn(fut.into_actor(self).map(move |(apps, accounts), act, ctx| {
+        ctx.spawn(fut.into_span(self).map(move |(apps, accounts), act, ctx| {
             if act.companion_gen != companion_gen {
                 return;
             }
@@ -1845,7 +1864,7 @@ impl AppleTvActor {
             self.timers.scan = Some(
                 ctx.spawn(
                     async move { discovery::scan_airplay_outputs(own_uid.as_deref()).await }
-                        .into_actor(self)
+                        .into_span(self)
                         .map(move |result, act, _| {
                             act.timers.scan = None;
                             match result {
@@ -2086,7 +2105,7 @@ impl AppleTvActor {
         };
         let start = connect_ended(connecting, join_wait)
             .into_actor(self)
-            .then(move |(), act, _| fut(act.tv.clone()).into_actor(act));
+            .then(move |(), act, _| fut(act.tv.clone()).into_span(act));
         ctx.spawn(start.map(move |result, act, _| {
             // Compare the session, not the id: the Remote can use the same id again.
             let current = act.siri.as_ref().map(|s| &s.flags);
@@ -2227,9 +2246,7 @@ async fn connect_endpoints(
     .await;
     // Companion won: MRP is connected again with `connect_missing`, which needs one handle.
     if let Some(tv) = extra {
-        actix::spawn(async move {
-            let _ = tv.close().await;
-        });
+        close_later(tv, tracing::Span::current());
     }
     result
 }
@@ -3166,7 +3183,7 @@ impl AppleTvActor {
             (result, unsent, missing, timed_out, guard)
         };
         let cmd_id = msg.cmd_id.clone();
-        fut.into_actor(self).map(
+        fut.into_span(self).map(
             move |(result, unsent, missing, timed_out, guard), act, ctx| {
                 let stays_missing = stays_missing(
                     missing,
@@ -3312,6 +3329,22 @@ mod tests {
     use crate::server::ArtworkStore;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU8;
+
+    #[test]
+    fn device_span_only_with_debug_logs() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let with = |filter: &str| {
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(filter))
+        };
+        tracing::subscriber::with_default(with("info"), || {
+            assert!(device_span("Apple TV").is_disabled());
+        });
+        tracing::subscriber::with_default(with("info,uc_intg_appletv=debug"), || {
+            let span = device_span("Apple TV");
+            assert!(!span.is_disabled());
+            assert_eq!(Some("device"), span.metadata().map(tracing::Metadata::name));
+        });
+    }
 
     #[test]
     fn only_the_first_screen_event_right_after_the_companion_connect_is_skipped() {

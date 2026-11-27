@@ -24,6 +24,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 use uc_api::intg::{DriverSetupChange, IntegrationSetup, SetupDriver};
 use uc_api::model::intg::{IntegrationSetupError, IntegrationSetupState, SetupChangeEventType};
 use uc_api::ws::{EventCategory, WsMessage};
@@ -437,6 +438,7 @@ impl Controller {
         let flow = self.setup_flow;
         ctx.spawn(
             async move { discovery::scan_apple_tvs(address).await }
+                .instrument(setup_span(&ws_id))
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     if !act.is_setup_flow(flow, &ws_id) {
@@ -776,6 +778,7 @@ impl Controller {
         let flow = self.setup_flow;
         ctx.spawn(
             async move { discovery::scan_apple_tvs(None).await }
+                .instrument(setup_span(&ws_id))
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     if !act.is_setup_flow(flow, &ws_id) {
@@ -815,6 +818,7 @@ impl Controller {
                 let found = discovery::find(&cfg).await;
                 (cfg, found)
             }
+            .instrument(setup_span(&ws_id))
             .into_actor(self)
             .map(move |(cfg, result), act, ctx| {
                 if !act.is_setup_flow(flow, &ws_id) {
@@ -878,6 +882,7 @@ impl Controller {
         let flow = self.setup_flow;
         let handle = ctx.spawn(
             async move { ratv::pair(&endpoints, &options).await }
+                .instrument(setup_span(&ws_id))
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     if !act.is_setup_flow(flow, &ws_id) {
@@ -922,6 +927,7 @@ impl Controller {
         let flow = self.setup_flow;
         let handle = ctx.spawn(
             async move { prompt.finish(&pin).await }
+                .instrument(setup_span(&ws_id))
                 .into_actor(self)
                 .map(move |result, act, ctx| {
                     // The setup was aborted or timed out: the user did not wait for the result.
@@ -1405,6 +1411,12 @@ fn parse_bool(values: &HashMap<String, String>, key: &str, default: bool) -> boo
     values.get(key).map_or(default, |v| v == "true")
 }
 
+/// Log span of the setup work of the Remote connection `ws_id`. Debug level: it costs very
+/// little while debug logs are off.
+fn setup_span(ws_id: &str) -> tracing::Span {
+    tracing::debug_span!("setup", ws = ws_id)
+}
+
 fn log_pairing_failure(ws_id: &str, e: &ratv::Error) {
     if not_read(pairing_cause(e)) {
         warn!("[{ws_id}] pairing failed: {NOT_SENT} ({e})");
@@ -1437,6 +1449,22 @@ fn setup_error(e: &ratv::Error) -> IntegrationSetupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_span_only_with_debug_logs() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let with = |filter: &str| {
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(filter))
+        };
+        tracing::subscriber::with_default(with("info"), || {
+            assert!(setup_span("127.0.0.1:1").is_disabled());
+        });
+        tracing::subscriber::with_default(with("info,uc_intg_appletv=debug"), || {
+            let span = setup_span("127.0.0.1:1");
+            assert!(!span.is_disabled());
+            assert_eq!(Some("setup"), span.metadata().map(tracing::Metadata::name));
+        });
+    }
 
     #[test]
     fn setup_error_timeouts_and_not_read() {
