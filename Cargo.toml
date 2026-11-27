@@ -46,10 +46,11 @@ jiff = { version = "1.0", default-features = false, features = ["serde", "std"] 
 bytestring = "1.6"
 uuid = { version = "1.29", features = ["v4"] }
 
-# Logging. ratv logs with tracing. The `log` feature forwards its events to env_logger. The actix
-# crates turn it on too, but the driver must not depend on that.
-tracing = { version = "0.1", default-features = false, features = ["log", "std"] }
-env_logger = "0.11"
+# Logging. ratv logs with tracing. The driver and other crates log with `log`: tracing-log
+# forwards these records to the tracing subscriber.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "parking_lot", "smallvec", "tracing-log"] }
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 log = "0.4"
 mdns-sd = { version = "0.22", optional = true }
 # Only for tests. A feature cannot enable a dev-dependency.

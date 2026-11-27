@@ -153,6 +153,15 @@ setup again, tick _Debug log_ and choose _Save settings_.
 The driver and ratv then write more lines to the log. It takes effect at once and stays on after a restart.
 Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
 
+Log line layout: `[<UTC time> <level> <target>] <message> <fields> <spans>`. The spans name the ratv connection,
+pairing or connect, for example `session{protocol="mrp" id=3 addr=192.168.1.20:49152}`. Nested spans are joined
+with `:`. Each span gets its own `id`, so all lines of one connection have the same `id`. The spans show only when
+`ratv` (or `ratv::log`) logs at debug level, for example with the debug log on, or with `RUST_LOG` set to
+`ratv=debug`. On Linux, when the output goes to the systemd journal (`JOURNAL_STREAM` names the stderr of the
+driver), each log entry starts with a priority prefix such as `<7>`. The journal then gets the level of each entry,
+and `journalctl -p warning` shows only warnings and errors. The second and later lines of a message with more than
+one line, and the output of a panic, get the default priority of the journal.
+
 _Siri protocol_ is on the same pages. Keep it at _Auto_: Siri then uses the same protocol as the iPhone remote.
 _MRP only_ is only for finding errors.
 
