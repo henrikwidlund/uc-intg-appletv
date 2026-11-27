@@ -1612,6 +1612,10 @@ fn position(ctx: &Ctx) -> Option<f64> {
         .and_then(Value::as_f64)
 }
 
+/// Wait after a play state change before the next PLAY, PAUSE or play_pause. The Apple TV can
+/// ignore such a command right after a change.
+const TOGGLE_SETTLE_MS: u64 = 700;
+
 pub async fn playback(ctx: &mut Ctx) -> Check {
     need_content(ctx, Content::Movie, PlaybackSeen::DriverOrOracle).await?;
     let standby = matches!(mp_state(ctx).as_str(), "STANDBY" | "OFF");
@@ -1620,12 +1624,15 @@ pub async fn playback(ctx: &mut Ctx) -> Check {
     mp_command(ctx, "PAUSE", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 5, "PAUSED").await?;
     wait_playback(ctx, PlaybackState::Paused).await?;
+    ctx.client.listen_ms(TOGGLE_SETTLE_MS).await?;
     mp_command(ctx, "PLAY", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 5, "PLAYING").await?;
     wait_playback(ctx, PlaybackState::Playing).await?;
+    ctx.client.listen_ms(TOGGLE_SETTLE_MS).await?;
     mp_command(ctx, "play_pause", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 5, "PAUSED").await?;
     wait_playback(ctx, PlaybackState::Paused).await?;
+    ctx.client.listen_ms(TOGGLE_SETTLE_MS).await?;
     mp_command(ctx, "play_pause", json!({})).await?;
     ctx.client.wait_text(&mp, "state", 5, "PLAYING").await?;
     wait_playback(ctx, PlaybackState::Playing).await?;
