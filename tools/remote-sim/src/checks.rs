@@ -798,10 +798,12 @@ fn volume_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
     }
 }
 
-/// Compare the title and the app that plays.
+/// Compare the title and the app that plays. On the Home Screen with nothing playing, the driver
+/// clears an old paused item: an empty title or source is then accepted.
 fn now_playing_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
     let c = &ctx.client;
     let mp = ctx.mp();
+    let home = oracle.home_screen();
     let np = oracle.now_playing();
     let shown = c.text(&mp, "media_title");
     // Like the driver: an episode shows its own title, not the show name.
@@ -812,12 +814,13 @@ fn now_playing_mismatches(ctx: &Ctx, oracle: &Oracle, out: &mut Vec<String>) {
         .or(np.title.as_deref());
     if let Some(title) = title.filter(|t| !t.is_empty())
         && !shown.contains(title)
+        && !(home && cleared(c.attr(&mp, "media_title")))
     {
         out.push(format!("media_title {shown:?}, Apple TV {title:?}"));
     }
     if let Some(name) = np.app.as_deref().and_then(|b| oracle.app_name(b)) {
         let source = c.text(&mp, "source");
-        if source != name {
+        if source != name && !(home && cleared(c.attr(&mp, "source"))) {
             out.push(format!("source {source:?}, Apple TV {name:?}"));
         }
     }
@@ -905,6 +908,7 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
         in_standby != "UNAVAILABLE",
         "state in standby: {in_standby}"
     );
+    let mark = ctx.driver.log_len();
     ctx.client.send_event("exit_standby").await?;
     let start = Instant::now();
     while connects(ctx) == before {
@@ -920,8 +924,28 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     let mut nothing = "";
     if ctx.oracle.is_some() {
         verify(ctx, 5).await?;
-        // `verify` does not see an old title when the Apple TV has none.
-        if ctx.oracle.as_ref().and_then(Oracle::has_item) == Some(false) {
+        // `verify` does not see an old title when the Apple TV has none, and accepts the old
+        // title on the Home Screen. The driver clears both after a new connection.
+        let oracle = ctx.oracle.as_ref();
+        if oracle.is_some_and(Oracle::home_screen) {
+            let mp = ctx.mp();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let left = item_left(ctx, &mp);
+                if left.is_empty() {
+                    break;
+                }
+                home_screen_or_skip(ctx)?;
+                ensure!(
+                    Instant::now() < deadline,
+                    "the Apple TV shows the Home Screen and nothing plays, the driver shows {}{}",
+                    left.join(", "),
+                    no_check_note(ctx, mark)
+                );
+                ctx.client.listen_ms(200).await?;
+            }
+            nothing = ", Home Screen and no old item is shown";
+        } else if oracle.and_then(Oracle::has_item) == Some(false) {
             no_old_item(ctx).await?;
             nothing = ", nothing plays and no old item is shown";
         }
@@ -931,12 +955,22 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     ))
 }
 
+/// A note for a FAIL text when the driver log after `mark` has no Home Screen check at a
+/// connect. Empty if it has one.
+fn no_check_note(ctx: &Ctx, mark: usize) -> &'static str {
+    if ctx.driver.log_since(mark).contains(NO_PLAYER_CHECK) {
+        ""
+    } else {
+        ", and the driver did not see the Home Screen at the connect"
+    }
+}
+
 /// True for a cleared attribute: the driver sends "" or null.
 fn cleared(v: Option<&Value>) -> bool {
     v.is_none_or(|v| v.is_null() || v.as_str() == Some(""))
 }
 
-/// Wait up to 5 s until the driver shows no title and no image.
+/// Wait up to 5 s until the driver shows no title and no image, as the Apple TV has no item.
 async fn no_old_item(ctx: &mut Ctx) -> Result<(), Fail> {
     let mp = ctx.mp();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1301,6 +1335,8 @@ fn has_value(ctx: &Ctx, entity: &str, attr: &str, name: &str) -> bool {
 
 /// Driver log line when the Home Screen clears now playing.
 const HOME_CLEAR: &str = "Home Screen: clearing now playing";
+/// Driver log line of the Home Screen check at a connect without a player.
+const NO_PLAYER_CHECK: &str = "no player at the connect";
 /// Driver log line when now playing shows again after the Home Screen clear.
 const HOME_LEFT: &str = "now playing again after the Home Screen";
 /// Driver log line when the connection closes during the Home Screen clear.
@@ -2522,11 +2558,7 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
         let seen = start.elapsed().as_millis();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let left: Vec<String> = ["source", "media_title", "media_image_url"]
-                .into_iter()
-                .filter(|a| !cleared(ctx.client.attr(&mp, a)))
-                .map(|a| format!("{a} {:?}", ctx.client.text(&mp, a)))
-                .collect();
+            let left = item_left(ctx, &mp);
             if left.is_empty() {
                 break;
             }
@@ -2553,9 +2585,27 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
         ))
     }
     .await;
-    // Open the app again for the later checks, also after an error.
-    let back = match bring_to_front(ctx, true, Some(app_before)).await {
-        Ok(_) if mp_state(ctx) != before => set_play_state(ctx, &before)
+    open_again(ctx, app_before, &before, result).await
+}
+
+/// The item fields that the driver still shows, as `name "value"`. Empty if source, title and
+/// image are cleared.
+fn item_left(ctx: &Ctx, mp: &str) -> Vec<String> {
+    ["source", "media_title", "media_image_url"]
+        .into_iter()
+        .filter(|a| !cleared(ctx.client.attr(mp, a)))
+        .map(|a| format!("{a} {:?}", ctx.client.text(mp, a)))
+        .collect()
+}
+
+/// Open `app` again and set the play state `state`, for the later checks. Runs also after an
+/// error of the check. Returns `result` with a note on the reopen added. A FAIL of `result`
+/// comes first; a failed reopen is added to its text. A skip of `result` becomes a FAIL if the
+/// reopen fails, else it stays as it is, with no note. If `result` is OK, a skip of the reopen is
+/// only a note and a failed reopen is a FAIL.
+async fn open_again(ctx: &mut Ctx, app: String, state: &str, result: Check) -> Check {
+    let back = match bring_to_front(ctx, true, Some(app)).await {
+        Ok(_) if mp_state(ctx) != state => set_play_state(ctx, state)
             .await
             .map(|()| "app open again")
             .map_err(|e| Fail {
@@ -2568,11 +2618,210 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
             skip: e.skip,
         }),
     };
-    let note = result?;
+    let note = match result {
+        Err(e) => {
+            let join = if e.skip { "but" } else { "and" };
+            return match back {
+                Err(b) if !b.skip => Err(Fail::new(format!("{}, {join} {}", e.msg, b.msg))),
+                _ => Err(e),
+            };
+        }
+        Ok(note) => note,
+    };
     match back {
         Ok(back) => Ok(format!("{note}, {back}")),
         Err(e) if e.skip => Ok(format!("{note}, {}", e.msg)),
         Err(e) => Err(Fail::new(format!("{note}, but {}", e.msg))),
+    }
+}
+
+/// After a wake onto the Home Screen, the driver shows no old paused item. The video is paused
+/// and HOME is pressed, so the Apple TV keeps the paused item in now playing.
+pub async fn wake_home(ctx: &mut Ctx) -> Check {
+    need_content(ctx, Content::Playing, PlaybackSeen::Driver).await?;
+    let before = stable_playback(ctx).await?;
+    let mp = ctx.mp();
+    let app = ctx.client.text(&mp, "source");
+    if app.is_empty() {
+        return Err(Fail::skip("the driver shows no app"));
+    }
+    let result = wake_home_steps(ctx).await;
+    open_again(ctx, app, &before, result).await
+}
+
+/// The part of [`wake_home`] after the content check. When it gets past HOME, it leaves the Apple
+/// TV on the Home Screen.
+async fn wake_home_steps(ctx: &mut Ctx) -> Check {
+    ensure_playing(ctx).await?;
+    set_play_state(ctx, "PAUSED").await?;
+    let mp = ctx.mp();
+    if cleared(ctx.client.attr(&mp, "media_title"))
+        && cleared(ctx.client.attr(&mp, "media_image_url"))
+    {
+        return Err(Fail::skip(
+            "the driver shows no title and no image before HOME",
+        ));
+    }
+    let mark = ctx.driver.log_len();
+    press(ctx, "HOME").await?;
+    let home = wait_home(ctx, mark).await?;
+    remote_sleep(ctx).await?;
+    let mark = ctx.driver.log_len();
+    ctx.client.send_event("exit_standby").await?;
+    let start = Instant::now();
+    let took = wait_joined(ctx, mark, start, 15).await?;
+    // The driver keeps the entity states over the standby. Read them again, so only what the
+    // driver shows after the connect counts, not the cache of this client.
+    ctx.client.forget_states();
+    ctx.client.refresh_states().await?;
+    // The driver clears the item 1.5 s after the connect, and again after an MRP join that shows
+    // the item again. The states can show cleared from before the standby, so after a Home Screen
+    // check at the connect the log after the wake must also have a clear that did not end.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        home_screen_or_skip(ctx)?;
+        let left = item_left(ctx, &mp);
+        let log = ctx.driver.log_since(mark);
+        let ended = clear_ended(&log);
+        let clear_missing = log.contains(NO_PLAYER_CHECK) && (!log.contains(HOME_CLEAR) || ended);
+        if left.is_empty() && !clear_missing {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "old item after the wake onto the Home Screen: {}",
+            if left.is_empty() && ended {
+                "the driver log shows that the Home Screen clear after the wake ended, and no new \
+                 clear after it"
+                    .to_owned()
+            } else if left.is_empty() {
+                "5 s after the full connect the driver log has the Home Screen check at the \
+                 connect but no clear after the wake"
+                    .to_owned()
+            } else if ended {
+                format!(
+                    "the driver shows {} again and does not clear it",
+                    left.join(", ")
+                )
+            } else {
+                format!(
+                    "5 s after the full connect the driver shows {}{}",
+                    left.join(", "),
+                    no_check_note(ctx, mark)
+                )
+            }
+        );
+        ctx.client.listen_ms(200).await?;
+    }
+    let cleared_ms = start.elapsed().as_millis();
+    // The item must stay cleared. A late MRP join can show it again until the next Home Screen
+    // check clears it 1.5 s later, so a short show is accepted. After 5 s, wait up to 2.5 s more
+    // until the item is cleared and each show has a later clear.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let last = deadline + Duration::from_millis(2500);
+    loop {
+        ctx.client.listen_ms(200).await?;
+        home_screen_or_skip(ctx)?;
+        let shown_again = clear_ended(&ctx.driver.log_since(mark));
+        let left = item_left(ctx, &mp);
+        let now = Instant::now();
+        if now >= deadline && !shown_again && left.is_empty() {
+            break;
+        }
+        ensure!(
+            now < last,
+            "old item after the wake onto the Home Screen: {}",
+            if left.is_empty() {
+                "the driver log shows that the Home Screen clear ended, and no new clear after \
+                 it"
+                .to_owned()
+            } else if shown_again {
+                format!(
+                    "the driver shows {} again and does not clear it",
+                    left.join(", ")
+                )
+            } else {
+                format!(
+                    "the driver shows {} again{}",
+                    left.join(", "),
+                    no_check_note(ctx, mark)
+                )
+            }
+        );
+    }
+    let checked = if ctx.driver.log_since(mark).contains(NO_PLAYER_CHECK) {
+        "Home Screen check at the connect"
+    } else {
+        "no Home Screen check at the connect"
+    };
+    Ok(format!(
+        "{home}, connected after {took} ms, no old item {cleared_ms} ms after exit_standby, \
+         {checked}"
+    ))
+}
+
+/// Skips if the second connection shows that the Apple TV left the Home Screen, plays, or gives
+/// no media control flags. Without a second connection it does not skip.
+fn home_screen_or_skip(ctx: &Ctx) -> Result<(), Fail> {
+    if ctx.oracle.as_ref().is_some_and(|o| !o.home_screen()) {
+        return Err(Fail::skip(
+            "the Apple TV left the Home Screen, plays again, or gives no media control flags \
+             after the wake",
+        ));
+    }
+    Ok(())
+}
+
+/// True if the last Home Screen clear in `log` ended (now playing again, or the connection
+/// closed) and no new clear came after that. Also true for an end line without a clear before
+/// it.
+fn clear_ended(log: &str) -> bool {
+    log.rfind(HOME_LEFT).max(log.rfind(HOME_CLOSED)) > log.rfind(HOME_CLEAR)
+}
+
+/// Wait up to 10 s after HOME until the driver clears now playing or the second connection
+/// shows the Home Screen. Skips if the Apple TV does not reach the Home Screen, plays on it, or
+/// has no item left. Returns a note.
+async fn wait_home(ctx: &mut Ctx, mark: usize) -> Result<String, Fail> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    loop {
+        let clear = ctx.driver.log_since(mark).contains(HOME_CLEAR);
+        if clear || ctx.oracle.as_ref().is_some_and(Oracle::home_screen) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let plays = ctx
+                .oracle
+                .as_ref()
+                .is_some_and(|o| o.playback_state() == Some(PlaybackState::Playing));
+            return Err(Fail::skip(if plays {
+                "the app plays on the Home Screen"
+            } else if ctx.oracle.is_some() {
+                "no Home Screen 10 s after HOME: no clear in the driver log and no Home Screen \
+                 on the second connection"
+            } else {
+                "no Home Screen 10 s after HOME: no clear in the driver log"
+            }));
+        }
+        ctx.client.listen_ms(200).await?;
+    }
+    let seen = start.elapsed().as_millis();
+    // An app can drop its item a short time after HOME.
+    ctx.client.listen(2).await?;
+    let Some(oracle) = ctx.oracle.as_ref() else {
+        return Ok(format!("Home Screen clear {seen} ms after HOME"));
+    };
+    match oracle.has_item() {
+        Some(true) => Ok(format!(
+            "Home Screen {seen} ms after HOME with the paused item"
+        )),
+        Some(false) => Err(Fail::skip(
+            "the app removed its item on HOME: no old item is left to test",
+        )),
+        None => Ok(format!(
+            "Home Screen {seen} ms after HOME, item not known: no MRP on the second connection"
+        )),
     }
 }
 
@@ -3727,6 +3976,22 @@ pub async fn log(ctx: &mut Ctx) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_ended_uses_the_last_line() {
+        let clear = format!("{HOME_CLEAR}\n");
+        let left = format!("{HOME_LEFT}\n");
+        let closed = format!("{HOME_CLOSED}\n");
+        assert!(!clear_ended(""));
+        assert!(!clear_ended(&clear));
+        assert!(clear_ended(&left));
+        assert!(clear_ended(&closed));
+        assert!(clear_ended(&format!("{clear}{left}")));
+        assert!(!clear_ended(&format!("{left}{clear}")));
+        assert!(clear_ended(&format!("{left}{clear}{closed}")));
+        assert!(!clear_ended(&format!("{closed}{clear}")));
+        assert!(!clear_ended(&format!("{clear}{closed}{clear}")));
+    }
 
     #[test]
     fn voice_messages() {

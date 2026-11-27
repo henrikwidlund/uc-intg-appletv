@@ -35,7 +35,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 36] = [
+const STEPS: [&str; 37] = [
     "metadata",
     "setup_input",
     "setup",
@@ -56,6 +56,7 @@ const STEPS: [&str; 36] = [
     "wake_artwork",
     "speed",
     "home_playing",
+    "wake_home",
     "siri_wake",
     "siri_direct",
     "power",
@@ -550,6 +551,7 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("wake_artwork", checks::wake_artwork).await;
     ctx.step("speed", checks::speed).await;
     ctx.step("home_playing", checks::home_playing).await;
+    ctx.step("wake_home", checks::wake_home).await;
     // Siri can cover the video, so it runs after the other checks that need playback.
     ctx.step("siri_wake", checks::siri_wake).await;
     // The same audio through the second connection, without the driver, to compare.

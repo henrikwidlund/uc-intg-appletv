@@ -703,6 +703,7 @@ impl AppleTvActor {
 
         let mrp_open = tv.is_open(Protocol::Mrp);
         self.tv = Some(tv);
+        self.check_no_player(ctx);
         // Before the status: a command that waits for the connect then waits for MRP too.
         if join_mrp {
             self.start_mrp_join();
@@ -1435,8 +1436,9 @@ impl AppleTvActor {
         dirty
     }
 
-    /// The screen changed. If nothing plays and no app has media controls, the Home Screen
-    /// (or an app without media) shows: clear now playing.
+    /// The screen changed, or a new connection reports no player. If nothing plays and
+    /// no app has media controls, the Home Screen (or an app without media) shows: clear now
+    /// playing.
     fn screen_changed(&mut self, ctx: &mut Context<Self>) {
         if let Some(handle) = self.timers.screen.take() {
             ctx.cancel_future(handle);
@@ -1475,6 +1477,24 @@ impl AppleTvActor {
             let dirty = act.apply_now_playing(dirty, ctx);
             act.emit(dirty);
         }));
+    }
+
+    /// If no app shows a player, run the Home Screen check: now playing can still hold an old
+    /// paused item. Called for each new handle. Each one adds Companion or MRP, and a new MRP
+    /// connection sends now playing again.
+    fn check_no_player(&mut self, ctx: &mut Context<Self>) {
+        let no_player = self
+            .tv
+            .as_ref()
+            .and_then(AppleTv::media_controls)
+            .is_some_and(|f| f.0 == 0);
+        if no_player {
+            debug!(
+                "[{}] no player at the connect, checking for the Home Screen",
+                self.cfg.name
+            );
+            self.screen_changed(ctx);
+        }
     }
 
     /// Returns `true` if an app shows a player, also when it is paused. ratv keeps the last media

@@ -340,6 +340,13 @@ impl Oracle {
         })
     }
 
+    /// True if the Apple TV shows the Home Screen (no app shows a player) and nothing plays. The
+    /// driver then clears an old paused item. False if Companion does not say.
+    pub fn home_screen(&self) -> bool {
+        self.tv.media_controls().is_some_and(|f| f.0 == 0)
+            && self.playback_state() != Some(PlaybackState::Playing)
+    }
+
     /// Name of the app that plays now, with the state Playing. A paused item can be an old
     /// item of another app, for example Music after the TV app stopped. Without a copy.
     pub fn active_app(&self) -> Option<&str> {
