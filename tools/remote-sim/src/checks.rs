@@ -80,6 +80,9 @@ const SIMPLE_COMMANDS: [&str; 20] = [
     "PREVIOUS_CHAPTER",
 ];
 
+/// Bundle id of Settings. It is on every Apple TV and plays nothing.
+const SETTINGS: &str = "com.apple.TVSettings";
+
 /// Longest entity id that the Remote accepts.
 const MAX_ENTITY_ID_LEN: usize = 36;
 
@@ -1185,7 +1188,7 @@ pub async fn app_select(ctx: &mut Ctx) -> Check {
     let target = ctx
         .oracle
         .as_ref()
-        .and_then(|o| o.app_name("com.apple.TVSettings"))
+        .and_then(|o| o.app_name(SETTINGS))
         .map(str::to_owned)
         .or_else(|| options.iter().find(|o| **o != current).cloned())
         .ok_or_else(|| Fail::new("no other app"))?;
@@ -3918,6 +3921,123 @@ pub async fn atv_restart(ctx: &mut Ctx) -> Check {
     Ok(format!(
         "closed after {closed_ms} ms, connected after {joined_ms} ms, {state} after \
          {available} ms{oracle}"
+    ))
+}
+
+/// Bundle id of YouTube.
+const YOUTUBE: &str = "com.google.ios.youtube";
+
+/// Time from the start of `select_source` in which `source` must stay the opened app. It ends
+/// before the driver's `LAUNCH_GRACE` (5 s): after that, a screen event clears the opened app on
+/// purpose.
+const LAUNCH_WINDOW_MS: u64 = 4500;
+
+/// A video in a third-party app (YouTube) shows its app and title on the driver. The owner opens
+/// the app, so the driver must get the app from the Apple TV, not from its own launch. Then, with
+/// the video paused, `select_source` opens Settings and `source` must stay Settings for
+/// [`LAUNCH_WINDOW_MS`]. Needs a person, so only with `--only third_party`.
+pub async fn third_party(ctx: &mut Ctx) -> Check {
+    if !terminal() {
+        return Err(Fail::skip("not asked: no terminal"));
+    }
+    turn_on(ctx).await?;
+    let o = oracle(ctx)?;
+    if !o.has_mrp() {
+        return Err(Fail::skip("no MRP on the second connection"));
+    }
+    let youtube = o
+        .app_name(YOUTUBE)
+        .map(str::to_owned)
+        .ok_or_else(|| Fail::skip("YouTube is not installed"))?;
+    let settings = o
+        .app_name(SETTINGS)
+        .map(str::to_owned)
+        .ok_or_else(|| Fail::new("no Settings app"))?;
+    let mp = ctx.mp();
+    ensure!(
+        has_value(ctx, &mp, "source_list", &youtube),
+        "{youtube} is not in the source list"
+    );
+    let text = format!(
+        "On the Apple TV, open {youtube}, start a video and wait until the video plays, after \
+         any ads."
+    );
+    if ask(ctx, Ask::Action("it plays", SKIP_CHECK), &text).await? != Answer::Done {
+        return Err(Fail::skip("no video started"));
+    }
+    // The second connection first: without app and title there, the driver cannot show them.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let o = oracle(ctx)?;
+        if o.active_app() == Some(youtube.as_str()) && o.missing(Content::Playing).is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let now = o.now_text().unwrap_or_else(|| "nothing".into());
+            let app = o.app_text().unwrap_or_else(|| "none".into());
+            return Err(Fail::new(format!(
+                "the second connection shows {now} (app {app}) after 30 s, not a {youtube} item \
+                 that plays and has a title"
+            )));
+        }
+        ctx.client.listen_ms(500).await?;
+    }
+    ctx.client.wait_text(&mp, "state", 10, "PLAYING").await?;
+    ctx.client.wait_text(&mp, "source", 10, &youtube).await?;
+    let title = ctx
+        .client
+        .wait_attr(&mp, "media_title", 10, |v| {
+            v.as_str().is_some_and(|t| !t.is_empty())
+        })
+        .await?;
+    let title = title.as_str().unwrap_or_default().to_owned();
+    mp_command(ctx, "PAUSE", json!({})).await?;
+    ctx.client.wait_text(&mp, "state", 5, "PAUSED").await?;
+    wait_playback(ctx, PlaybackState::Paused).await?;
+    // The paused item should stay in now playing. An MRP update must not replace the opened app.
+    let opened = Instant::now();
+    let end = opened + Duration::from_millis(LAUNCH_WINDOW_MS);
+    mp_command(ctx, "select_source", json!({ "source": settings })).await?;
+    let shown_by = opened + Duration::from_secs(10);
+    while ctx.client.attr(&mp, "source").and_then(Value::as_str) != Some(settings.as_str()) {
+        ensure!(
+            Instant::now() < shown_by,
+            "{settings} not shown in 10 s, source {:?}",
+            ctx.client.text(&mp, "source")
+        );
+        ctx.client.listen_ms(100).await?;
+    }
+    let shown = opened.elapsed().as_millis();
+    if Instant::now() >= end {
+        return Err(Fail::skip(format!(
+            "{settings} shown after {shown} ms, no time left to check the source"
+        )));
+    }
+    while Instant::now() < end {
+        ctx.client.listen_ms(200).await?;
+        if ctx.client.attr(&mp, "source").and_then(Value::as_str) != Some(settings.as_str()) {
+            let source = ctx.client.text(&mp, "source");
+            let o = oracle(ctx)?;
+            let now = o.now_text().unwrap_or_else(|| "nothing".into());
+            let app = o.app_text().unwrap_or_else(|| "none".into());
+            return Err(Fail::new(format!(
+                "source changed from {settings} to {source:?} after {} ms with {youtube} \
+                 paused, the second connection shows {now} (app {app})",
+                opened.elapsed().as_millis()
+            )));
+        }
+    }
+    // Without the paused item, nothing from YouTube can update now playing in the window, so the
+    // check proves less.
+    let item = match oracle(ctx)?.has_item() {
+        Some(true) => "the paused item stayed",
+        Some(false) => "the paused item is gone",
+        None => "item unknown: no MRP on the second connection",
+    };
+    press(ctx, "HOME").await?;
+    Ok(format!(
+        "{youtube} shows {title:?} on the driver, {settings} shown after {shown} ms and stayed \
+         until {LAUNCH_WINDOW_MS} ms, {item}"
     ))
 }
 

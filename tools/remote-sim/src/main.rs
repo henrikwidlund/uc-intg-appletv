@@ -3,8 +3,8 @@
 
 //! Test program that acts as the Remote. It starts the driver, sets it up with a real Apple TV
 //! and runs the checks over the WebSocket. Some checks ask the owner on the terminal, for example
-//! to start the right video. Without a terminal they skip the question. `atv_restart` runs only
-//! with `--only atv_restart`.
+//! to start the right video. Without a terminal they skip the question. `third_party` and
+//! `atv_restart` run only when `--only` names them.
 //!
 //! The driver pairing comes from a `config.json` of the driver: the setup restores it as a
 //! backup. Values are compared with a second connection that has its own pairing, see
@@ -35,7 +35,7 @@ use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 37] = [
+const STEPS: [&str; 38] = [
     "metadata",
     "setup_input",
     "setup",
@@ -57,6 +57,7 @@ const STEPS: [&str; 37] = [
     "speed",
     "home_playing",
     "wake_home",
+    "third_party",
     "siri_wake",
     "siri_direct",
     "power",
@@ -80,7 +81,7 @@ const BASE_STEPS: [&str; 3] = ["setup", "entities", "states"];
 const END_STEPS: [&str; 2] = ["restore_power", "log"];
 
 /// Steps that run only when `--only` names them.
-const OPT_IN_STEPS: [&str; 1] = ["atv_restart"];
+const OPT_IN_STEPS: [&str; 2] = ["third_party", "atv_restart"];
 
 /// A step runs if `--only` is empty or names it, or if it is in [`BASE_STEPS`] or
 /// [`END_STEPS`]. A step of [`OPT_IN_STEPS`] runs only if `--only` names it. `--skip` wins.
@@ -552,6 +553,8 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("speed", checks::speed).await;
     ctx.step("home_playing", checks::home_playing).await;
     ctx.step("wake_home", checks::wake_home).await;
+    // Needs a person, so only with `--only third_party`.
+    ctx.step("third_party", checks::third_party).await;
     // Siri can cover the video, so it runs after the other checks that need playback.
     ctx.step("siri_wake", checks::siri_wake).await;
     // The same audio through the second connection, without the driver, to compare.
@@ -606,16 +609,13 @@ mod tests {
         assert!(!selected(&only, &[], "languages"));
         assert!(!selected(&only, &names(&["setup"]), "setup"), "--skip wins");
         assert!(!selected(&[], &names(&["log"]), "log"));
-        assert!(
-            !selected(&[], &[], "atv_restart"),
-            "opt-in step without --only"
-        );
-        assert!(!selected(&only, &[], "atv_restart"));
-        let restart = names(&["atv_restart"]);
-        assert!(selected(&restart, &[], "atv_restart"));
-        assert!(!selected(&restart, &restart, "atv_restart"), "--skip wins");
         for name in OPT_IN_STEPS {
             assert!(STEPS.contains(&name), "{name}");
+            assert!(!selected(&[], &[], name), "{name} without --only");
+            assert!(!selected(&only, &[], name), "{name} with another --only");
+            let named = names(&[name]);
+            assert!(selected(&named, &[], name), "{name}");
+            assert!(!selected(&named, &named, name), "{name}: --skip wins");
         }
     }
 

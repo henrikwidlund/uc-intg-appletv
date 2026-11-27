@@ -256,8 +256,10 @@ listening. On tvOS 27.2.1 this leaves the dimmed Siri overlay on the Apple TV, w
 navigation until Siri and then Back twice are pressed. It is for testing that. `siri_wake` tests
 Siri at wake in the _Auto_ mode: Siri over MRP does not work on tvOS 27 and later. `siri_direct`
 sends the same audio to Siri through ratv directly, without the driver, to compare with Siri through
-the driver. `atv_restart` asks you to restart the Apple TV and measures the reconnect; it runs only
-with `--only atv_restart`.
+the driver. `third_party` asks you to open YouTube and start a video, checks that the driver shows
+its app and title, then pauses it, opens Settings and checks that the source stays Settings until
+4.5 s after the command; it runs only with `--only third_party`. `atv_restart` asks you to restart
+the Apple TV and measures the reconnect; it runs only with `--only atv_restart`.
 
 `--only a,b` and `--skip a,b` choose the checks; both can be given more than once. `--only` also
 runs `setup`, `entities` and `states`, because the other checks need them, and `restore_power`

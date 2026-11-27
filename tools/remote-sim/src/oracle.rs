@@ -370,6 +370,14 @@ impl Oracle {
         self.app_name(np.app.as_deref()?)
     }
 
+    /// App of now playing: its name, or the bundle id when the app list does not have it.
+    pub fn app_text(&self) -> Option<String> {
+        let rx = self.tv.now_playing();
+        let np = rx.borrow();
+        let id = np.app.as_deref()?;
+        Some(self.app_name(id).unwrap_or(id).to_owned())
+    }
+
     pub fn volume(&self) -> Option<Volume> {
         self.tv.volume().map(|rx| rx.borrow().clone())
     }
