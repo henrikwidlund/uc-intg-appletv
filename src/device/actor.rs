@@ -995,7 +995,8 @@ impl AppleTvActor {
         }));
     }
 
-    /// Connect again soon while the network is not ready. Returns `false` when the time for this is over.
+    /// Connect again soon while the network is not ready. Returns `false` when the time for this
+    /// is over.
     fn network_retry(&mut self, ctx: &mut Context<Self>) -> bool {
         if !retry_window_open(&mut self.network_retry_end, Instant::now()) {
             warn!("[{}] network not ready", self.cfg.name);
@@ -1649,7 +1650,8 @@ impl AppleTvActor {
                             );
                             act.emit(dirty);
                         }
-                        // Some apps drop the image of the same item. Keep it until the item changes.
+                        // Some apps drop the image of the same item. Keep it until the item
+                        // changes.
                         Ok(None) if act.s.artwork_item == item && act.s.artwork_url.is_some() => {
                             debug!(
                                 "[{}] no artwork, keeping the image of this item",
@@ -1658,7 +1660,7 @@ impl AppleTvActor {
                         }
                         Ok(None) if act.s.keep_artwork(item) => {
                             debug!(
-                                "[{}] no artwork, keeping the image of the short item before ({:?})",
+                                "[{}] no artwork, keeping the image of the short item before {:?}",
                                 act.cfg.name, act.s.prev_item_lasted
                             );
                             act.s.artwork_item = item;
@@ -1672,7 +1674,7 @@ impl AppleTvActor {
                                 && let Some(name) = act.cached_art(item_key)
                                 && act.show_file(name, item)
                             {
-                                debug!("[{}] no artwork, using the image seen before for this item", act.cfg.name);
+                                debug!("[{}] no artwork, using the cached image", act.cfg.name);
                                 return;
                             }
                             debug!(
@@ -2429,7 +2431,8 @@ fn siri_event(
             return siri_unavailable(
                 entity_id,
                 session_id,
-                "Apple TV did not start listening. Check that Siri is on: Settings > General > Siri.",
+                "Apple TV did not start listening. Check that Siri is on: Settings > General > \
+                 Siri.",
             );
         }
         Err(e) => {

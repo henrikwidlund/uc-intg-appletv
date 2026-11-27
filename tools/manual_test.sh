@@ -349,7 +349,7 @@ The log shows 'artwork url' (the image has a URL), or 'from Companion' (the imag
 or 'fetching artwork', and then 'artwork file'.
 The file URL stays the same for the same image.
 Telia: a channel seen before with a logo shows the logo again, also when the TV sends none
-(log: 'using the image seen before for this item').
+(log: 'using the cached image').
 If the image goes black: copy the artwork lines and the lines around them into the note." \
 "recent_log 'artwork' 20"
 
