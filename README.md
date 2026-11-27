@@ -197,6 +197,8 @@ A tag with `-`, like `v1.2.3-beta.1`, creates a pre-release.
 
 ### Development
 
+How the driver works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```shell
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings

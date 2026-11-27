@@ -36,6 +36,7 @@ use std::time::Duration;
 use uc_api::intg::{DeviceState, IntegrationDriverUpdate};
 use uc_api::ws::{EventCategory, WsMessage};
 
+// Driver operation mode. Diagram: `docs/ARCHITECTURE.md`.
 state_machine! {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub operation_mode(RequireSetup)

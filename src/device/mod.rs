@@ -96,7 +96,7 @@ pub fn now() -> f64 {
     ratv::mrp::cocoa_time(std::time::SystemTime::now())
 }
 
-/// Connection status of an Apple TV.
+/// Connection status of an Apple TV. Diagram: `docs/ARCHITECTURE.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
     Disconnected,

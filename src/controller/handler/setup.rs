@@ -77,7 +77,7 @@ impl Found {
     }
 }
 
-/// Page the setup flow waits for.
+/// Page the setup flow waits for. Diagram: `docs/ARCHITECTURE.md`.
 pub enum SetupState {
     /// Optional IP address for the discovery.
     Discover,
