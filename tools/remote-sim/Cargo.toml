@@ -10,7 +10,7 @@ publish = false
 [workspace]
 
 [dependencies]
-ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "a509c904f29777d82a6d8aea4fdc84c387f41ea0", features = ["opus"] }
+ratv = { git = "https://github.com/henrikwidlund/ratv", rev = "b3537ec40990ad218d4b23e1e14cadd803f00e5d", features = ["opus"] }
 # The WebSocket client of the Remote. Without TLS: the driver is on ws://.
 actix-ws-client = { git = "https://github.com/unfoldedcircle/actix-ws-client", rev = "e3bf55bb19f06f5be5ab4b096500d6a3bbd1ad38", default-features = false }
 actix = "0.13"
