@@ -104,6 +104,10 @@ const HOME_GRACE: Duration = Duration::from_secs(1);
 const CHAPTER_TIMER_MARGIN: Duration = Duration::from_millis(250);
 /// Screen changes in this time after an app launch come from the launch.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+/// The first screen event in this time after a new Companion event stream starts is the answer
+/// to the connect requests of ratv (session start, supported actions). It does not mean that the
+/// screen changed.
+const SESSION_START_GRACE: Duration = Duration::from_millis(250);
 
 /// Lists that are kept between restarts. A missing list is empty.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -265,6 +269,8 @@ pub struct AppleTvActor {
     /// Incremented when Companion connects or closes. Results of older Companion requests are
     /// ignored. A handle from `connect_missing` that keeps Companion keeps this value.
     companion_gen: u64,
+    /// Start of the Companion event stream. Taken by the first screen event.
+    companion_since: Option<Instant>,
     /// Set while MRP connects after a connect with Companion only. Holds the end of the
     /// command wait for it, see [`MRP_JOIN_WAIT`].
     mrp_join: watch::Sender<Option<tokio::time::Instant>>,
@@ -359,6 +365,7 @@ impl AppleTvActor {
             disconnects: 0,
             stale_config: false,
             companion_gen: 0,
+            companion_since: None,
             mrp_join: watch::Sender::new(None),
             artwork_after_mrp: false,
             np: None,
@@ -661,6 +668,7 @@ impl AppleTvActor {
         // The stream of a kept Companion still runs.
         if !keep_companion && let Some(companion) = tv.companion() {
             self.companion_gen += 1;
+            self.companion_since = Some(now);
             let companion_gen = self.companion_gen;
             let events = BroadcastStream::new(companion.events()).map(move |e| CompanionEvent {
                 companion_gen,
@@ -820,6 +828,7 @@ impl AppleTvActor {
             Protocol::Companion => {
                 // Results of requests to the closed client are not used.
                 self.companion_gen += 1;
+                self.companion_since = None;
                 self.attention = None;
                 self.media_flags = None;
                 self.expected_power = None;
@@ -877,6 +886,7 @@ impl AppleTvActor {
     fn close(&mut self, ctx: &mut Context<Self>) {
         self.generation += 1;
         self.companion_gen += 1;
+        self.companion_since = None;
         self.attempt += 1;
         // A connection that drops at once keeps the reconnect delay growing.
         if self
@@ -2264,6 +2274,14 @@ fn missing(tv: &AppleTv) -> impl Iterator<Item = Protocol> + '_ {
         .filter(|&p| !tv.is_open(p))
 }
 
+/// Returns `true` if a screen event at `now` is the first one since the Companion event stream
+/// started at `since`, and comes within [`SESSION_START_GRACE`]. Clears `since`.
+fn session_start_event(since: &mut Option<Instant>, now: Instant) -> bool {
+    since
+        .take()
+        .is_some_and(|t| now.saturating_duration_since(t) < SESSION_START_GRACE)
+}
+
 /// IP address of the endpoints.
 fn ip(ep: Endpoints) -> Option<IpAddr> {
     ep.companion.or(ep.airplay).map(|a| a.ip())
@@ -2515,6 +2533,13 @@ impl Handler<CompanionEvent> for AppleTvActor {
             Some(Event::ScreenChanged {
                 guide_supported, ..
             }) => {
+                if session_start_event(&mut self.companion_since, Instant::now()) {
+                    debug!(
+                        "[{}] screen event after the Companion connect skipped",
+                        self.cfg.name
+                    );
+                    return;
+                }
                 debug!(
                     "[{}] screen changed, guide supported: {guide_supported}",
                     self.cfg.name
@@ -3271,6 +3296,22 @@ mod tests {
     use crate::server::ArtworkStore;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU8;
+
+    #[test]
+    fn only_the_first_screen_event_right_after_the_companion_connect_is_skipped() {
+        let start = Instant::now();
+        let after = |ms| start + Duration::from_millis(ms);
+        assert!(!session_start_event(&mut None, start));
+        let mut since = Some(start);
+        assert!(session_start_event(&mut since, after(2)));
+        assert!(!session_start_event(&mut since, after(3)), "second event");
+        let mut since = Some(start);
+        assert!(!session_start_event(
+            &mut since,
+            start + SESSION_START_GRACE
+        ));
+        assert!(since.is_none());
+    }
 
     #[test]
     fn cache_with_a_missing_list_loads() {

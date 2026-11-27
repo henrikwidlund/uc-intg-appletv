@@ -2140,7 +2140,8 @@ async fn ensure_playing(ctx: &mut Ctx) -> Result<(), Fail> {
     Ok(())
 }
 
-/// play_pause right after `exit_standby` runs once, after the connect.
+/// play_pause right after `exit_standby` runs once, after the connect. The driver must not clear
+/// now playing as if the Home Screen showed.
 pub async fn wake_command(ctx: &mut Ctx) -> Check {
     need_content(ctx, Content::Playing, PlaybackSeen::Driver).await?;
     let was = stable_playback(ctx).await?;
@@ -2189,6 +2190,10 @@ async fn wake_toggle(ctx: &mut Ctx) -> Check {
     bad.extend(lines_with(tail, &base));
     bad.extend(lines_with(tail, &["play_pause failed"]));
     ensure!(bad.is_empty(), "{}", bad.join(" | "));
+    ensure!(
+        !log.contains(HOME_CLEAR),
+        "the driver cleared now playing as if the Home Screen showed"
+    );
     let shown = mp_state(ctx);
     ensure!(
         shown == toggled,
