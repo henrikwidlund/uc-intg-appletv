@@ -304,8 +304,6 @@ pub struct AppleTvActor {
     chapter_due: Option<Instant>,
     /// Time of the last app launch through the driver.
     launched_at: Option<Instant>,
-    /// Last media control flags from Companion. 0 when no app has media controls.
-    media_flags: Option<u32>,
     /// Name of the shown artwork file.
     shown_file: Option<Box<str>>,
     item_art: ItemArtwork,
@@ -379,7 +377,6 @@ impl AppleTvActor {
             home_dropped: false,
             chapter_due: None,
             launched_at: None,
-            media_flags: None,
             shown_file: None,
             item_art: ItemArtwork::default(),
             http_base: None,
@@ -830,7 +827,6 @@ impl AppleTvActor {
                 self.companion_gen += 1;
                 self.companion_since = None;
                 self.attention = None;
-                self.media_flags = None;
                 self.expected_power = None;
                 self.s.set_power(Power::Unknown)
             }
@@ -907,7 +903,6 @@ impl AppleTvActor {
                 self.cfg.name
             );
         }
-        self.media_flags = None;
         self.http_base = None;
         self.expected_mute = None;
         self.expected_power = None;
@@ -1438,10 +1433,15 @@ impl AppleTvActor {
                 act.launched_at = None;
                 act.emit(Dirty::APP);
             }
+            // A closed Companion gives no flags; its close is not handled yet.
             if act.companion_gen != companion_gen
+                || !act
+                    .tv
+                    .as_ref()
+                    .is_some_and(|tv| tv.is_open(Protocol::Companion))
                 || act.home_since.is_some()
                 || act.s.state == Some(PlaybackState::Playing)
-                || act.media_flags.is_some_and(|f| f != 0)
+                || act.player_shown()
             {
                 return;
             }
@@ -1456,6 +1456,16 @@ impl AppleTvActor {
             let dirty = act.apply_now_playing(dirty, ctx);
             act.emit(dirty);
         }));
+    }
+
+    /// Returns `true` if an app shows a player, also when it is paused. ratv keeps the last media
+    /// control flags of Companion, also those sent during the connect. `false` without an open
+    /// Companion connection or if the device did not send the flags.
+    fn player_shown(&self) -> bool {
+        self.tv
+            .as_ref()
+            .and_then(AppleTv::media_controls)
+            .is_some_and(|f| f.0 != 0)
     }
 
     /// An app has media controls again: show now playing.
@@ -2546,15 +2556,21 @@ impl Handler<CompanionEvent> for AppleTvActor {
                 );
                 self.screen_changed(ctx);
             }
-            Some(Event::MediaControl(flags)) => {
-                self.media_flags = Some(flags.0);
-                if flags.0 != 0 {
+            // ratv stores the flags before it sends the event, so the live flags are as new or
+            // newer.
+            Some(Event::MediaControl(_)) => {
+                if self.player_shown() {
                     self.leave_home(ctx);
                 }
             }
             Some(_) => {}
-            // Events were lost: ask again.
-            None => self.query_power(ctx, 0, false),
+            // Events were lost: ask again. ratv keeps the media control flags of a lost event.
+            None => {
+                self.query_power(ctx, 0, false);
+                if self.player_shown() {
+                    self.leave_home(ctx);
+                }
+            }
         }
     }
 }
