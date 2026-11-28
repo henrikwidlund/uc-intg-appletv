@@ -6,6 +6,7 @@
 
 use serde::de::{DeserializeOwned, Error};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::env;
 use std::ffi::OsStr;
 
@@ -14,6 +15,15 @@ use std::ffi::OsStr;
 /// Returns `false` if the variable is not set or has another value.
 pub fn bool_from_env<K: AsRef<OsStr>>(key: K) -> bool {
     env::var(key).is_ok_and(|v| v == "true" || v == "1")
+}
+
+/// Compare two names: first by the lowercase form of each character, then exactly. Does not
+/// allocate.
+pub fn cmp_names(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+        .then_with(|| a.cmp(b))
 }
 
 /// Deserialize the `msg_data` JSON value of a message into a typed struct.

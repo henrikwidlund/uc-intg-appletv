@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use prost::Message;
 use std::borrow::Cow;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -200,12 +201,14 @@ impl WsConn {
                 "[{}] Error registering new WebSocket connection: {e}",
                 self.id
             );
-            let _ = session
-                .close(Some(CloseReason {
+            close(
+                session,
+                Some(CloseReason {
                     code: CloseCode::Error,
                     description: Some("internal error".into()),
-                }))
-                .await;
+                }),
+            )
+            .await;
             debug!("[{}] stopped", self.id);
             return;
         }
@@ -243,7 +246,16 @@ impl WsConn {
                         }
                         Some(Err(e)) => {
                             let reply = if let Some(reason) = buffered_close(&mut stream).await {
-                                debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                // An I/O error is the normal case, see `buffered_close`. Invalid
+                                // UTF-8 text is also an `Io` error, but is a protocol error. A
+                                // message over the continuation size limit is an `Io` error of kind
+                                // `Other` and stays at debug. A frame over the size limit is
+                                // `Overflow` and is logged at info.
+                                if matches!(&e, ProtocolError::Io(io) if io.kind() != ErrorKind::InvalidData) {
+                                    debug!("[{}] Read error before the close frame: {e:?}", self.id);
+                                } else {
+                                    info!("[{}] Read error before the close frame: {e:?}", self.id);
+                                }
                                 info!(
                                     "[{}] Remote closed connection. Reason: {reason:?}",
                                     self.id
@@ -637,7 +649,8 @@ fn string_values(text: &str, key: &str, ranges: &mut Vec<(usize, usize)>) {
 /// its socket right after its close frame, so this is the normal case for a close by such a Remote.
 ///
 /// Other messages are skipped. Stops at an error, at the end of the stream, or after
-/// [`BUFFERED_CLOSE_TIMEOUT`]. `Some(None)` is a close frame without a reason.
+/// [`BUFFERED_CLOSE_TIMEOUT`]. If the read error before the call does not end the connection, it
+/// can wait for the full time. `Some(None)` is a close frame without a reason.
 async fn buffered_close<S>(stream: &mut S) -> Option<Option<CloseReason>>
 where
     S: Stream<Item = Result<AggregatedMessage, ProtocolError>> + Unpin,

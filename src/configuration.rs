@@ -26,7 +26,7 @@ const ENV_INTERFACE: &str = "UC_INTEGRATION_INTERFACE";
 const ENV_HTTP_PORT: &str = "UC_INTEGRATION_HTTP_PORT";
 /// Environment variable to disable mDNS service publishing. Not needed on the Remote.
 pub const ENV_DISABLE_MDNS_PUBLISH: &str = "UC_DISABLE_MDNS_PUBLISH";
-/// Environment variable for Integration-API message tracing: `all`, `in` or `out`.
+/// Environment variable for Integration-API tracing of text messages: `all`, `in` or `out`.
 ///
 /// **Attention:** only for debugging. Messages can contain PINs and personal data.
 pub const ENV_API_MSG_TRACING: &str = "UC_API_MSG_TRACING";

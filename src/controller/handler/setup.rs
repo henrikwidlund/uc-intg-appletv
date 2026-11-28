@@ -7,7 +7,7 @@
 use crate::config_store::{
     DeviceConfig, DriverSettings, SaveWait, SiriMode, backup_json, device_key, parse_backup,
 };
-use crate::controller::devices::{Trigger, sort_configs};
+use crate::controller::devices::Trigger;
 use crate::controller::handler::AbortDriverSetup;
 use crate::controller::{Controller, SendWsMessage, operation_mode, response_text};
 use crate::device::{DeviceCache, SiriModeChanged, discovery, pairing_not_valid};
@@ -416,9 +416,8 @@ impl Controller {
                 InputError::Invalid(Box::new(SetupState::Restore), RESTORE_FAILED.into())
             })?;
         info!("[{ws_id}] restoring {} device(s)", devices.len());
-        let mut devices = devices;
-        sort_configs(&mut devices);
-        let save = self.store.save_devices(&devices);
+        let mut refs: Vec<&DeviceConfig> = devices.iter().collect();
+        let save = self.store.save_devices(&mut refs);
         self.apply_after_save(ws_id, save, ctx, move |act, ctx| {
             act.restore_devices(devices, ctx);
         });
@@ -503,7 +502,7 @@ impl Controller {
         // Check the input first: a page that is shown again changes no settings.
         self.check_config_action(action, key)?;
         let backup = if action == "backup" {
-            Some(backup_json(&self.sorted_configs()).ok_or_else(|| {
+            Some(backup_json(&mut self.configs()).ok_or_else(|| {
                 InputError::Invalid(Box::new(SetupState::ConfigMode), "Backup failed".into())
             })?)
         } else {
@@ -525,9 +524,9 @@ impl Controller {
                 });
             }
             "remove" => {
-                let mut configs = self.sorted_configs();
+                let mut configs = self.configs();
                 configs.retain(|c| c.key != key);
-                let save = self.store.save_devices(&configs);
+                let save = self.store.save_devices(&mut configs);
                 let (key, id) = (key.to_owned(), ws_id.clone());
                 self.apply_after_save(ws_id, save, ctx, move |act, _| {
                     if let Some(cfg) = act.forget_device(&key) {
@@ -589,13 +588,16 @@ impl Controller {
         values: &HashMap<String, String>,
         ctx: &mut Context<Self>,
     ) {
-        let mut configs = self.sorted_configs();
-        let Some(cfg) = configs.iter_mut().find(|c| c.key == key) else {
+        let Some(mut cfg) = self.devices.get(key).map(|d| d.cfg.clone()) else {
             self.finish_setup_later(ws_id, Some(IntegrationSetupError::NotFound), ctx);
             return;
         };
-        configure(cfg, found, address, values, false);
-        let save = self.store.save_devices(&configs);
+        configure(&mut cfg, found, address, values, false);
+        let mut configs = self.configs();
+        if let Some(c) = configs.iter_mut().find(|c| c.key == key) {
+            *c = &cfg;
+        }
+        let save = self.store.save_devices(&mut configs);
         let (key, found, values) = (key.to_owned(), found.to_vec(), values.clone());
         self.apply_after_save(ws_id, save, ctx, move |act, _| {
             // Apply the page again: the device can have changed its address or ids meanwhile.
@@ -698,7 +700,7 @@ impl Controller {
         }
         self.driver_settings.debug_log = on;
         logging::set_debug(on);
-        if logging::env_filter() {
+        if logging::rust_log_sets_filter() {
             info!(
                 "[{ws_id}] debug log {}, RUST_LOG is used instead",
                 if on { "saved" } else { "off" }
@@ -1007,12 +1009,11 @@ impl Controller {
         let mut configs = if replace_all {
             Vec::new()
         } else {
-            self.sorted_configs()
+            self.configs()
         };
         configs.retain(|c| c.key != cfg.key);
-        configs.push(cfg.clone());
-        sort_configs(&mut configs);
-        let save = self.store.save_devices(&configs);
+        configs.push(&cfg);
+        let save = self.store.save_devices(&mut configs);
         self.apply_after_save(ws_id, save, ctx, move |act, ctx| {
             if replace_all {
                 act.forget_other_devices(&cfg.key);
@@ -1037,9 +1038,9 @@ impl Controller {
             Some(SetupState::Discover) => Some(discover_page()),
             Some(SetupState::RestoreChoice) => Some(restore_choice_page(self.driver_settings)),
             Some(SetupState::Restore) => Some(restore_page()),
-            Some(SetupState::Backup) => backup_json(&self.sorted_configs())
-                .as_deref()
-                .map(backup_page),
+            Some(SetupState::Backup) => {
+                backup_json(&mut self.configs()).as_deref().map(backup_page)
+            }
             Some(SetupState::ConfigMode) => Some(self.config_mode_page()),
             Some(SetupState::ChooseDevice { found, .. }) => Some(choose_device_page(found)),
             Some(SetupState::Pin { found, .. }) => Some(pin_page(&found.name)),
@@ -1129,8 +1130,7 @@ impl Controller {
     }
 
     fn config_mode_page(&self) -> Value {
-        let mut devices: Vec<_> = self.devices.values().map(|d| &d.cfg).collect();
-        devices.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let devices = self.sorted_configs();
         let mut items: Vec<Value> = devices
             .iter()
             .map(|c| json!({ "id": c.key, "label": { "en": format!("{} ({})", c.name, c.id) } }))
@@ -1753,7 +1753,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("dir");
             ConfigStore::new(&dir)
-                .save_devices(std::slice::from_ref(cfg))
+                .save_devices(&mut [cfg])
                 .expect("save")
                 .wait()
                 .await
@@ -1873,7 +1873,7 @@ mod tests {
             let mut other = device();
             other.id = "02:00:00:00:00:01".into();
             other.key = device_key(&other.id);
-            let backup = backup_json(std::slice::from_ref(&other)).expect("backup");
+            let backup = backup_json(&mut [&other]).expect("backup");
 
             start_setup(&controller, &events, "a", false).await;
             let before = setup_events(&events);
@@ -1942,7 +1942,7 @@ mod tests {
                 .expect("send")
                 .expect("ok");
             wait_page(&events, before).await;
-            let backup = backup_json(std::slice::from_ref(&cfg)).expect("backup");
+            let backup = backup_json(&mut [&cfg]).expect("backup");
             controller
                 .send(values("a", &[("restore_data", &backup)]))
                 .await
@@ -1967,7 +1967,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("dir");
             let cfg = device();
             ConfigStore::new(&dir)
-                .save_devices(std::slice::from_ref(&cfg))
+                .save_devices(&mut [&cfg])
                 .expect("save")
                 .wait()
                 .await
@@ -2359,6 +2359,90 @@ mod tests {
         }
 
         #[actix::test]
+        async fn saves_and_the_device_list_use_the_list_order() {
+            let name = "list-order-setup";
+            let lower = DeviceConfig {
+                name: "den".into(),
+                ..device()
+            };
+            let mut upper = device();
+            upper.id = "02:00:00:00:00:01".into();
+            upper.key = device_key(&upper.id);
+            upper.name = "Den".into();
+            let dir = test_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            ConfigStore::new(&dir)
+                .save_devices(&mut [&lower, &upper])
+                .expect("save")
+                .wait()
+                .await
+                .expect("write");
+            let saved_keys = || -> Vec<String> {
+                ConfigStore::new(&dir)
+                    .load_devices()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect()
+            };
+            let expected = vec![upper.key.clone(), lower.key.clone()];
+            assert_eq!(expected, saved_keys());
+
+            let controller = controller(name);
+            let events = connect(&controller, "a").await;
+            start_setup(&controller, &events, "a", true).await;
+            let items: Vec<Value> = last(&events)["require_user_action"]["input"]["settings"][0]
+                ["field"]["dropdown"]["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|i| i["id"].clone())
+                .collect();
+            assert_eq!(vec![json!(upper.key), json!(lower.key)], items);
+
+            // Configure the second device in the list. The other one stays as it is.
+            controller
+                .send(ShowConfigure(lower.key.clone()))
+                .await
+                .expect("send");
+            controller
+                .send(values("a", &[("global_volume", "false")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            assert_eq!(json!("OK"), wait_stop(&events).await["state"]);
+            controller.send(FlushStore).await.expect("send");
+            let saved = ConfigStore::new(&dir).load_devices();
+            assert_eq!(expected, saved_keys());
+            assert_eq!(upper, saved[0]);
+            assert!(!saved[1].global_volume);
+
+            // A backup with the devices in the other order is saved in the list order.
+            let mut backup: Value =
+                serde_json::from_str(&backup_json(&mut [&upper, &lower]).expect("backup"))
+                    .expect("json");
+            backup["devices"].as_array_mut().expect("devices").reverse();
+            assert_eq!(json!(lower.key), backup["devices"][0]["key"]);
+            start_setup(&controller, &events, "a", false).await;
+            let before = setup_events(&events);
+            controller
+                .send(values("a", &[("restore_from_backup", "true")]))
+                .await
+                .expect("send")
+                .expect("ok");
+            wait_page(&events, before).await;
+            controller
+                .send(values("a", &[("restore_data", &backup.to_string())]))
+                .await
+                .expect("send")
+                .expect("ok");
+            assert_eq!(json!("OK"), wait_stop(&events).await["state"]);
+            controller.send(FlushStore).await.expect("send");
+            assert_eq!(expected, saved_keys());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[actix::test]
         async fn abort_during_the_write_still_uses_the_devices() {
             let name = "abort-write";
             let dir = test_dir(name);
@@ -2376,7 +2460,7 @@ mod tests {
                 .expect("ok");
             wait_page(&events, before).await;
             let hold = controller.send(HoldWrites).await.expect("send");
-            let backup = backup_json(std::slice::from_ref(&cfg)).expect("backup");
+            let backup = backup_json(&mut [&cfg]).expect("backup");
             controller
                 .send(values("a", &[("restore_data", &backup)]))
                 .await

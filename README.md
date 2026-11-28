@@ -138,16 +138,16 @@ After the driver starts, add it on the Remote:
 
 The driver reads these environment variables:
 
-| Variable                   | Default             | Description                                                            |
-|----------------------------|---------------------|------------------------------------------------------------------------|
-| `UC_CONFIG_HOME`           | working directory   | Folder for the configuration and cache files.                          |
-| `UC_INTEGRATION_INTERFACE` | `0.0.0.0`           | Network interface to listen on.                                        |
-| `UC_INTEGRATION_HTTP_PORT` | `9090`              | WebSocket and artwork port.                                            |
-| `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                  |
-| `UC_SETUP_TIMEOUT`         | `3600`              | Setup timeout in seconds. `0` disables it.                             |
-| `UC_CLIENT_NAME`           | host name           | Name shown on the Apple TV for the pairing.                            |
-| `UC_API_MSG_TRACING`       | off                 | Log WebSocket messages: `all`, `in` or `out`. Needs debug log level.   |
-| `RUST_LOG`                 | `info`              | Log level, for example `info,uc_intg_appletv=debug`.                   |
+| Variable                   | Default             | Description                                                                |
+|----------------------------|---------------------|----------------------------------------------------------------------------|
+| `UC_CONFIG_HOME`           | working directory   | Folder for the configuration and cache files.                              |
+| `UC_INTEGRATION_INTERFACE` | `0.0.0.0`           | Network interface to listen on.                                            |
+| `UC_INTEGRATION_HTTP_PORT` | `9090`              | WebSocket and artwork port.                                                |
+| `UC_DISABLE_MDNS_PUBLISH`  | `false`             | Do not announce the driver with mDNS.                                      |
+| `UC_SETUP_TIMEOUT`         | `3600`              | Setup timeout in seconds. `0` disables it.                                 |
+| `UC_CLIENT_NAME`           | host name           | Name shown on the Apple TV for the pairing.                                |
+| `UC_API_MSG_TRACING`       | off                 | Log WebSocket text messages: `all`, `in` or `out`. Needs debug log level.  |
+| `RUST_LOG`                 | `info`              | Log level, for example `info,uc_intg_appletv=debug`.                       |
 
 `config.json` contains the pairing keys. On Linux and macOS, only the owner can read it.
 The folder also holds `settings.json` (debug log and Siri protocol), the cache files and the

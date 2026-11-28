@@ -9,10 +9,12 @@
 //! The data is serialized on the caller thread. One background thread writes the files in order,
 //! so the actor thread does not wait for the disk.
 
+use crate::util::cmp_names;
 use log::{error, info};
 use ratv::{Credentials, ExposeSecret};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, Write};
 use std::net::IpAddr;
@@ -61,6 +63,17 @@ impl DeviceConfig {
     pub fn matches<'a>(&self, mut ids: impl Iterator<Item = &'a str>) -> bool {
         ids.any(|id| id == self.id || self.known_ids.iter().any(|k| k == id))
     }
+
+    /// The order of the devices in lists and in the configuration file: by name, ignoring upper
+    /// and lower case, then by the exact name, then by key.
+    pub fn cmp_list_order(&self, other: &Self) -> Ordering {
+        cmp_names(&self.name, &other.name).then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+/// Sort the devices in [`DeviceConfig::cmp_list_order`].
+pub(crate) fn sort_list_order(devices: &mut [&DeviceConfig]) {
+    devices.sort_unstable_by(|a, b| a.cmp_list_order(b));
 }
 
 const fn default_true() -> bool {
@@ -99,7 +112,7 @@ const BACKUP_VERSION: u8 = 1;
 #[derive(Serialize)]
 struct BackupRef<'a> {
     version: u8,
-    devices: &'a [DeviceConfig],
+    devices: &'a [&'a DeviceConfig],
 }
 
 #[derive(Deserialize)]
@@ -108,8 +121,10 @@ struct Backup {
     devices: Vec<DeviceConfig>,
 }
 
-/// Serialize the devices for a backup. The text contains the pairing credentials.
-pub fn backup_json(devices: &[DeviceConfig]) -> Option<String> {
+/// Sort the devices in [`DeviceConfig::cmp_list_order`] and serialize them for a backup. The text
+/// contains the pairing credentials.
+pub fn backup_json(devices: &mut [&DeviceConfig]) -> Option<String> {
+    sort_list_order(devices);
     serde_json::to_string(&BackupRef {
         version: BACKUP_VERSION,
         devices,
@@ -250,10 +265,12 @@ impl ConfigStore {
         Vec::new()
     }
 
-    /// Queue the save of the configured devices. The write runs on the writer thread: the caller
-    /// does not wait for the disk, and gets the result from the returned [`SaveWait`]. If the
-    /// writer thread is missing, the write runs at once on this thread.
-    pub fn save_devices(&self, devices: &[DeviceConfig]) -> io::Result<SaveWait> {
+    /// Sort the devices in [`DeviceConfig::cmp_list_order`] and queue their save. The write runs
+    /// on the writer thread: the caller does not wait for the disk, and gets the result from the
+    /// returned [`SaveWait`]. If the writer thread is missing, the write runs at once on this
+    /// thread.
+    pub fn save_devices(&self, devices: &mut [&DeviceConfig]) -> io::Result<SaveWait> {
+        sort_list_order(devices);
         let data = serde_json::to_vec_pretty(&devices).map_err(io::Error::other)?;
         let (tx, rx) = oneshot::channel();
         self.writer.send(Job::Write {
@@ -266,9 +283,10 @@ impl ConfigStore {
         Ok(SaveWait(rx))
     }
 
-    /// Queue the save of the configured devices. A write error is only logged. Use it where no
-    /// caller waits for the result.
-    pub fn queue_devices(&self, devices: &[DeviceConfig]) -> io::Result<()> {
+    /// Sort the devices in [`DeviceConfig::cmp_list_order`] and queue their save. A write error is
+    /// only logged. Use it where no caller waits for the result.
+    pub fn queue_devices(&self, devices: &mut [&DeviceConfig]) -> io::Result<()> {
+        sort_list_order(devices);
         self.write_json(self.dir.join(CONFIG_FILE), devices, true)
     }
 
@@ -646,16 +664,16 @@ pub(crate) mod tests {
         fs::write(dir.join("config.json.tmp"), b"x").expect("tmp");
         let devices = vec![device()];
         store
-            .save_devices(&devices)
+            .save_devices(&mut [&devices[0]])
             .expect("save")
             .wait_blocking()
             .expect("write");
         assert_eq!(devices, store.load_devices());
 
-        store.queue_devices(&[]).expect("queue");
+        store.queue_devices(&mut []).expect("queue");
         store.writer.flush();
         assert_eq!(Vec::<DeviceConfig>::new(), store.load_devices());
-        store.queue_devices(&devices).expect("queue");
+        store.queue_devices(&mut [&devices[0]]).expect("queue");
         store.writer.flush();
         assert_eq!(devices, store.load_devices());
 
@@ -685,13 +703,47 @@ pub(crate) mod tests {
     #[test]
     fn backup_round_trip() {
         let devices = vec![device()];
-        let text = backup_json(&devices).expect("backup");
+        let text = backup_json(&mut [&devices[0]]).expect("backup");
         assert_eq!(Some(devices), parse_backup(&format!("  {text}\n")));
     }
 
     #[test]
+    fn the_list_order_ignores_the_case_of_the_name() {
+        let named = |name: &str, key: &str| DeviceConfig {
+            name: name.into(),
+            key: key.into(),
+            ..device()
+        };
+        let mut devices = [
+            named("living room", "B"),
+            named("ärm", "A"),
+            named("Kitchen", "A"),
+            named("Living Room", "C"),
+            named("living room", "A"),
+            named("Äpple", "A"),
+        ];
+        devices.sort_unstable_by(DeviceConfig::cmp_list_order);
+        let order: Vec<(&str, &str)> = devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.key.as_str()))
+            .collect();
+        assert_eq!(
+            vec![
+                ("Kitchen", "A"),
+                // Names that are equal when case is ignored: by exact name, then by key.
+                ("Living Room", "C"),
+                ("living room", "A"),
+                ("living room", "B"),
+                ("Äpple", "A"),
+                ("ärm", "A"),
+            ],
+            order
+        );
+    }
+
+    #[test]
     fn invalid_backups_are_rejected() {
-        let valid = backup_json(&[device()]).expect("backup");
+        let valid = backup_json(&mut [&device()]).expect("backup");
         assert_eq!(None, parse_backup(""));
         assert_eq!(None, parse_backup("{broken"));
         assert_eq!(None, parse_backup(&valid[..valid.len() - 2]));

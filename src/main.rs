@@ -49,7 +49,7 @@ async fn main() -> io::Result<()> {
         error!("{e}. Using the default settings");
     }
     info!("Starting {} {APP_VERSION}", built_info::PKG_NAME);
-    if driver_settings.debug_log && !logging::env_filter() {
+    if driver_settings.debug_log && !logging::rust_log_sets_filter() {
         info!("Debug log is on");
     }
     let driver_metadata = configuration::get_driver_metadata()?;

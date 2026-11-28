@@ -66,7 +66,7 @@ pub fn set_debug(on: bool) {
 }
 
 /// Returns `true` if `RUST_LOG` sets the log filter.
-pub fn env_filter() -> bool {
+pub fn rust_log_sets_filter() -> bool {
     FILTER.get().is_some_and(Option::is_none)
 }
 
@@ -428,8 +428,8 @@ mod tests {
     async fn ratv_log_lines_reach_the_log() {
         let (sub, capture) = subscriber(option_filter(true), false);
         let _guard = tracing::subscriber::set_default(sub);
-        // Nothing listens on this port, so the connect fails at once and ratv logs it. A fixed
-        // port can be in use on a test machine.
+        // Nothing listens on this port, so the connect fails fast (on Windows after about 2 s) and
+        // ratv logs it. A fixed port can be in use on a test machine.
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .expect("free port");

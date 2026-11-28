@@ -6,6 +6,7 @@
 //! The snapshot copies only the fields that changed, and reports them as [`Dirty`] groups. Only
 //! the attributes of dirty groups are built again.
 
+use crate::util::cmp_names;
 use bytes::Bytes;
 use ratv::companion::AttentionState;
 use ratv::mrp::{
@@ -209,7 +210,7 @@ pub struct Snapshot {
     pub own_output_uid: Option<String>,
     pub global_volume: bool,
 
-    /// Installed apps, sorted by name.
+    /// Installed apps, sorted by name (see [`cmp_names`]), then by bundle id.
     pub apps: Vec<AppInfo>,
     pub accounts: Vec<AccountInfo>,
     /// Last account chosen through the driver. The Apple TV does not report it.
@@ -574,9 +575,10 @@ impl Snapshot {
         d
     }
 
-    /// Set the AirPlay devices that can join the group.
+    /// Set the AirPlay devices that can join the group. They are sorted by name, see
+    /// [`cmp_names`], then by uid.
     pub fn set_airplay_devices(&mut self, mut devices: Vec<(String, String)>) -> Dirty {
-        devices.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        devices.sort_unstable_by(|a, b| cmp_names(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
         if self.airplay_devices == devices {
             return Dirty::NONE;
         }
@@ -585,11 +587,10 @@ impl Snapshot {
         Dirty::OUTPUTS
     }
 
-    /// Set the installed apps. They are sorted by name, case-insensitive.
+    /// Set the installed apps. They are sorted by name, see [`cmp_names`], then by bundle id.
     pub fn set_apps(&mut self, mut apps: Vec<AppInfo>) -> Dirty {
         apps.sort_unstable_by(|a, b| {
-            let a = a.name.chars().flat_map(char::to_lowercase);
-            a.cmp(b.name.chars().flat_map(char::to_lowercase))
+            cmp_names(&a.name, &b.name).then_with(|| a.bundle_id.cmp(&b.bundle_id))
         });
         if self.apps == apps {
             return Dirty::NONE;
@@ -770,7 +771,7 @@ impl Snapshot {
                 candidates.push((&o.uid, &o.name));
             }
         }
-        candidates.sort_unstable_by(|a, b| a.1.cmp(b.1));
+        candidates.sort_unstable_by(|a, b| cmp_names(a.1, b.1).then_with(|| a.0.cmp(b.0)));
 
         let mut combos = vec![OutputCombo {
             name: self.name.clone(),
@@ -1475,6 +1476,78 @@ mod tests {
         s.set_apps(vec![app("b"), app("C"), app("a")]);
         let names: Vec<_> = s.apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(vec!["a", "b", "C"], names);
+    }
+
+    #[test]
+    fn apps_with_equal_names_are_sorted_by_exact_name_then_bundle_id() {
+        let app = |bundle_id: &str, name: &str| AppInfo {
+            bundle_id: bundle_id.into(),
+            name: name.into(),
+        };
+        let mut s = Snapshot::default();
+        let apps = vec![
+            app("z", "tv"),
+            app("b", "TV"),
+            app("a", "tv"),
+            app("c", "Music"),
+        ];
+        assert_eq!(Dirty::APPS, s.set_apps(apps.clone()));
+        let order: Vec<_> = s
+            .apps
+            .iter()
+            .map(|a| (a.name.as_str(), a.bundle_id.as_str()))
+            .collect();
+        assert_eq!(
+            vec![("Music", "c"), ("TV", "b"), ("tv", "a"), ("tv", "z")],
+            order
+        );
+        // The same apps in another order are no change.
+        assert_eq!(Dirty::NONE, s.set_apps(apps.into_iter().rev().collect()));
+    }
+
+    #[test]
+    fn airplay_devices_with_equal_names_are_sorted_by_exact_name_then_id() {
+        let mut s = Snapshot::default();
+        let devices: Vec<(String, String)> =
+            [("Z", "den"), ("B", "Den"), ("A", "den"), ("C", "attic")]
+                .into_iter()
+                .map(|(u, n)| (u.into(), n.into()))
+                .collect();
+        assert_eq!(Dirty::OUTPUTS, s.set_airplay_devices(devices.clone()));
+        let order: Vec<_> = s
+            .airplay_devices
+            .iter()
+            .map(|(u, n)| (n.as_str(), u.as_str()))
+            .collect();
+        assert_eq!(
+            vec![("attic", "C"), ("Den", "B"), ("den", "A"), ("den", "Z")],
+            order
+        );
+        // The same devices in another order are no change.
+        assert_eq!(
+            Dirty::NONE,
+            s.set_airplay_devices(devices.into_iter().rev().collect())
+        );
+    }
+
+    #[test]
+    fn output_candidates_with_equal_names_are_sorted_by_exact_name_then_id() {
+        let mut s = Snapshot {
+            name: "TV".into(),
+            ..Snapshot::default()
+        };
+        // Outputs in the group that are not on the network are also candidates.
+        s.update_volume(&{
+            let mut v = Volume::default();
+            v.outputs = vec![output("Z", "den", Some(0.5)), output("A", "den", Some(0.5))];
+            v
+        });
+        s.set_airplay_devices(vec![("B".into(), "Den".into())]);
+        let uids: Vec<_> = s.output_combos[1..4]
+            .iter()
+            .map(|c| c.uids.join(","))
+            .collect();
+        assert_eq!(vec!["B", "A", "Z"], uids);
     }
 
     #[test]

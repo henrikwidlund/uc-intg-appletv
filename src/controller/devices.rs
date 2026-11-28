@@ -3,7 +3,7 @@
 
 //! Apple TV devices of the controller: entity states, subscriptions and commands.
 
-use crate::config_store::DeviceConfig;
+use crate::config_store::{DeviceConfig, sort_list_order};
 use crate::controller::{Controller, R2AudioChunkMsg, R2RequestMsg, SendWsMessage};
 use crate::device::{
     AppleTvActor, AudioChunk, Browse, Command, Connect, DeviceCache, DeviceEvent, DeviceStatus,
@@ -17,6 +17,7 @@ use bytestring::ByteString;
 use log::{debug, info, warn};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::cmp::Ordering;
 use std::sync::Arc;
 use uc_api::EntityType;
 use uc_api::intg::ws::BrowseMediaMsgData;
@@ -206,16 +207,21 @@ impl Controller {
         Some(device.cfg)
     }
 
-    /// The configuration of all devices, sorted by name and key.
-    pub(super) fn sorted_configs(&self) -> Vec<DeviceConfig> {
-        let mut devices: Vec<DeviceConfig> = self.devices.values().map(|d| d.cfg.clone()).collect();
-        sort_configs(&mut devices);
+    /// The configuration of all devices, in no order. The save and backup functions sort it.
+    pub(super) fn configs(&self) -> Vec<&DeviceConfig> {
+        self.devices.values().map(|d| &d.cfg).collect()
+    }
+
+    /// The configuration of all devices, in [`DeviceConfig::cmp_list_order`].
+    pub(super) fn sorted_configs(&self) -> Vec<&DeviceConfig> {
+        let mut devices = self.configs();
+        sort_list_order(&mut devices);
         devices
     }
 
     /// Queue the save of the configuration of all devices. A write error is only logged.
     pub(super) fn queue_devices(&self) -> Result<(), ServiceError> {
-        self.store.queue_devices(&self.sorted_configs())?;
+        self.store.queue_devices(&mut self.configs())?;
         Ok(())
     }
 
@@ -232,8 +238,7 @@ impl Controller {
             .filter(|e| entity_type.is_none_or(|t| e.entity_type == t))
             .collect();
         list.sort_unstable_by(|a, b| {
-            self.send_order(a.entity_type, &a.entity_id)
-                .cmp(&self.send_order(b.entity_type, &b.entity_id))
+            self.send_order((a.entity_type, &a.entity_id), (b.entity_type, &b.entity_id))
         });
         list
     }
@@ -251,8 +256,7 @@ impl Controller {
             .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect();
         states.sort_unstable_by(|a, b| {
-            self.send_order(a.entity_type, a.entity_id)
-                .cmp(&self.send_order(b.entity_type, b.entity_id))
+            self.send_order((a.entity_type, a.entity_id), (b.entity_type, b.entity_id))
         });
         states
     }
@@ -278,12 +282,25 @@ impl Controller {
         }
     }
 
-    /// Sort key for sending entities: media players first, then remotes, then the rest.
-    /// Within each group: device name, device key, entity id.
-    fn send_order<'a>(&'a self, ty: EntityType, id: &'a str) -> (u8, &'a str, &'a str, &'a str) {
-        let key = EntityKind::parse(id).map_or("", |(k, _)| k);
-        let name = self.devices.get(key).map_or("", |d| d.cfg.name.as_str());
-        (send_rank(ty), name, key, id)
+    /// The order for sending entities: media players first, then remotes, then the rest.
+    /// Within each group: devices in [`DeviceConfig::cmp_list_order`], then entity id. An entity
+    /// without a configured device comes first in its group, ordered by key. An id that does not
+    /// parse has no device.
+    fn send_order(&self, (ty_a, a): (EntityType, &str), (ty_b, b): (EntityType, &str)) -> Ordering {
+        send_rank(ty_a).cmp(&send_rank(ty_b)).then_with(|| {
+            let key_a = EntityKind::parse(a).map_or("", |(k, _)| k);
+            let key_b = EntityKind::parse(b).map_or("", |(k, _)| k);
+            if key_a == key_b {
+                return a.cmp(b);
+            }
+            match (self.devices.get(key_a), self.devices.get(key_b)) {
+                (Some(da), Some(db)) => da.cfg.cmp_list_order(&db.cfg),
+                (da, db) => da
+                    .is_some()
+                    .cmp(&db.is_some())
+                    .then_with(|| key_a.cmp(key_b)),
+            }
+        })
     }
 
     /// Subscribe entities. `None` or no ids means all entities.
@@ -346,8 +363,7 @@ impl Controller {
             .filter_map(|(id, attrs)| entity_change(id, attrs))
             .collect();
         changes.sort_unstable_by(|a, b| {
-            self.send_order(a.entity_type, a.entity_id)
-                .cmp(&self.send_order(b.entity_type, b.entity_id))
+            self.send_order((a.entity_type, a.entity_id), (b.entity_type, b.entity_id))
         });
         for change in &changes {
             self.send_entity_change(ws_id, change);
@@ -846,11 +862,6 @@ impl Controller {
     }
 }
 
-/// Sort device configurations by name and key, the order of `config.json`.
-pub(super) fn sort_configs(devices: &mut [DeviceConfig]) {
-    devices.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
-}
-
 /// Session id of an assistant event.
 const fn assistant_session_id(event: &AssistantEvent) -> u32 {
     match event {
@@ -1129,7 +1140,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("dir");
             let cfg = device();
             ConfigStore::new(&dir)
-                .save_devices(std::slice::from_ref(&cfg))
+                .save_devices(&mut [&cfg])
                 .expect("save")
                 .wait()
                 .await
@@ -1158,6 +1169,83 @@ mod tests {
         #[actix::test]
         async fn replaced_device_keeps_the_cache() {
             assert!(cache_exists_after("cache-replace", false).await);
+        }
+    }
+
+    mod order {
+        use crate::config_store::DeviceConfig;
+        use crate::config_store::tests::device;
+        use crate::controller::Controller;
+        use crate::controller::test_util::{controller, test_dir};
+        use crate::device::DeviceCache;
+        use actix::{Context, Handler, Message, MessageResult};
+        use uc_api::EntityType;
+
+        /// Add devices whose names differ only in case, then return the entity ids in
+        /// `send_order` and the keys of `sorted_configs`.
+        #[derive(Message)]
+        #[rtype(result = "(Vec<String>, Vec<String>)")]
+        struct Orders;
+
+        impl Handler<Orders> for Controller {
+            type Result = MessageResult<Orders>;
+            fn handle(&mut self, _: Orders, ctx: &mut Context<Self>) -> Self::Result {
+                for (name, key) in [("living room", "B"), ("Kitchen", "A"), ("Living Room", "C")] {
+                    let cfg = DeviceConfig {
+                        name: name.into(),
+                        key: key.into(),
+                        ..device()
+                    };
+                    self.add_device(cfg, DeviceCache::default(), ctx);
+                }
+                let mut entities = [
+                    (EntityType::VoiceAssistant, "voice_assistant.A"),
+                    (EntityType::Select, "select.A.shuffle"),
+                    (EntityType::Select, "select.A.app"),
+                    (EntityType::MediaPlayer, "media_player.B"),
+                    (EntityType::Remote, "remote.B"),
+                    (EntityType::MediaPlayer, "media_player.UNKNOWN2"),
+                    (EntityType::Sensor, "bogus"),
+                    (EntityType::MediaPlayer, "media_player.C"),
+                    (EntityType::MediaPlayer, "media_player.UNKNOWN1"),
+                    (EntityType::MediaPlayer, "media_player.A"),
+                ];
+                entities.sort_unstable_by(|&a, &b| self.send_order(a, b));
+                let ids = entities.iter().map(|(_, id)| (*id).to_owned()).collect();
+                let keys = self
+                    .sorted_configs()
+                    .iter()
+                    .map(|c| c.key.clone())
+                    .collect();
+                MessageResult((ids, keys))
+            }
+        }
+
+        #[actix::test]
+        async fn devices_and_entities_use_the_list_order() {
+            let name = "list-order";
+            let _ = std::fs::remove_dir_all(test_dir(name));
+            let (ids, keys) = controller(name).send(Orders).await.expect("send");
+            assert_eq!(
+                vec![
+                    // Entities without a configured device come first, by key.
+                    "media_player.UNKNOWN1",
+                    "media_player.UNKNOWN2",
+                    "media_player.A",
+                    "media_player.C",
+                    "media_player.B",
+                    "remote.B",
+                    // An id that does not parse has no device.
+                    "bogus",
+                    // The same device: by entity id.
+                    "select.A.app",
+                    "select.A.shuffle",
+                    "voice_assistant.A",
+                ],
+                ids
+            );
+            assert_eq!(vec!["A", "C", "B"], keys);
+            let _ = std::fs::remove_dir_all(test_dir(name));
         }
     }
 }
