@@ -7,6 +7,27 @@ Remote 3. It controls Apple TV devices on the local network with the
 The driver id is `appletv_rs`, so it can run next to the Apple TV integration that comes with the
 Remote.
 
+Contents:
+
+- [Features](#features)
+- [Compared to the built-in Apple TV integration](#compared-to-the-built-in-apple-tv-integration)
+- [Requirements](#requirements)
+- [Install on the Remote](#install-on-the-remote)
+- [Setup options](#setup-options)
+- [Run on a computer](#run-on-a-computer)
+- [Known limits](#known-limits)
+- [Troubleshooting](#troubleshooting)
+- [Debug log](#debug-log)
+- [Backup and restore](#backup-and-restore)
+- [Details](#details): how the driver works inside
+  - [Network and wake-up](#network-and-wake-up)
+  - [Log format](#log-format)
+  - [systemd journal](#systemd-journal)
+- [Build](#build)
+- [Links](#links)
+- [Credits](#credits)
+- [License](#license)
+
 ## Features
 
 - **Media player**: power, playback, seek, fast forward and rewind, skip, chapters, volume and mute,
@@ -182,7 +203,36 @@ docker run -d --name uc-intg-appletv --network host \
 - **Other errors**: turn on the [debug log](#debug-log) and add the log to a
   [bug report](https://github.com/henrikwidlund/uc-intg-appletv/issues/new/choose).
 
-## Network and wake-up
+## Debug log
+
+For an error report, turn on the debug log. Either:
+
+- Turn on _Debug log_ on the _Restore_ page of a new setup.
+- Or run the setup again, turn on _Debug log_ and choose _Save settings_.
+
+The driver and ratv then write more lines to the log. It takes effect at once and stays on after a
+restart. Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
+
+[Log format](#log-format) explains the log lines.
+
+## Backup and restore
+
+Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a
+text field. Copy it and keep it in a safe place.
+
+To restore, choose _Restore configuration from backup_ in the setup, or turn on
+_Restore from backup_ on the _Restore_ page of a new setup. Paste the data. It replaces all
+configured devices.
+
+The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never
+writes the backup data to the log. With `UC_API_MSG_TRACING`, the backup data and the PIN are
+shown as `***`.
+
+## Details
+
+This part explains how the driver works inside. Most users do not need it.
+
+### Network and wake-up
 
 The driver uses two protocols of the Apple TV. Companion is the protocol of the iPhone remote.
 MRP (Media Remote Protocol) gives most of the playback data.
@@ -199,16 +249,6 @@ MRP (Media Remote Protocol) gives most of the playback data.
 - The driver connects Companion first. Commands wait at most 0.5 seconds for MRP. Siri in the
   _MRP only_ mode waits for the MRP connect, also at most 10 seconds.
 - If 3 commands time out within 60 seconds, the driver connects again.
-
-## Debug log
-
-For an error report, turn on the debug log. Either:
-
-- Turn on _Debug log_ on the _Restore_ page of a new setup.
-- Or run the setup again, turn on _Debug log_ and choose _Save settings_.
-
-The driver and ratv then write more lines to the log. It takes effect at once and stays on after a
-restart. Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
 
 ### Log format
 
@@ -237,18 +277,6 @@ driver). Then each log entry starts with a priority prefix such as `<7>`:
   errors.
 - The second and later lines of a message with more than one line, and the output of a panic, get
   the default priority of the journal.
-
-## Backup and restore
-
-Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a
-text field. Copy it and keep it in a safe place.
-
-To restore, choose _Restore configuration from backup_ in the setup, or turn on
-_Restore from backup_ on the _Restore_ page of a new setup. Paste the data. It replaces all configured devices.
-
-The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never
-writes the backup data to the log. With `UC_API_MSG_TRACING`, the backup data and the PIN are
-shown as `***`.
 
 ## Build
 
@@ -298,8 +326,23 @@ It saves the results to `test-results/manual-test-results-<time>.md`.
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. See
 [tools/remote-sim/README.md](tools/remote-sim/README.md).
 
+## Links
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to help.
+- [SECURITY.md](SECURITY.md): how to report a security problem.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): rules for the community.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the driver works.
+- [tools/remote-sim/README.md](tools/remote-sim/README.md): device tests without a Remote.
+
+## Credits
+
+Parts of the code come from the
+[Home Assistant integration](https://github.com/unfoldedcircle/integration-home-assistant) by
+Unfolded Circle, which also uses the MPL-2.0 license.
+
+This project is not made or supported by Apple or Unfolded Circle. Apple TV, tvOS and Siri are
+trademarks of Apple Inc. Other names are the property of their owners.
+
 ## License
 
-[MPL-2.0](LICENSE). Parts of the code come from the
-[Home Assistant integration](https://github.com/unfoldedcircle/integration-home-assistant) by Unfolded Circle,
-which uses the same license.
+[MPL-2.0](LICENSE).
