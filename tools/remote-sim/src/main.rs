@@ -10,12 +10,16 @@
 //! backup. Values are compared with a second connection that has its own pairing, see
 //! [`oracle`].
 //!
+//! Before the driver starts, it is built with [`BUILD_ARGS`], unless `--no-build` or `--driver` is
+//! given.
+//!
 //! Usage:
-//! - `remote-sim pair <address>`: pair the second connection one time.
-//! - `remote-sim pair-driver <address>`: pair the driver through its setup flow and save its
-//!   `config.json` as `--config`. An old file is kept as `<config>.old-<unix time>`.
+//! - `remote-sim pair <address> [--credentials <path>]`: pair the second connection one time.
+//! - `remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--no-build]
+//!   [--port <port>]`: pair the driver through its setup flow and save its `config.json` as
+//!   `--config`. An old file is kept as `<config>.old-<unix time>`.
 //! - `remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-//!   [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-hold]`
+//!   [--only a,b] [--skip a,b] [--no-power] [--no-build] [--port <port>] [--siri-hold]`
 //!
 //! `--siri-hold` sends 1500 ms of silence after the speech instead of 300 ms, like a user who
 //! holds the button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri
@@ -30,12 +34,12 @@ mod ws;
 use driver::Driver;
 use std::fmt::{self, Display};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use ws::Client;
 
 /// All steps in the order of [`run`].
-const STEPS: [&str; 38] = [
+const STEPS: [&str; 40] = [
     "metadata",
     "setup_input",
     "setup",
@@ -45,6 +49,7 @@ const STEPS: [&str; 38] = [
     "remote_ui",
     "standby",
     "remote_wake",
+    "quick_wake",
     "remote_commands",
     "simple_commands",
     "app_select",
@@ -69,6 +74,7 @@ const STEPS: [&str; 38] = [
     "ws_close",
     "ws_driver_restart",
     "driver_restart",
+    "debug_log",
     "config_file",
     "broken_config",
     "atv_restart",
@@ -97,9 +103,107 @@ fn selected(only: &[String], skip: &[String], name: &str) -> bool {
 
 const USAGE: &str = "Usage:
   remote-sim pair <address> [--credentials <path>]
-  remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--port <port>]
+  remote-sim pair-driver <address> [--config <path>] [--driver <path>] [--no-build]
+             [--port <port>]
   remote-sim <address> [--config <path>] [--driver <path>] [--credentials <path>]
-             [--only a,b] [--skip a,b] [--no-power] [--port <port>] [--siri-hold]";
+             [--only a,b] [--skip a,b] [--no-power] [--no-build] [--port <port>] [--siri-hold]";
+
+/// The repository folder of the driver.
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("tools/remote-sim is in the repository")
+}
+
+/// Arguments of `cargo` that build the driver.
+const BUILD_ARGS: [&str; 3] = ["build", "--release", "--locked"];
+
+/// Argument of `cargo` that writes the build messages as JSON lines to stdout. The diagnostics and
+/// the progress go to stderr as text.
+const MESSAGE_ARG: &str = "--message-format=json-render-diagnostics";
+
+/// Name of the driver binary.
+const BIN_NAME: &str = "uc-intg-appletv";
+
+/// Build the driver with [`BUILD_ARGS`] and return the path of the binary that cargo gives. It is
+/// in the target folder of cargo, for example from `CARGO_TARGET_DIR`. The diagnostics and the
+/// progress of cargo go to the terminal.
+async fn build_driver() -> Result<PathBuf, String> {
+    let manifest = repo_root().join("Cargo.toml");
+    println!(
+        "Building the driver: cargo {} --manifest-path {}",
+        BUILD_ARGS.join(" "),
+        manifest.display()
+    );
+    let build = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("cargo")
+            .args(BUILD_ARGS)
+            .arg(MESSAGE_ARG)
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut bin = None;
+        if let Some(stdout) = child.stdout.take() {
+            // All output is read, so cargo never waits on a full pipe. Bytes that are not UTF-8
+            // become U+FFFD.
+            for line in std::io::BufReader::new(stdout).split(b'\n') {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(e) => {
+                        // Without the output, the build result is not known: stop cargo.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(e);
+                    }
+                };
+                if let Some(path) = artifact_executable(&String::from_utf8_lossy(&line)) {
+                    bin = Some(path);
+                }
+            }
+        }
+        Ok((child.wait()?, bin))
+    });
+    let (status, bin) = build
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
+        .map_err(|e| {
+            format!(
+                "cannot run cargo to build the driver: {e}. Use --no-build to start the driver as \
+                 it is"
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "the driver build failed ({status}). Fix the build, or use --no-build to start the \
+             driver as it is"
+        ));
+    }
+    bin.ok_or_else(|| {
+        format!("cargo did not name the {BIN_NAME} binary. Use --driver <path> to start it")
+    })
+}
+
+/// The path of the driver binary in a JSON message of cargo. `None` for other messages.
+fn artifact_executable(line: &str) -> Option<PathBuf> {
+    // Most messages have no binary: they are not parsed.
+    if !line.contains("\"executable\":\"") {
+        return None;
+    }
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    let is_bin = message["reason"] == "compiler-artifact"
+        && message["target"]["name"] == BIN_NAME
+        && message["target"]["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
+    is_bin
+        .then(|| message["executable"].as_str().map(PathBuf::from))
+        .flatten()
+}
 
 /// A failed or skipped check.
 pub struct Fail {
@@ -138,13 +242,30 @@ impl Display for Fail {
 /// Result of a check: a note for the report.
 pub type Check = Result<String, Fail>;
 
+/// Where the driver binary comes from.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Build {
+    /// Built with [`BUILD_ARGS`] before the start.
+    Cargo,
+    /// `--no-build`: [`repo_bin`] as it is.
+    Repo,
+    /// `--driver <path>`: that binary as it is. It wins over `--no-build`.
+    Custom(PathBuf),
+}
+
+/// The release binary of the driver in the target folder of the repository.
+fn repo_bin() -> PathBuf {
+    repo_root().join("target/release").join(BIN_NAME)
+}
+
 pub struct Options {
     pub pair: bool,
     pub pair_driver: bool,
     pub address: Option<IpAddr>,
     /// `config.json` of the driver with the pairing to use.
     pub config: PathBuf,
-    pub bin: PathBuf,
+    /// Where the driver binary comes from.
+    pub build: Build,
     /// Pairing of the second connection.
     pub credentials: PathBuf,
     pub only: Vec<String>,
@@ -264,7 +385,7 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Options, String> {
         pair_driver: false,
         address: None,
         config: PathBuf::from("config.json"),
-        bin: PathBuf::from("target/release/uc-intg-appletv"),
+        build: Build::Cargo,
         credentials: PathBuf::from("remote-sim-credentials"),
         only: Vec::new(),
         skip: Vec::new(),
@@ -283,13 +404,20 @@ fn parse_from(args: impl Iterator<Item = String>) -> Result<Options, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => opt.config = args.next().ok_or("--config needs a path")?.into(),
-            "--driver" => opt.bin = args.next().ok_or("--driver needs a path")?.into(),
+            "--driver" => {
+                opt.build = Build::Custom(args.next().ok_or("--driver needs a path")?.into());
+            }
             "--credentials" => {
                 opt.credentials = args.next().ok_or("--credentials needs a path")?.into();
             }
             "--only" => opt.only.extend(step_list("--only", args.next())?),
             "--skip" => opt.skip.extend(step_list("--skip", args.next())?),
             "--no-power" => opt.no_power = true,
+            "--no-build" => {
+                if opt.build == Build::Cargo {
+                    opt.build = Build::Repo;
+                }
+            }
             "--siri-hold" => opt.siri_hold = true,
             "--port" => {
                 opt.port = args
@@ -350,6 +478,17 @@ async fn main() {
         }
         return;
     }
+    // A busy port stops the run before the build.
+    if let Err(e) = driver::check_port_free(opt.port).await {
+        exit(&e.msg);
+    }
+    // Before the Apple TV is contacted: a failed build stops the run.
+    let bin = driver_bin(&opt.build).await.unwrap_or_else(|e| exit(&e));
+    if opt.build != Build::Cargo
+        && let Some(text) = old_driver(&bin, &opt.build)
+    {
+        println!("{text}");
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -357,10 +496,7 @@ async fn main() {
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         exit(&format!("cannot create {}: {e}", dir.display()));
     }
-    if let Some(text) = old_driver(&opt.bin) {
-        println!("{text}");
-    }
-    let mut driver = Driver::new(&opt.bin, &dir, opt.port);
+    let mut driver = Driver::new(&bin, &dir, opt.port);
     if let Err(e) = driver.start().await {
         exit(&e.msg);
     }
@@ -415,10 +551,32 @@ async fn main() {
     std::process::exit(i32::from(ctx.failed > 0));
 }
 
+/// The driver binary for `build`. [`Build::Cargo`] builds it first.
+async fn driver_bin(build: &Build) -> Result<PathBuf, String> {
+    match build {
+        Build::Cargo => build_driver().await,
+        Build::Repo => existing_repo_bin(repo_bin()),
+        Build::Custom(bin) => Ok(bin.clone()),
+    }
+}
+
+/// `bin` for [`Build::Repo`], or an error if the file is missing.
+fn existing_repo_bin(bin: PathBuf) -> Result<PathBuf, String> {
+    if bin.is_file() {
+        Ok(bin)
+    } else {
+        Err(format!(
+            "{} not found. Build it or leave out --no-build, or use --driver <path>",
+            bin.display()
+        ))
+    }
+}
+
 /// A warning if the driver binary is older than a file in `src` or `resources`, or than
 /// `Cargo.toml`, `Cargo.lock` or `build.rs` of its repo. The repo is the folder above
-/// `target/<profile>/` with a `Cargo.toml`. `None` if it is not older or not in a repo.
-fn old_driver(bin: &std::path::Path) -> Option<String> {
+/// `target/<profile>/` with a `Cargo.toml`. `None` if it is not older or not in a repo. For
+/// [`Build::Repo`] the hint names [`BUILD_ARGS`] and says to leave out `--no-build`.
+fn old_driver(bin: &std::path::Path, build: &Build) -> Option<String> {
     let built = std::fs::metadata(bin).ok()?.modified().ok()?;
     let profile = bin.parent()?.file_name()?.to_str()?;
     let root = bin.ancestors().nth(3)?;
@@ -430,7 +588,10 @@ fn old_driver(bin: &std::path::Path) -> Option<String> {
     if !root.join("Cargo.toml").is_file() {
         return None;
     }
-    let build = match profile {
+    let hint = match profile {
+        _ if *build == Build::Repo => {
+            format!("cargo {} or leave out --no-build", BUILD_ARGS.join(" "))
+        }
         "debug" => "cargo build".to_owned(),
         "release" => "cargo build --release".to_owned(),
         other => format!("cargo build --profile {other}"),
@@ -447,8 +608,8 @@ fn old_driver(bin: &std::path::Path) -> Option<String> {
         .max()?;
     (newest > built).then(|| {
         format!(
-            "WARNING: the driver binary {} may be older than the source: run {build} (ignore \
-             this if it has nothing to build)",
+            "WARNING: the driver binary {} may be older than the source: run {hint} \
+             (ignore this if it has nothing to build)",
             bin.display()
         )
     })
@@ -541,6 +702,7 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("remote_ui", checks::remote_ui).await;
     ctx.step("standby", checks::standby).await;
     ctx.step("remote_wake", checks::remote_wake).await;
+    ctx.step("quick_wake", checks::quick_wake).await;
     ctx.step("remote_commands", checks::remote_commands).await;
     ctx.step("simple_commands", checks::simple_commands).await;
     ctx.step("app_select", checks::app_select).await;
@@ -571,6 +733,8 @@ async fn middle_steps(ctx: &mut Ctx) {
     ctx.step("ws_driver_restart", checks::ws_driver_restart)
         .await;
     ctx.step("driver_restart", checks::driver_restart).await;
+    // Starts the driver without RUST_LOG, then again with it.
+    ctx.step("debug_log", checks::debug_log).await;
     ctx.step("config_file", checks::config_file).await;
     ctx.step("broken_config", checks::broken_config).await;
     // Needs a person, so only with `--only atv_restart`.
@@ -589,6 +753,47 @@ mod tests {
     fn siri_hold_option() {
         assert!(!parse_from(args("10.0.0.1")).unwrap().siri_hold);
         assert!(parse_from(args("10.0.0.1 --siri-hold")).unwrap().siri_hold);
+    }
+
+    #[test]
+    fn no_build_option() {
+        let build = |line: &str| parse_from(args(line)).unwrap().build;
+        assert_eq!(Build::Cargo, build("10.0.0.1"));
+        assert_eq!(Build::Repo, build("10.0.0.1 --no-build"));
+        assert_eq!(Build::Repo, build("pair-driver 10.0.0.1 --no-build"));
+        let custom = Build::Custom(PathBuf::from("/bin/driver"));
+        assert_eq!(custom, build("10.0.0.1 --driver /bin/driver"));
+        assert_eq!(custom, build("10.0.0.1 --driver /bin/driver --no-build"));
+        assert_eq!(custom, build("10.0.0.1 --no-build --driver /bin/driver"));
+        assert!(parse_from(args("10.0.0.1 --driver")).is_err(), "no path");
+        assert_eq!(
+            repo_root().join("target/release/uc-intg-appletv"),
+            repo_bin()
+        );
+        assert!(
+            repo_root().join("Cargo.toml").is_file(),
+            "driver repository"
+        );
+    }
+
+    #[test]
+    fn the_driver_binary_is_taken_from_the_cargo_messages() {
+        let bin = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"uc-intg-appletv"},"executable":"/t/release/uc-intg-appletv","fresh":true}"#;
+        assert_eq!(
+            Some(PathBuf::from("/t/release/uc-intg-appletv")),
+            artifact_executable(bin)
+        );
+        let other = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other"},"executable":"/t/release/other"}"#;
+        assert_eq!(None, artifact_executable(other));
+        let lib = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"uc-intg-appletv"},"executable":null}"#;
+        assert_eq!(None, artifact_executable(lib));
+        let test = r#"{"reason":"compiler-artifact","target":{"kind":["test"],"name":"uc-intg-appletv"},"executable":"/t/release/deps/uc_intg_appletv-1"}"#;
+        assert_eq!(None, artifact_executable(test));
+        assert_eq!(
+            None,
+            artifact_executable(r#"{"reason":"build-finished","success":true}"#)
+        );
+        assert_eq!(None, artifact_executable("not json \"executable\":\""));
     }
 
     #[test]
@@ -656,6 +861,7 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let root = std::env::temp_dir().join(format!("remote-sim-old-{}", std::process::id()));
         let bin = root.join("target/release/driver");
+        let custom = Build::Custom(bin.clone());
         std::fs::create_dir_all(bin.parent().expect("parent")).expect("target");
         std::fs::create_dir_all(root.join("src/sub")).expect("src");
         std::fs::write(root.join("Cargo.toml"), "").expect("Cargo.toml");
@@ -671,16 +877,21 @@ mod tests {
         };
         let now = SystemTime::now();
         set(now - Duration::from_secs(100));
-        let warning = old_driver(&bin).expect("older than the source");
+        let warning = old_driver(&bin, &custom).expect("older than the source");
         assert!(
             warning.contains("run cargo build --release (ignore"),
             "{warning}"
         );
+        let warning = old_driver(&bin, &Build::Repo).expect("older than the source");
+        assert!(
+            warning.contains("run cargo build --release --locked or leave out --no-build (ignore"),
+            "{warning}"
+        );
         std::fs::remove_file(root.join("Cargo.toml")).expect("remove Cargo.toml");
-        assert!(old_driver(&bin).is_none(), "not in a repo");
+        assert!(old_driver(&bin, &custom).is_none(), "not in a repo");
         std::fs::write(root.join("Cargo.toml"), "").expect("Cargo.toml");
         set(now + Duration::from_secs(100));
-        assert!(old_driver(&bin).is_none(), "newer than the source");
+        assert!(old_driver(&bin, &custom).is_none(), "newer than the source");
         // Only Cargo.lock is newer, as after a dependency update.
         let age = |path: &std::path::Path, time: SystemTime| {
             std::fs::File::options()
@@ -692,11 +903,36 @@ mod tests {
         age(&root.join("src/sub/a.rs"), now - Duration::from_secs(300));
         age(&root.join("Cargo.toml"), now - Duration::from_secs(300));
         set(now - Duration::from_secs(100));
-        assert!(old_driver(&bin).is_none(), "older source");
+        assert!(old_driver(&bin, &custom).is_none(), "older source");
         std::fs::write(root.join("Cargo.lock"), "").expect("Cargo.lock");
-        assert!(old_driver(&bin).is_some(), "newer Cargo.lock");
-        assert!(old_driver(&root.join("missing")).is_none(), "no binary");
+        assert!(old_driver(&bin, &custom).is_some(), "newer Cargo.lock");
+        assert!(
+            old_driver(&root.join("missing"), &custom).is_none(),
+            "no binary"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn driver_binary_choice() {
+        let custom = PathBuf::from("/no/such/driver");
+        assert_eq!(
+            Ok(custom.clone()),
+            driver_bin(&Build::Custom(custom.clone())).await,
+            "taken as it is"
+        );
+        assert_eq!(
+            Err(
+                "/no/such/driver not found. Build it or leave out --no-build, or use --driver \
+                 <path>"
+                    .to_owned()
+            ),
+            existing_repo_bin(custom)
+        );
+        let file = std::env::temp_dir().join(format!("remote-sim-repo-bin-{}", std::process::id()));
+        std::fs::write(&file, "").expect("write");
+        assert_eq!(Ok(file.clone()), existing_repo_bin(file.clone()));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

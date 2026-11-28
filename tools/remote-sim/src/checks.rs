@@ -7,6 +7,8 @@
 //! directly with Siri through the driver. `tools/manual_test.sh` has the steps that are not
 //! checked here yet.
 
+use crate::driver::log::{DriverLog, RawLog, driver_log, has_any, log_after};
+use crate::driver::{Driver, LogMark, RustLog};
 use crate::oracle::{self, Content, Oracle};
 use crate::ws::{Client, field_ids, field_value};
 use crate::{Check, Ctx, Fail};
@@ -176,25 +178,23 @@ async fn press(ctx: &mut Ctx, command: &str) -> Result<(), Fail> {
         .await
 }
 
-fn closed_lines(ctx: &Ctx) -> usize {
-    ctx.driver.log_text().matches("connection closed").count()
+/// The [`CLOSED`] lines of the driver in its log after `mark`, joined with " | ". Empty if there
+/// is none.
+fn closed_lines(driver: &Driver, mark: LogMark) -> String {
+    driver_log(driver, mark).lines_with(&CLOSED).join(" | ")
 }
 
-/// Wait until the driver log has `pattern` after `mark` (from `Driver::log_len`).
-async fn wait_log(ctx: &mut Ctx, mark: usize, pattern: &str, secs: u64) -> Result<(), Fail> {
+/// Wait up to `secs` until a driver line after `mark` has `pattern` in its message.
+async fn wait_log(ctx: &mut Ctx, mark: LogMark, pattern: &str, secs: u64) -> Result<(), Fail> {
     let deadline = Instant::now() + Duration::from_secs(secs);
-    while !ctx.driver.log_since(mark).contains(pattern) {
+    while !driver_log(&ctx.driver, mark).contains(pattern) {
         ensure!(
             Instant::now() < deadline,
-            "no log line with '{pattern}' in {secs} s"
+            "no driver log line with '{pattern}' in {secs} s"
         );
         ctx.client.listen_ms(100).await?;
     }
     Ok(())
-}
-
-fn connects(ctx: &Ctx) -> usize {
-    ctx.driver.log_text().matches("connected in").count()
 }
 
 /// The oracle, or a skip when there is none.
@@ -369,22 +369,35 @@ enum Answer {
     Skip,
     /// The input ended, so the owner cannot answer.
     NoInput,
+    /// Stdin is not a terminal, so the question is not asked.
+    NoTerminal,
 }
 
 /// Kind of question to the owner.
 #[derive(Clone, Copy)]
 enum Ask {
     /// Something to do. Enter means it is done, s skips. The texts say what each key means.
-    Action(&'static str, &'static str),
-    /// A yes or no question. The texts say what y and n mean.
-    Question(&'static str, &'static str),
+    Action {
+        done: &'static str,
+        skip: &'static str,
+    },
+    /// A yes or no question. The texts say what y, n and s mean.
+    Question {
+        yes: &'static str,
+        no: &'static str,
+        skip: &'static str,
+    },
 }
+
+/// Report text for a question that is not asked, because stdin is not a terminal.
+const NO_TERMINAL: &str = "not asked: no terminal";
 
 /// What s + Enter means for most questions.
 const SKIP_CHECK: &str = "skip this check";
 
-/// Ask the owner on the terminal and wait for the answer. Without a terminal it returns `Skip`,
-/// at the end of the input `NoInput`. The question and the answer go to the report of the step.
+/// Ask the owner on the terminal and wait for the answer. Without a terminal it returns
+/// `NoTerminal`, at the end of the input `NoInput`. The question and the answer go to the report
+/// of the step.
 async fn ask(ctx: &mut Ctx, kind: Ask, text: &str) -> Result<Answer, Fail> {
     ask_hint(ctx, kind, text, None).await
 }
@@ -397,16 +410,10 @@ async fn ask_hint(
     hint: Option<&str>,
 ) -> Result<Answer, Fail> {
     if !terminal() {
-        ctx.answers
-            .push(format!("{text:?}: not asked, no terminal"));
-        return Ok(Answer::Skip);
+        ctx.answers.push(format!("{text:?}: {NO_TERMINAL}"));
+        return Ok(Answer::NoTerminal);
     }
-    let keys = match kind {
-        Ask::Action(done, skip) => format!("Enter = {done}, s + Enter = {skip}"),
-        Ask::Question(yes, no) => {
-            format!("y + Enter = {yes}, n + Enter = {no}, s + Enter = {SKIP_CHECK}")
-        }
-    };
+    let keys = keys_text(kind);
     drop_typed_lines(ctx);
     match hint {
         Some(hint) => println!("\n  >>> {text}\n  {hint}\n  {keys}"),
@@ -416,20 +423,34 @@ async fn ask_hint(
         let Some(line) = read_line(ctx).await? else {
             break Answer::NoInput;
         };
-        let answer = match (kind, line.trim().to_ascii_lowercase().as_str()) {
-            (_, "s") => Answer::Skip,
-            (Ask::Action(..), "") => Answer::Done,
-            (Ask::Question(..), "y") => Answer::Yes,
-            (Ask::Question(..), "n") => Answer::No,
-            _ => {
-                println!("  Unknown answer. {keys}");
-                continue;
-            }
-        };
-        break answer;
+        match parse_answer(kind, &line) {
+            Some(answer) => break answer,
+            None => println!("  Unknown answer. {keys}"),
+        }
     };
     ctx.answers.push(format!("{text:?}: {answer:?}"));
     Ok(answer)
+}
+
+/// The line that says what each key does.
+fn keys_text(kind: Ask) -> String {
+    match kind {
+        Ask::Action { done, skip } => format!("Enter = {done}, s + Enter = {skip}"),
+        Ask::Question { yes, no, skip } => {
+            format!("y + Enter = {yes}, n + Enter = {no}, s + Enter = {skip}")
+        }
+    }
+}
+
+/// The answer of a typed line. `None` for a line that is not a key of `kind`.
+fn parse_answer(kind: Ask, line: &str) -> Option<Answer> {
+    match (kind, line.trim().to_ascii_lowercase().as_str()) {
+        (_, "s") => Some(Answer::Skip),
+        (Ask::Action { .. }, "") => Some(Answer::Done),
+        (Ask::Question { .. }, "y") => Some(Answer::Yes),
+        (Ask::Question { .. }, "n") => Some(Answer::No),
+        _ => None,
+    }
 }
 
 /// [`need_playback`], after a wait of up to 10 s for the driver to show the playback.
@@ -515,26 +536,25 @@ async fn need_content(ctx: &mut Ctx, need: Content, seen: PlaybackSeen) -> Resul
         }
     }
     if !terminal() {
-        decline(
-            ctx,
-            need,
-            format!("not asked: no terminal, needs {}", need.text()),
-        );
+        decline(ctx, need, format!("{NO_TERMINAL}, needs {}", need.text()));
         return Err(Fail::skip(format!(
-            "not asked: no terminal, needs {}: {missing}",
+            "{NO_TERMINAL}, needs {}: {missing}",
             need.text()
         )));
     }
     // Ask until the content is right or the owner skips. Each prompt says what is wrong now.
-    let mut keys = Ask::Action("it plays", "skip the checks that need it");
+    let mut keys = Ask::Action {
+        done: "it plays",
+        skip: "skip the checks that need it",
+    };
     loop {
         let text = content_prompt(ctx, need, &missing);
         let answer = ask(ctx, keys, &text).await?;
         if answer != Answer::Done {
-            let why = if answer == Answer::NoInput {
-                "not started (no input)"
-            } else {
-                "the owner skipped"
+            let why = match answer {
+                Answer::NoInput => "not started (no input)",
+                Answer::NoTerminal => NO_TERMINAL,
+                Answer::Skip | Answer::Done | Answer::Yes | Answer::No => "the owner skipped",
             };
             let reason = format!("{why}: {}: {missing}", need.text());
             decline(ctx, need, reason.clone());
@@ -545,7 +565,10 @@ async fn need_content(ctx: &mut Ctx, need: Content, seen: PlaybackSeen) -> Resul
             None => return content_found(ctx, need, seen).await,
             Some(still) => missing = still,
         }
-        keys = Ask::Action("check again", "skip the checks that need it");
+        keys = Ask::Action {
+            done: "check again",
+            skip: "skip the checks that need it",
+        };
     }
 }
 
@@ -673,9 +696,7 @@ pub async fn states(ctx: &mut Ctx) -> Check {
     let state = match wait_available(ctx, 30).await {
         Ok(state) => state,
         Err(e)
-            if ctx
-                .driver
-                .log_text()
+            if driver_log(&ctx.driver, ctx.driver.log_start())
                 .contains("pairing is not valid anymore") =>
         {
             return Err(Fail::new(format!(
@@ -691,7 +712,7 @@ pub async fn states(ctx: &mut Ctx) -> Check {
     let Some(address) = ctx.opt.address else {
         return Err(Fail::new("no address"));
     };
-    let closed = closed_lines(ctx);
+    let mark = ctx.driver.log_len();
     let oracle = match Oracle::connect(address, &ctx.opt.credentials).await {
         Ok(oracle) => {
             ctx.oracle = Some(oracle);
@@ -703,9 +724,14 @@ pub async fn states(ctx: &mut Ctx) -> Check {
                 .as_ref()
                 .and_then(Oracle::active_app)
                 .map(str::to_owned);
+            let closed = closed_lines(&ctx.driver, mark);
             ensure!(
-                closed_lines(ctx) == closed && mp_state(ctx) != "UNAVAILABLE",
-                "the driver lost the Apple TV when the second connection started"
+                closed.is_empty(),
+                "a driver connection closed when the second connection started: {closed}"
+            );
+            ensure!(
+                mp_state(ctx) != "UNAVAILABLE",
+                "the media player is UNAVAILABLE after the second connection started"
             );
             "values are compared with a second connection".to_owned()
         }
@@ -903,7 +929,6 @@ pub async fn remote_ui(ctx: &mut Ctx) -> Check {
 // ---------------------------------------------------------------- wake and sleep
 
 pub async fn standby(ctx: &mut Ctx) -> Check {
-    let before = connects(ctx);
     ctx.client.send_event("enter_standby").await?;
     ctx.client.listen(3).await?;
     let in_standby = mp_state(ctx);
@@ -913,15 +938,7 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
     );
     let mark = ctx.driver.log_len();
     ctx.client.send_event("exit_standby").await?;
-    let start = Instant::now();
-    while connects(ctx) == before {
-        ensure!(
-            start.elapsed() < Duration::from_secs(8),
-            "no new connection after exit_standby"
-        );
-        ctx.client.listen_ms(100).await?;
-    }
-    let took = start.elapsed().as_millis();
+    let took = wait_joined(ctx, mark, Instant::now(), 8).await?;
     ctx.client.refresh_states().await?;
     let after = wait_available(ctx, 5).await?;
     let mut nothing = "";
@@ -954,14 +971,14 @@ pub async fn standby(ctx: &mut Ctx) -> Check {
         }
     }
     Ok(format!(
-        "connected {took} ms after exit_standby, state {after}{nothing}"
+        "full connect {took} ms after exit_standby, state {after}{nothing}"
     ))
 }
 
 /// A note for a FAIL text when the driver log after `mark` has no Home Screen check at a
 /// connect. Empty if it has one.
-fn no_check_note(ctx: &Ctx, mark: usize) -> &'static str {
-    if ctx.driver.log_since(mark).contains(NO_PLAYER_CHECK) {
+fn no_check_note(ctx: &Ctx, mark: LogMark) -> &'static str {
+    if driver_log(&ctx.driver, mark).contains(NO_PLAYER_CHECK) {
         ""
     } else {
         ", and the driver did not see the Home Screen at the connect"
@@ -1007,6 +1024,97 @@ pub async fn remote_wake(ctx: &mut Ctx) -> Check {
     ctx.client.request_ok("subscribe_events", json!({})).await?;
     Ok(format!(
         "state {first} after {took} ms, subscribed without ids"
+    ))
+}
+
+/// The waits in ms in [`quick_wake`]: from an `exit_standby` to the next `enter_standby`, and from
+/// that `enter_standby` to the next `exit_standby`. On the test device, Companion opens after 30 to
+/// 100 ms and MRP joins after 50 to 200 ms. So the waits send the standby before Companion is
+/// open, while MRP joins, about when MRP has joined and after the full connect. A wait of 0 after
+/// a standby sends the next wake while the old connection still closes.
+const QUICK_GAPS_MS: [(u64, u64); 6] = [(0, 0), (15, 0), (40, 0), (80, 10), (200, 0), (500, 500)];
+
+/// Wait in s after the last `enter_standby` of the burst, so the driver has closed its
+/// connection before the last `exit_standby`. The driver waits up to 2 s for a running command
+/// before it closes.
+const QUICK_SETTLE_SECS: u64 = 3;
+
+/// Longest wait in s for the full connect after the last `exit_standby`.
+const QUICK_CONNECT_SECS: u64 = 15;
+
+/// Parts of the one driver log line of a new connect: both protocols in one go, or Companion
+/// first with MRP next. A protocol that is added later logs "<protocol> connected in" without
+/// them.
+const CONNECT_LINES: [&str; 2] = ["] connected in ", ", MRP next"];
+
+/// Checks the driver lines after the last `exit_standby` of [`quick_wake`]: exactly one connect,
+/// no line at level WARN or ERROR and no closed connection. A failed or partial connect logs at
+/// WARN.
+fn after_quick_wake(log: &DriverLog) -> Result<(), String> {
+    let connects = log.lines_with(&CONNECT_LINES);
+    if connects.len() != 1 {
+        return Err(format!(
+            "{} connects after the last exit_standby, expected 1: {}",
+            connects.len(),
+            connects.join(" | ")
+        ));
+    }
+    // One pass, so a line that is both is shown once.
+    let bad: Vec<&str> = log
+        .entries()
+        .filter(|l| matches!(l.level, "WARN" | "ERROR") || has_any(l.message, &CLOSED))
+        .map(|l| l.line)
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(bad.join(" | "))
+    }
+}
+
+/// The standby and wake events of [`quick_wake`], up to the last standby and the wait after it.
+async fn standby_burst(ctx: &mut Ctx) -> Result<(), Fail> {
+    remote_sleep(ctx).await?;
+    for (awake, asleep) in QUICK_GAPS_MS {
+        ctx.client.send_event("exit_standby").await?;
+        ctx.client.listen_ms(awake).await?;
+        ctx.client.send_event("enter_standby").await?;
+        ctx.client.listen_ms(asleep).await?;
+    }
+    ctx.client.listen(QUICK_SETTLE_SECS).await
+}
+
+/// The Remote wakes and goes to standby again with short gaps, so a standby comes while a connect
+/// runs and a wake while the old connection closes. After the last wake the driver must connect
+/// once, with no driver line at level WARN or ERROR and no closed connection, show the media
+/// player as available and agree with the second connection if there is one. If the burst fails,
+/// the Remote wakes again.
+pub async fn quick_wake(ctx: &mut Ctx) -> Check {
+    if let Err(e) = standby_burst(ctx).await {
+        // Wake the Remote again, else the next checks run in standby. The first error counts.
+        let mark = ctx.driver.log_len();
+        if ctx.client.send_event("exit_standby").await.is_ok() {
+            let _ = wait_joined(ctx, mark, Instant::now(), QUICK_CONNECT_SECS).await;
+        }
+        return Err(e);
+    }
+    let mark = ctx.driver.log_len();
+    ctx.client.send_event("exit_standby").await?;
+    let took = wait_joined(ctx, mark, Instant::now(), QUICK_CONNECT_SECS).await?;
+    // A second connect or a close can come after the first connect.
+    ctx.client.listen(2).await?;
+    after_quick_wake(&driver_log(&ctx.driver, mark)).map_err(Fail::new)?;
+    ctx.client.refresh_states().await?;
+    let state = wait_available(ctx, 5).await?;
+    let values = if ctx.oracle.is_some() {
+        verify(ctx, 5).await?;
+        ", values agree with the second connection"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} wakes, full connect {took} ms after the last exit_standby, state {state}{values}",
+        QUICK_GAPS_MS.len() + 1
     ))
 }
 
@@ -1347,11 +1455,11 @@ const HOME_CLOSED: &str = "Home Screen clear ended: connection closed";
 
 /// True if the last Home Screen clear in the driver log since the driver start was not ended.
 fn home_clear_active(ctx: &Ctx) -> bool {
-    let log = ctx.driver.log_since(ctx.driver.log_start());
-    let Some(clear) = log.rfind(HOME_CLEAR) else {
+    let log = driver_log(&ctx.driver, ctx.driver.log_start());
+    let Some(clear) = log.last_with(&[HOME_CLEAR]) else {
         return false;
     };
-    let ended = log.rfind(HOME_LEFT).max(log.rfind(HOME_CLOSED));
+    let ended = log.last_with(&[HOME_LEFT, HOME_CLOSED]);
     ended.is_none_or(|end| clear > end)
 }
 
@@ -1439,7 +1547,7 @@ async fn wait_front_state(
     ctx: &mut Ctx,
     app: &str,
     clear_at_start: bool,
-    front_mark: usize,
+    front_mark: LogMark,
 ) -> Result<(), Fail> {
     let total = Duration::from_secs(15);
     let start = Instant::now();
@@ -1473,7 +1581,13 @@ async fn wait_front_state(
 }
 
 /// Result of [`wait_front_state`] when the states did not agree in time.
-fn front_timeout(ctx: &Ctx, app: &str, clear_at_start: bool, front_mark: usize, e: &Fail) -> Fail {
+fn front_timeout(
+    ctx: &Ctx,
+    app: &str,
+    clear_at_start: bool,
+    front_mark: LogMark,
+    e: &Fail,
+) -> Fail {
     let device = ctx.oracle.as_ref().map(Oracle::playback_state);
     let shown = mp_state(ctx);
     if shown == "BUFFERING" && device.is_none_or(|d| d == Some(PlaybackState::Seeking)) {
@@ -1483,7 +1597,7 @@ fn front_timeout(ctx: &Ctx, app: &str, clear_at_start: bool, front_mark: usize, 
     let paused = device
         .is_some_and(|d| matches!(d, Some(PlaybackState::Paused | PlaybackState::Interrupted)));
     if shown == "STANDBY" && paused {
-        if ctx.driver.log_since(front_mark).contains(HOME_CLEAR) {
+        if driver_log(&ctx.driver, front_mark).contains(HOME_CLEAR) {
             return Fail::new(format!("Home Screen clear fired with {app} in front"));
         }
         if clear_at_start && home_clear_active(ctx) {
@@ -2078,16 +2192,13 @@ pub async fn artwork(ctx: &mut Ctx) -> Check {
 
 // ---------------------------------------------------------------- at wake
 
-/// Driver log line of a full connect: both protocols in one go, or MRP after Companion.
-fn joined(log: &str) -> bool {
-    log.contains("] connected in ") || log.contains("MRP connected in")
-}
+/// Parts of the driver log lines of a full connect: both protocols in one go, or MRP after
+/// Companion.
+const FULL_CONNECT: [&str; 2] = ["] connected in ", "MRP connected in"];
 
-/// Lines of `log` that contain one of `patterns`.
-fn lines_with<'a>(log: &'a str, patterns: &[&str]) -> Vec<&'a str> {
-    log.lines()
-        .filter(|l| patterns.iter().any(|p| l.contains(p)))
-        .collect()
+/// True if a driver line of `log` shows a full connect.
+fn joined(log: &DriverLog) -> bool {
+    log.has_any(&FULL_CONNECT)
 }
 
 /// Send `enter_standby` like a Remote that sleeps. The driver closes its connection to the Apple
@@ -2098,16 +2209,21 @@ async fn remote_sleep(ctx: &mut Ctx) -> Result<(), Fail> {
 }
 
 /// Wait until the driver log after `mark` shows a full connect. Returns the ms since `start`.
-async fn wait_joined(ctx: &mut Ctx, mark: usize, start: Instant, secs: u64) -> Result<u128, Fail> {
+async fn wait_joined(
+    ctx: &mut Ctx,
+    mark: LogMark,
+    start: Instant,
+    secs: u64,
+) -> Result<u128, Fail> {
     let deadline = start + Duration::from_secs(secs);
     loop {
-        let log = ctx.driver.log_since(mark);
+        let log = driver_log(&ctx.driver, mark);
         if joined(&log) {
             return Ok(start.elapsed().as_millis());
         }
         if Instant::now() >= deadline {
             let mut msg = format!("no full connect {secs} s after exit_standby");
-            for line in lines_with(&log, &["did not connect"]) {
+            for line in log.lines_with(&["did not connect"]) {
                 msg.push_str(" | ");
                 msg.push_str(line);
             }
@@ -2219,8 +2335,8 @@ async fn wake_toggle(ctx: &mut Ctx) -> Check {
     wait_playback(ctx, playback_of(toggled)).await?;
     // A second toggle comes within a short time.
     ctx.client.listen(3).await?;
-    let log = ctx.driver.log_since(mark);
-    let sent = log.matches("] play_pause -> ").count();
+    let log = driver_log(&ctx.driver, mark);
+    let sent = log.count(&["] play_pause -> "]);
     let again = log.contains(SENT_AGAIN);
     ensure!(
         sent == 1 || (sent == 2 && again),
@@ -2228,13 +2344,15 @@ async fn wake_toggle(ctx: &mut Ctx) -> Check {
     );
     // The first try logs "play_pause failed" before it is sent again: that line is allowed.
     let base = ["NotConnected", "did not connect", "play_pause not sent:"];
-    let (head, tail) = log.split_at(log.find(SENT_AGAIN).unwrap_or(0));
-    let mut bad: Vec<&str> = lines_with(head, &base)
-        .into_iter()
-        .filter(|l| !l.contains("play_pause failed:"))
+    let split = log.first_with(&[SENT_AGAIN]).unwrap_or(0);
+    let (head, tail) = (log.lines_before(split), log.lines_from(split));
+    let mut bad: Vec<&str> = head
+        .matches(&base)
+        .filter(|l| !l.message.contains("play_pause failed:"))
+        .map(|l| l.line)
         .collect();
-    bad.extend(lines_with(tail, &base));
-    bad.extend(lines_with(tail, &["play_pause failed"]));
+    bad.extend(tail.lines_with(&base));
+    bad.extend(tail.lines_with(&["play_pause failed"]));
     ensure!(bad.is_empty(), "{}", bad.join(" | "));
     ensure!(
         !log.contains(HOME_CLEAR),
@@ -2292,8 +2410,8 @@ pub async fn wake_artwork(ctx: &mut Ctx) -> Check {
     fetch_artwork(ctx, &url).await?;
     // An artwork error or a new image can come after the first image.
     ctx.client.listen(2).await?;
-    let log = ctx.driver.log_since(mark);
-    let failed = lines_with(&log, &["artwork failed"]);
+    let log = driver_log(&ctx.driver, mark);
+    let failed = log.lines_with(&["artwork failed"]);
     ensure!(failed.is_empty(), "{}", failed.join(" | "));
     let after = ctx.client.text(&mp, "media_image_url");
     ensure!(!after.is_empty(), "the image went away 2 s after it showed");
@@ -2351,8 +2469,13 @@ async fn set_device_rate(
         Err(e) => return Err(Fail::new(format!("rate {rate}: {e}"))),
     };
     let text = format!("{refused}. Choose {rate}x in the speed menu of the player on the TV.");
-    if ask(ctx, Ask::Action("done", skip), &text).await? != Answer::Done {
-        return Err(Fail::skip(refused));
+    match ask(ctx, Ask::Action { done: "done", skip }, &text).await? {
+        Answer::Done => {}
+        Answer::NoTerminal => {
+            return Err(Fail::skip(format!("{refused}, {NO_TERMINAL}")));
+        }
+        Answer::NoInput => return Err(Fail::skip(format!("{refused} (no input)"))),
+        Answer::Skip | Answer::Yes | Answer::No => return Err(Fail::skip(refused)),
     }
     wait_rate(ctx, rate)
         .await
@@ -2453,12 +2576,18 @@ async fn speeds(ctx: &mut Ctx, paused: bool) -> Check {
                         "The rate is still {rate} after PLAY. Choose 1x (normal speed) in the \
                          speed menu of the player on the TV."
                     );
-                    let answer = ask(ctx, Ask::Action("done", SKIP_CHECK), &text).await?;
+                    let keys = Ask::Action {
+                        done: "done",
+                        skip: SKIP_CHECK,
+                    };
+                    let answer = ask(ctx, keys, &text).await?;
                     if answer != Answer::Done {
                         let why = match answer {
                             Answer::NoInput => "not set (no input)",
-                            _ if !terminal() => "not asked: no terminal",
-                            _ => "the owner skipped",
+                            Answer::NoTerminal => NO_TERMINAL,
+                            Answer::Skip | Answer::Done | Answer::Yes | Answer::No => {
+                                "the owner skipped"
+                            }
                         };
                         return Err(Fail::skip(format!("the rate is not 1x, {why}")));
                     }
@@ -2509,7 +2638,7 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         let cleared_by_driver = loop {
-            if ctx.driver.log_since(mark).contains(HOME_CLEAR) {
+            if driver_log(&ctx.driver, mark).contains(HOME_CLEAR) {
                 break true;
             }
             if left_app(ctx) {
@@ -2536,7 +2665,7 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
                 ctx.client.text(&mp, "media_title")
             ));
         }
-        if !ctx.driver.log_since(mark).contains(HOME_CLEAR) {
+        if !driver_log(&ctx.driver, mark).contains(HOME_CLEAR) {
             // An app that plays audio in the background keeps playing on the Home Screen.
             let plays = ctx
                 .oracle
@@ -2545,7 +2674,7 @@ pub async fn home_playing(ctx: &mut Ctx) -> Check {
             if plays {
                 return Err(Fail::skip("the app keeps playing on the Home Screen"));
             }
-            if !ctx.driver.log_since(mark).contains("screen changed") {
+            if !driver_log(&ctx.driver, mark).contains("screen changed") {
                 return Err(Fail::skip(
                     "HOME did not reach the Home Screen: no screen change from the Apple TV",
                 ));
@@ -2684,7 +2813,7 @@ async fn wake_home_steps(ctx: &mut Ctx) -> Check {
     loop {
         home_screen_or_skip(ctx)?;
         let left = item_left(ctx, &mp);
-        let log = ctx.driver.log_since(mark);
+        let log = driver_log(&ctx.driver, mark);
         let ended = clear_ended(&log);
         let clear_missing = log.contains(NO_PLAYER_CHECK) && (!log.contains(HOME_CLEAR) || ended);
         if left.is_empty() && !clear_missing {
@@ -2725,7 +2854,7 @@ async fn wake_home_steps(ctx: &mut Ctx) -> Check {
     loop {
         ctx.client.listen_ms(200).await?;
         home_screen_or_skip(ctx)?;
-        let shown_again = clear_ended(&ctx.driver.log_since(mark));
+        let shown_again = clear_ended(&driver_log(&ctx.driver, mark));
         let left = item_left(ctx, &mp);
         let now = Instant::now();
         if now >= deadline && !shown_again && left.is_empty() {
@@ -2752,7 +2881,7 @@ async fn wake_home_steps(ctx: &mut Ctx) -> Check {
             }
         );
     }
-    let checked = if ctx.driver.log_since(mark).contains(NO_PLAYER_CHECK) {
+    let checked = if driver_log(&ctx.driver, mark).contains(NO_PLAYER_CHECK) {
         "Home Screen check at the connect"
     } else {
         "no Home Screen check at the connect"
@@ -2786,18 +2915,18 @@ fn flags_text(oracle: &Oracle) -> String {
 /// True if the last Home Screen clear in `log` ended (now playing again, or the connection
 /// closed) and no new clear came after that. Also true for an end line without a clear before
 /// it.
-fn clear_ended(log: &str) -> bool {
-    log.rfind(HOME_LEFT).max(log.rfind(HOME_CLOSED)) > log.rfind(HOME_CLEAR)
+fn clear_ended(log: &DriverLog) -> bool {
+    log.last_with(&[HOME_LEFT, HOME_CLOSED]) > log.last_with(&[HOME_CLEAR])
 }
 
 /// Wait up to 10 s after HOME until the driver clears now playing or the second connection
 /// shows the Home Screen. Skips if the Apple TV does not reach the Home Screen, plays on it, or
 /// has no item left. Returns a note.
-async fn wait_home(ctx: &mut Ctx, mark: usize) -> Result<String, Fail> {
+async fn wait_home(ctx: &mut Ctx, mark: LogMark) -> Result<String, Fail> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(10);
     loop {
-        let clear = ctx.driver.log_since(mark).contains(HOME_CLEAR);
+        let clear = driver_log(&ctx.driver, mark).contains(HOME_CLEAR);
         if clear || ctx.oracle.as_ref().is_some_and(Oracle::home_screen) {
             break;
         }
@@ -3092,17 +3221,18 @@ fn voice_note(ctx: &Ctx) -> String {
 async fn siri_answer(ctx: &mut Ctx, note: &str, audio_end: Instant) -> Check {
     let question = format!("Did Siri answer '{SIRI_TEXT}' and show the time?");
     let hint = Some("Siri can take up to 20 s to answer.");
-    // A WebSocket error in a wait is a FAIL, not hidden behind the SKIP.
-    let mut lost = None;
-    if !terminal() {
-        lost = siri_late_answer(ctx, audio_end).await.err();
-    }
-    // s + Enter does not wait.
-    let keys = Ask::Question("it answered", "nothing came after 20 s");
+    let keys = Ask::Question {
+        yes: "it answered",
+        no: "nothing came after 20 s",
+        skip: "skip this check without waiting for the answer",
+    };
     let answer = ask_hint(ctx, keys, &question, hint).await?;
-    if answer == Answer::NoInput {
-        lost = siri_late_answer(ctx, audio_end).await.err();
-    }
+    // A WebSocket error in a wait is a FAIL, not hidden behind the SKIP.
+    let lost = if matches!(answer, Answer::NoTerminal | Answer::NoInput) {
+        siri_late_answer(ctx, audio_end).await.err()
+    } else {
+        None
+    };
     let closed = close_siri(ctx).await;
     if let Some(e) = lost {
         return Err(Fail::new(format!(
@@ -3115,7 +3245,10 @@ async fn siri_answer(ctx: &mut Ctx, note: &str, audio_end: Instant) -> Check {
             "{note}, Siri did not answer as expected{closed}"
         ))),
         Answer::Yes => Ok(format!("{note}, Siri answered{closed}")),
-        _ => Err(Fail::skip(format!(
+        Answer::NoTerminal => Err(Fail::skip(format!(
+            "{note}, the answer on the TV was not checked, {NO_TERMINAL}{closed}"
+        ))),
+        Answer::Skip | Answer::NoInput | Answer::Done => Err(Fail::skip(format!(
             "{note}, the answer on the TV was not checked{closed}"
         ))),
     }
@@ -3200,10 +3333,13 @@ pub async fn siri_direct(ctx: &mut Ctx) -> Check {
     siri_answer(ctx, &note, audio_end).await
 }
 
-/// Siri mode id in `settings.json` of the driver. The driver loads a missing or unknown value
+/// Settings file of the driver. It has the debug log option and the Siri mode.
+const SETTINGS_FILE: &str = "settings.json";
+
+/// Siri mode id in [`SETTINGS_FILE`] of the driver. The driver loads a missing or unknown value
 /// as `auto`.
 fn siri_mode(ctx: &Ctx) -> String {
-    let text = std::fs::read_to_string(ctx.driver.dir.join("settings.json")).unwrap_or_default();
+    let text = std::fs::read_to_string(ctx.driver.dir.join(SETTINGS_FILE)).unwrap_or_default();
     let settings: Value = serde_json::from_str(&text).unwrap_or_default();
     match settings["siri_mode"].as_str() {
         Some("mrp") => "mrp".into(),
@@ -3349,7 +3485,7 @@ async fn siri_session(ctx: &mut Ctx, pcm: &[u8]) -> Check {
 async fn siri_result(
     ctx: &mut Ctx,
     session: u32,
-    mark: usize,
+    mark: LogMark,
     ready: u128,
     sent: usize,
     early: Option<Result<bool, String>>,
@@ -3369,12 +3505,12 @@ async fn siri_result(
     // The voice_end line can come a short time after the end event.
     let end_line = format!("=> voice_end({session}): ");
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut log = ctx.driver.log_since(mark);
+    let mut log = driver_log(&ctx.driver, mark);
     while !log.contains(&end_line) && Instant::now() < deadline {
         ctx.client.listen_ms(100).await?;
-        log = ctx.driver.log_since(mark);
+        log = driver_log(&ctx.driver, mark);
     }
-    let failed = lines_with(&log, &["Siri failed"]);
+    let failed = log.lines_with(&["Siri failed"]);
     ensure!(failed.is_empty(), "{}", failed.join(" | "));
     if let Err(message) = end {
         return Err(Fail::new(format!("assistant error: {message}")));
@@ -3384,9 +3520,9 @@ async fn siri_result(
         "no voice_begin line in the log"
     );
     let bytes = log
-        .lines()
+        .entries()
         .find_map(|l| {
-            let rest = l.split_once(&end_line)?.1;
+            let rest = l.message.split_once(&end_line)?.1;
             let (_, rest) = rest.split_once(" chunks, ")?;
             rest.split_once(" bytes")?.0.parse::<u64>().ok()
         })
@@ -3630,29 +3766,32 @@ pub async fn ws_close(ctx: &mut Ctx) -> Check {
     let mark = ctx.driver.log_len();
     let client = Client::connect(ctx.driver.port).await?;
     // The driver logs lines of a connection with its peer address as `[id]`.
-    let log = ctx.driver.log_since(mark);
-    let Some(id) = log
-        .lines()
-        .find_map(|l| l.split_once(NEW).map(|(_, id)| format!("[{}]", id.trim())))
-    else {
+    let log = driver_log(&ctx.driver, mark);
+    let Some(id) = log.entries().find_map(|l| {
+        l.message
+            .split_once(NEW)
+            .map(|(_, id)| format!("[{}]", id.trim()))
+    }) else {
         return Err(Fail::new("the driver logged no new connection"));
     };
     let stopped = format!("{id} stopped");
     client.close().await;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let log = ctx.driver.log_since(mark);
-        let lines = log.lines().filter(|l| l.contains(&id));
-        if lines.clone().any(|l| l.contains(&stopped)) {
-            if lines
-                .clone()
-                .any(|l| l.contains("Remote closed connection"))
-            {
+        let log = driver_log(&ctx.driver, mark);
+        let lines: Vec<&str> = log
+            .entries()
+            .map(|l| l.message)
+            .filter(|m| m.contains(&id))
+            .collect();
+        if lines.iter().any(|m| m.contains(&stopped)) {
+            if lines.iter().any(|m| m.contains("Remote closed connection")) {
                 return Ok("the driver read the close frame".into());
             }
             // The connection logs why it closes in its last line before `stopped`. The controller
             // logs "Remote disconnected" on another thread, so that line can come between them.
             let how = lines
+                .into_iter()
                 .take_while(|l| !l.contains(&stopped))
                 .filter(|l| !l.contains("Remote disconnected"))
                 .last()
@@ -3793,6 +3932,202 @@ pub async fn driver_restart(ctx: &mut Ctx) -> Check {
     Ok(format!("state {state} after {took} ms, {apps}{fresh}"))
 }
 
+/// Start the driver again, with or without `RUST_LOG`, and connect a new Remote. Waits until the
+/// media player is available.
+async fn restart_ready(ctx: &mut Ctx, rust_log: RustLog) -> Result<(), Fail> {
+    ctx.driver.launch(rust_log).await?;
+    ctx.reconnect().await?;
+    ctx.client.forget_states();
+    subscribe_all(ctx).await?;
+    wait_available(ctx, 30).await.map(|_| ())
+}
+
+/// The debug log option of the setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DebugLog {
+    On,
+    Off,
+}
+
+impl DebugLog {
+    /// The value in the settings file and in the setup.
+    const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// The Remote goes to standby and wakes, so the driver and ratv connect again and log.
+async fn wake_again(ctx: &mut Ctx) -> Result<(), Fail> {
+    remote_sleep(ctx).await?;
+    let mark = ctx.driver.log_len();
+    ctx.client.send_event("exit_standby").await?;
+    wait_joined(ctx, mark, Instant::now(), 15).await?;
+    // Time for the lines after the connect.
+    ctx.client.listen(2).await
+}
+
+/// Turn the debug log option on or off with "Save settings" in the configuration mode.
+async fn save_debug_log(ctx: &mut Ctx, option: DebugLog) -> Result<(), Fail> {
+    let key = ctx.key.clone();
+    let page = start_setup(ctx, true).await?;
+    ensure!(
+        field_ids(&page).iter().any(|f| f == "debug_log"),
+        "configuration mode page without debug_log: {page}"
+    );
+    ctx.client
+        .answer(
+            json!({ "choice": key, "action": "settings", "debug_log": option.is_on().to_string() }),
+        )
+        .await?;
+    ctx.client.setup_done(20).await
+}
+
+/// Wait up to 2 s until the settings file has `option` for the debug log. The driver writes the
+/// file in another thread.
+async fn wait_settings(ctx: &Ctx, option: DebugLog) -> Result<(), Fail> {
+    let on = option.is_on();
+    let settings = ctx.driver.dir.join(SETTINGS_FILE);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let saved = tokio::fs::read_to_string(&settings)
+            .await
+            .unwrap_or_default();
+        let value = serde_json::from_str::<Value>(&saved)
+            .ok()
+            .and_then(|v| v["debug_log"].as_bool());
+        if value == Some(on) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "{SETTINGS_FILE} after 2 s, debug log {on} expected: {saved}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The settings of `before` with the debug log option set to `option`. The other values stay. A
+/// missing file or one that is not a JSON object gives only the option.
+fn settings_with_debug_log(before: Option<&[u8]>, option: DebugLog) -> Value {
+    let mut settings: Value = before
+        .and_then(|s| serde_json::from_slice(s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    settings["debug_log"] = option.is_on().into();
+    settings
+}
+
+/// Write `before` back to the settings file at `path`. `None` removes the file, because there
+/// was none before.
+async fn restore_settings(path: &std::path::Path, before: Option<&[u8]>) -> Result<(), Fail> {
+    match before {
+        Some(bytes) => tokio::fs::write(path, bytes).await,
+        None => match tokio::fs::remove_file(path).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
+    .map_err(|e| Fail::new(format!("{} not set back: {e}", path.display())))
+}
+
+/// Start the driver with the debug log option off, turn it on in the setup, then off, then start
+/// the driver with the option on. `settings` is the settings file before the step. The driver
+/// starts without `RUST_LOG`, because `RUST_LOG` overrides the option.
+async fn debug_log_checks(ctx: &mut Ctx, settings: Option<&[u8]>) -> Check {
+    let off = settings_with_debug_log(settings, DebugLog::Off);
+    ctx.driver.stop().await;
+    let path = ctx.driver.dir.join(SETTINGS_FILE);
+    tokio::fs::write(&path, off.to_string())
+        .await
+        .map_err(|e| Fail::new(format!("{}: {e}", path.display())))?;
+    let mark = ctx.driver.log_len();
+    restart_ready(ctx, RustLog::Unset).await?;
+    ctx.client.listen(2).await?;
+    let lines = RawLog::since(&ctx.driver, mark).debug_lines();
+    ensure!(
+        lines == (0, 0),
+        "debug lines (driver, ratv) {lines:?} with the option off"
+    );
+
+    let mark = ctx.driver.log_len();
+    save_debug_log(ctx, DebugLog::On).await?;
+    ensure!(
+        !driver_log(&ctx.driver, mark).contains("RUST_LOG is used instead"),
+        "the driver uses RUST_LOG, but it was started without it"
+    );
+    wake_again(ctx).await?;
+    let (driver, ratv) = log_after(&ctx.driver, mark, "] debug log on")?.debug_lines();
+    ensure!(
+        driver > 0 && ratv > 0,
+        "{driver} driver and {ratv} ratv debug lines after the option was turned on"
+    );
+    wait_settings(ctx, DebugLog::On).await?;
+
+    let mark = ctx.driver.log_len();
+    save_debug_log(ctx, DebugLog::Off).await?;
+    log_after(&ctx.driver, mark, "] debug log off")?;
+    wait_settings(ctx, DebugLog::Off).await?;
+    // A debug line that was written while the option changed does not count.
+    let mark = ctx.driver.log_len();
+    wake_again(ctx).await?;
+    let after = RawLog::since(&ctx.driver, mark).debug_lines();
+    ensure!(
+        after == (0, 0),
+        "debug lines (driver, ratv) {after:?} after the option was turned off"
+    );
+
+    save_debug_log(ctx, DebugLog::On).await?;
+    wait_settings(ctx, DebugLog::On).await?;
+    ctx.driver.stop().await;
+    let mark = ctx.driver.log_len();
+    restart_ready(ctx, RustLog::Unset).await?;
+    ensure!(
+        driver_log(&ctx.driver, mark).contains("Debug log is on"),
+        "no 'Debug log is on' line after a start with the option on"
+    );
+    ensure!(
+        RawLog::since(&ctx.driver, mark).debug_lines().0 > 0,
+        "no driver debug lines after a start with the option on"
+    );
+    Ok(format!(
+        "option on ({driver} driver, {ratv} ratv debug lines), off, and on after a start"
+    ))
+}
+
+/// The debug log option of the setup. The driver of the other checks gets `RUST_LOG`, so the
+/// option has no effect there. At the end, on all paths, the settings file is set back and the
+/// driver is started again with `RUST_LOG`.
+pub async fn debug_log(ctx: &mut Ctx) -> Check {
+    let settings = ctx.driver.dir.join(SETTINGS_FILE);
+    let before = match tokio::fs::read(&settings).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Fail::new(format!("{}: {e}", settings.display()))),
+    };
+    let result = debug_log_checks(ctx, before.as_deref()).await;
+    ctx.driver.stop().await;
+    let file = restore_settings(&settings, before.as_deref()).await;
+    // Start the driver also when the check fails, so the next steps have a driver.
+    let started = restart_ready(ctx, RustLog::Set).await;
+    // The check error comes first, then the errors from setting things back.
+    let after: Vec<String> = [file.err(), started.err()]
+        .into_iter()
+        .flatten()
+        .map(|e| e.msg)
+        .collect();
+    match result {
+        Ok(note) if after.is_empty() => Ok(note),
+        Ok(_) => Err(Fail::new(after.join("; "))),
+        Err(mut e) => {
+            for msg in after {
+                e.msg.push_str("; ");
+                e.msg.push_str(&msg);
+            }
+            Err(e)
+        }
+    }
+}
+
 pub async fn config_file(ctx: &mut Ctx) -> Check {
     let device = device_config(ctx)?;
     for field in [
@@ -3879,28 +4214,38 @@ async fn reconnect_oracle(ctx: &mut Ctx) -> Result<(), Fail> {
 }
 
 /// Driver log lines when the connection to the Apple TV closes.
-const CLOSED: [&str; 3] = ["connection closed", "Companion closed", "Mrp closed"];
+/// The `]` before "connection closed" leaves out "Home Screen clear ended: connection closed".
+const CLOSED: [&str; 3] = ["] connection closed", "Companion closed", "Mrp closed"];
 
 /// The owner restarts the Apple TV. The driver must connect again. Only with `--only`.
 pub async fn atv_restart(ctx: &mut Ctx) -> Check {
     turn_on(ctx).await?;
     let mark = ctx.driver.log_len();
     let text = "Restart the Apple TV: Settings > System > Restart.";
-    if ask(ctx, Ask::Action("the restart started", SKIP_CHECK), text).await? != Answer::Done {
-        return Err(Fail::skip("no restart"));
+    let keys = Ask::Action {
+        done: "the restart started",
+        skip: SKIP_CHECK,
+    };
+    match ask(ctx, keys, text).await? {
+        Answer::Done => {}
+        Answer::NoTerminal => return Err(Fail::skip(NO_TERMINAL)),
+        Answer::NoInput => return Err(Fail::skip("no restart (no input)")),
+        Answer::Skip | Answer::Yes | Answer::No => return Err(Fail::skip("no restart")),
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(300);
-    let closed_at = |log: &str| CLOSED.iter().filter_map(|p| log.find(p)).min();
-    while closed_at(&ctx.driver.log_since(mark)).is_none() {
+    while !driver_log(&ctx.driver, mark).has_any(&CLOSED) {
         ensure!(Instant::now() < deadline, "no closed line in 300 s");
         ctx.client.listen_ms(200).await?;
     }
     let closed_ms = start.elapsed().as_millis();
     let joined_ms = loop {
         // Only a connect after the closed line counts.
-        let log = ctx.driver.log_since(mark);
-        if closed_at(&log).is_some_and(|at| joined(&log[at..])) {
+        let log = driver_log(&ctx.driver, mark);
+        if log
+            .first_with(&CLOSED)
+            .is_some_and(|at| joined(&log.lines_from(at)))
+        {
             break start.elapsed().as_millis();
         }
         ensure!(
@@ -3938,7 +4283,7 @@ const LAUNCH_WINDOW_MS: u64 = 4500;
 /// [`LAUNCH_WINDOW_MS`]. Needs a person, so only with `--only third_party`.
 pub async fn third_party(ctx: &mut Ctx) -> Check {
     if !terminal() {
-        return Err(Fail::skip("not asked: no terminal"));
+        return Err(Fail::skip(NO_TERMINAL));
     }
     turn_on(ctx).await?;
     let o = oracle(ctx)?;
@@ -3962,8 +4307,15 @@ pub async fn third_party(ctx: &mut Ctx) -> Check {
         "On the Apple TV, open {youtube}, start a video and wait until the video plays, after \
          any ads."
     );
-    if ask(ctx, Ask::Action("it plays", SKIP_CHECK), &text).await? != Answer::Done {
-        return Err(Fail::skip("no video started"));
+    let keys = Ask::Action {
+        done: "it plays",
+        skip: SKIP_CHECK,
+    };
+    match ask(ctx, keys, &text).await? {
+        Answer::Done => {}
+        Answer::NoTerminal => return Err(Fail::skip(NO_TERMINAL)),
+        Answer::NoInput => return Err(Fail::skip("no video started (no input)")),
+        Answer::Skip | Answer::Yes | Answer::No => return Err(Fail::skip("no video started")),
     }
     // The second connection first: without app and title there, the driver cannot show them.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -4053,7 +4405,7 @@ pub async fn restore_power(ctx: &mut Ctx) -> Check {
 }
 
 pub async fn log(ctx: &mut Ctx) -> Check {
-    let text = ctx.driver.log_text();
+    let text = RawLog::whole(&ctx.driver);
     // After a failed setup the driver may have no config, so also use the source file.
     let mut credentials = Vec::new();
     for path in [ctx.driver.config_file(), ctx.opt.config.clone()] {
@@ -4080,17 +4432,17 @@ pub async fn log(ctx: &mut Ctx) -> Check {
     ensure!(
         !credentials
             .iter()
-            .any(|c| c.len() > 24 && text.contains(&c[c.len() - 24..])),
+            .any(|c| c.len() > 24 && text.contains_anywhere(&c[c.len() - 24..])),
         "the log contains the credentials"
     );
-    ensure!(!text.contains("panicked"), "the driver panicked");
-    let lines = |tag: &str| -> Vec<&str> { text.lines().filter(|l| l.contains(tag)).collect() };
+    ensure!(!text.contains_anywhere("panicked"), "the driver panicked");
     // The broken file check causes one ERROR line.
-    let errors: Vec<&str> = lines(" ERROR ")
+    let errors: Vec<&str> = text
+        .level_lines("ERROR")
         .into_iter()
         .filter(|l| !l.contains("config.json.bad-"))
         .collect();
-    let warnings = lines(" WARN ");
+    let warnings = text.level_lines("WARN");
     for line in errors.iter().chain(&warnings) {
         println!("      {line}");
     }
@@ -4098,28 +4450,45 @@ pub async fn log(ctx: &mut Ctx) -> Check {
     Ok(format!(
         "{} warnings, no errors, no credentials. Log: {}",
         warnings.len(),
-        ctx.driver.log.display()
+        ctx.driver.log_display()
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::log::test_line as line;
+
+    fn log_of(raw: &str) -> DriverLog {
+        DriverLog::from_raw(raw)
+    }
+
+    fn quick_wake_of(raw: &str) -> Result<(), String> {
+        after_quick_wake(&log_of(raw))
+    }
+
+    fn joined_of(raw: &str) -> bool {
+        joined(&log_of(raw))
+    }
+
+    fn clear_ended_of(raw: &str) -> bool {
+        clear_ended(&log_of(raw))
+    }
 
     #[test]
     fn clear_ended_uses_the_last_line() {
-        let clear = format!("{HOME_CLEAR}\n");
-        let left = format!("{HOME_LEFT}\n");
-        let closed = format!("{HOME_CLOSED}\n");
-        assert!(!clear_ended(""));
-        assert!(!clear_ended(&clear));
-        assert!(clear_ended(&left));
-        assert!(clear_ended(&closed));
-        assert!(clear_ended(&format!("{clear}{left}")));
-        assert!(!clear_ended(&format!("{left}{clear}")));
-        assert!(clear_ended(&format!("{left}{clear}{closed}")));
-        assert!(!clear_ended(&format!("{closed}{clear}")));
-        assert!(!clear_ended(&format!("{clear}{closed}{clear}")));
+        let clear = line(HOME_CLEAR);
+        let left = line(HOME_LEFT);
+        let closed = line(HOME_CLOSED);
+        assert!(!clear_ended_of(""));
+        assert!(!clear_ended_of(&clear));
+        assert!(clear_ended_of(&left));
+        assert!(clear_ended_of(&closed));
+        assert!(clear_ended_of(&format!("{clear}{left}")));
+        assert!(!clear_ended_of(&format!("{left}{clear}")));
+        assert!(clear_ended_of(&format!("{left}{clear}{closed}")));
+        assert!(!clear_ended_of(&format!("{closed}{clear}")));
+        assert!(!clear_ended_of(&format!("{clear}{closed}{clear}")));
     }
 
     #[test]
@@ -4206,10 +4575,227 @@ mod tests {
 
     #[test]
     fn full_connect_lines() {
-        assert!(joined("INFO x] [ATV] connected in 812 ms (mDNS)"));
-        assert!(joined("INFO x] [ATV] MRP connected in 1200 ms"));
-        assert!(!joined(
-            "INFO x] [ATV] Companion connected in 300 ms (mDNS), MRP next"
+        assert!(joined_of(
+            "[t INFO  uc_intg_appletv::device::actor] [ATV] connected in 812 ms"
         ));
+        assert!(joined_of(
+            "[t INFO  uc_intg_appletv] [ATV] MRP connected in 1200 ms"
+        ));
+        assert!(!joined_of(
+            "[t INFO  uc_intg_appletv] [ATV] Companion connected in 300 ms (mDNS), MRP next"
+        ));
+        assert!(
+            !joined_of("[t DEBUG ratv] [ATV] connected in 80 ms"),
+            "ratv line"
+        );
+        assert!(
+            !joined_of("INFO x] [ATV] connected in 812 ms"),
+            "no line start"
+        );
+        let both = "[t INFO  uc_intg_appletv] [ATV] Companion and MRP connected in 50 ms";
+        assert!(joined_of(both), "MRP after Companion in one line");
+        assert_eq!(0, log_of(both).count(&CONNECT_LINES));
+    }
+
+    #[test]
+    fn quick_gaps_cover_the_connect() {
+        let awake =
+            |range: std::ops::Range<u64>| QUICK_GAPS_MS.iter().any(|g| range.contains(&g.0));
+        assert!(awake(0..30), "a standby before Companion is open");
+        assert!(
+            awake(30..100),
+            "a standby while Companion opens or MRP joins"
+        );
+        assert!(awake(300..1000), "a standby after the full connect");
+        assert!(
+            QUICK_GAPS_MS.iter().any(|&(a, s)| a >= 100 && s == 0),
+            "a wake while the old connection closes"
+        );
+    }
+
+    #[test]
+    fn after_quick_wake_needs_one_connect() {
+        let full = line("[ATV] connected in 80 ms (known)");
+        let full = full.as_str();
+        assert_eq!(Ok(()), quick_wake_of(full));
+        let joined = format!(
+            "{}{}",
+            line("[ATV] Companion connected in 30 ms (known), MRP next"),
+            line("[ATV] MRP connected in 60 ms")
+        );
+        let joined = joined.as_str();
+        assert_eq!(Ok(()), quick_wake_of(joined), "Companion, then MRP");
+        let added = line("[ATV] Companion connected in 40 ms");
+        assert_eq!(0, log_of(&added).count(&CONNECT_LINES), "added later");
+        let mrp_first = format!("{}{added}", line("[ATV] connected in 50 ms (known)"));
+        assert_eq!(
+            Ok(()),
+            quick_wake_of(&mrp_first),
+            "Companion added after MRP"
+        );
+        assert_eq!(
+            1,
+            log_of(&format!("{joined}{added}")).count(&CONNECT_LINES),
+            "Companion first"
+        );
+        assert_eq!(
+            Err("0 connects after the last exit_standby, expected 1: ".to_owned()),
+            quick_wake_of("")
+        );
+        let two = format!("{joined}{full}");
+        assert_eq!(
+            Err(format!(
+                "2 connects after the last exit_standby, expected 1: {} | {}",
+                line("[ATV] Companion connected in 30 ms (known), MRP next").trim_end(),
+                full.trim_end()
+            )),
+            quick_wake_of(&two)
+        );
+        let warn = |message: &str| line(message).replacen("INFO ", "WARN ", 1);
+        let other = format!(
+            "{full}[t DEBUG ratv::apple_tv] connection failed protocol=mrp\n\
+             [t DEBUG ratv::mrp] connection closed\n\
+             [t WARN  ratv::mrp] connection failed\n\
+             [t ERROR ratv::apple_tv] broken\n{}",
+            line("[ATV] not found on the network")
+        );
+        assert_eq!(
+            Ok(()),
+            quick_wake_of(&other),
+            "ratv lines and driver INFO lines do not count"
+        );
+        for bad in [
+            warn("[ATV] MRP did not connect: timeout. No Siri"),
+            warn("[ATV] connect failed: timeout"),
+            warn("[ATV] not connected: Mrp. No Siri"),
+            line("[ATV] broken").replacen("INFO ", "ERROR", 1),
+            line("[ATV] connection closed"),
+            line("[ATV] Companion closed. No apps"),
+        ] {
+            let log = format!("{full}{bad}");
+            assert_eq!(Err(bad.trim_end().to_owned()), quick_wake_of(&log), "{bad}");
+        }
+        // A WARN line about a closed connection is shown once.
+        let both = warn("[ATV] connection closed: reset");
+        assert_eq!(
+            Err(both.trim_end().to_owned()),
+            quick_wake_of(&format!("{full}{both}"))
+        );
+    }
+
+    /// A new empty folder in the temp folder for one test.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("remote-sim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test folder");
+        dir
+    }
+
+    #[tokio::test]
+    async fn settings_are_set_back() {
+        let dir = test_dir("settings");
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::write(&path, r#"{"debug_log":false}"#).expect("write");
+        let before = br#"{"debug_log":true,"siri_mode":"auto"}"#;
+        assert!(restore_settings(&path, Some(before)).await.is_ok());
+        assert_eq!(before.as_slice(), std::fs::read(&path).expect("read"));
+        assert!(restore_settings(&path, None).await.is_ok());
+        assert!(!path.exists(), "a file that did not exist is removed");
+        assert!(restore_settings(&path, None).await.is_ok(), "no file");
+        // A folder at the path cannot be written or removed as a file.
+        std::fs::create_dir(&path).expect("folder");
+        for before in [Some(before.as_slice()), None] {
+            let error = restore_settings(&path, before).await.expect_err("folder");
+            assert!(error.msg.contains("not set back"), "{}", error.msg);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_keep_other_values() {
+        let before = br#"{"debug_log":true,"siri_mode":"mrp"}"#;
+        assert_eq!(
+            json!({ "debug_log": false, "siri_mode": "mrp" }),
+            settings_with_debug_log(Some(before), DebugLog::Off)
+        );
+        assert_eq!(
+            json!({ "debug_log": true }),
+            settings_with_debug_log(Some(b"{broken"), DebugLog::On)
+        );
+        assert_eq!(
+            json!({ "debug_log": false }),
+            settings_with_debug_log(Some(b"[1]"), DebugLog::Off)
+        );
+        assert_eq!(
+            json!({ "debug_log": false }),
+            settings_with_debug_log(None, DebugLog::Off)
+        );
+    }
+
+    #[test]
+    fn closed_lines_count_after_the_mark() {
+        let dir = test_dir("closed");
+        let driver = Driver::new(std::path::Path::new("none"), &dir, 0);
+        let start = LogMark::at(0);
+        assert!(closed_lines(&driver, start).is_empty(), "no log");
+        let first = line("[A] connection closed");
+        driver.append_test_log(&first);
+        let mark = driver.log_len();
+        assert_eq!(first.trim_end(), closed_lines(&driver, start));
+        assert!(closed_lines(&driver, mark).is_empty(), "an earlier line");
+        let mut log = String::new();
+        for message in [
+            "[A] connected in 20 ms",
+            "[A] connection closed: reset",
+            "[A] Companion closed. x",
+            "[A] Mrp closed: y. z",
+        ] {
+            log.push_str(&line(message));
+        }
+        log.push_str("[t DEBUG ratv::mrp] connection closed\n");
+        // A driver line about the Home Screen, not about the connection.
+        log.push_str(&line(HOME_CLOSED).replacen("INFO ", "DEBUG", 1));
+        driver.append_test_log(&log);
+        let after = [
+            line("[A] connection closed: reset"),
+            line("[A] Companion closed. x"),
+            line("[A] Mrp closed: y. z"),
+        ]
+        .map(|l| l.trim_end().to_owned())
+        .join(" | ");
+        assert_eq!(after, closed_lines(&driver, mark));
+        assert_eq!(
+            format!("{} | {after}", first.trim_end()),
+            closed_lines(&driver, start)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_keys_and_answers() {
+        let action = Ask::Action {
+            done: "done",
+            skip: SKIP_CHECK,
+        };
+        let question = Ask::Question {
+            yes: "yes",
+            no: "no",
+            skip: "do not wait",
+        };
+        assert_eq!(
+            "Enter = done, s + Enter = skip this check",
+            keys_text(action)
+        );
+        assert_eq!(
+            "y + Enter = yes, n + Enter = no, s + Enter = do not wait",
+            keys_text(question)
+        );
+        assert_eq!(Some(Answer::Done), parse_answer(action, ""));
+        assert_eq!(Some(Answer::Skip), parse_answer(action, " S "));
+        assert_eq!(None, parse_answer(action, "y"));
+        assert_eq!(Some(Answer::Yes), parse_answer(question, "Y"));
+        assert_eq!(Some(Answer::No), parse_answer(question, "n"));
+        assert_eq!(Some(Answer::Skip), parse_answer(question, "s"));
+        assert_eq!(None, parse_answer(question, ""));
     }
 }

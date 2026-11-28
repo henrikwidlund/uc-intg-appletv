@@ -271,8 +271,8 @@ mod tests {
         });
         let lines = capture.lines();
         let rests: Vec<&str> = lines.iter().map(|l| split_time(l).1).collect();
-        // The remote-sim tool finds levels with " ERROR " and " WARN ", so a space must come
-        // before and after the level name.
+        // The remote-sim tool splits `[<time> <level> <target>]` at spaces to read the level and
+        // the target, so spaces must separate them.
         assert_eq!(
             vec![
                 "INFO  uc_intg_appletv::device::actor] [A] connected in 20 ms",
