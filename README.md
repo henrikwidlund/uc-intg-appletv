@@ -51,35 +51,37 @@ from one integration to the other.
 
 - With an IP address in the setup, the driver asks that address directly. This also works when the
   Apple TV is in another network (VLAN) and only mDNS is forwarded between the networks.
-- If the Apple TV gets a new IP address, the driver finds it on the network and saves the new address.
+- If the Apple TV gets a new IP address, the driver finds it on the network and saves the new
+  address.
 - After the Remote wakes up, the driver connects to the last address first. While the network of the
   Remote starts, it tries again every 50 ms for up to 3 seconds. A connect step without an answer in
   0.5 seconds is started again once.
 - A command that comes while the driver connects waits up to 10 seconds for the connection.
   After that, the command is dropped.
-  The driver connects Companion first. Commands wait at most 0.5 seconds for MRP. Siri in the
+- The driver connects Companion first. Commands wait at most 0.5 seconds for MRP. Siri in the
   _MRP only_ mode waits for the MRP connect, also at most 10 seconds.
 - If 3 commands time out within 60 seconds, the driver connects again.
 
 ## Requirements
 
-- Apple TV HD (4th generation) or Apple TV 4K (all generations). Older models, and devices that do not
-  report a model, are not shown in the setup.
+- Apple TV HD (4th generation) or Apple TV 4K (all generations). Older models, and devices that do
+  not report a model, are not shown in the setup.
   Tested with an Apple TV 4K (1st generation) on tvOS 26.6.1 and an Apple TV from 2026 (AppleTV18,1)
   on tvOS 27.2.1.
-- The Apple TV and the Remote are on the same network or use a mDNS reflector. Multicast DNS (mDNS) must not be blocked.
+- The Apple TV and the Remote are on the same network or use an mDNS reflector.
+  Multicast DNS (mDNS) must not be blocked.
 - On the Apple TV, in the AirPlay settings: set _Allow Access_ to _Anyone on the Same Network_.
 - For the voice assistant, Siri must be on in the Apple TV settings: Settings > General > Siri.
-- A fixed IP address for the Apple TV (DHCP reservation) is recommended. The driver then finds the Apple TV
-  faster after a restart.
+- A fixed IP address for the Apple TV (DHCP reservation) is recommended. The driver then finds the
+  Apple TV faster after a restart.
 
 ## Known limits
 
 - Volume control works only if the Apple TV can change the volume of the TV or receiver (HDMI CEC).
   Otherwise the volume controls stay on the Remote, but they do nothing. For set volume and mute,
   the driver logs it. The _Volume control_ sensor shows off.
-- The Apple TV does not report the app in front. The app select shows the app opened through the driver or
-  the app that plays media.
+- The Apple TV does not report the app in front. The app select shows the app opened through the
+  driver or the app that plays media.
 - The Apple TV does not report the current account. The account select shows the last account chosen
   through the driver.
 - Metadata, artwork and playback speeds depend on the app. Many apps send only some of them.
@@ -110,8 +112,8 @@ _Apple TV on the network_. The entity ids stay the same.
 
 The driver can also run on a computer as an external integration. The Remote finds it with mDNS.
 
-Each release has binaries for Linux, macOS and Windows, for amd64 and arm64. The Linux binaries are static
-and run on any distribution.
+Each release has binaries for Linux, macOS and Windows, for amd64 and arm64.
+The Linux binaries are static and run on any distribution.
 
 ```shell
 cargo run --release
@@ -139,51 +141,67 @@ docker run -d --name uc-intg-appletv --network host \
   -v uc-intg-appletv:/data henrikwidlund/uc-intg-appletv
 ```
 
-- The image runs as user `65532`. A named volume works as it is. For a folder on the host, give that user write access.
-- `--network host` lets the driver find the Apple TV and announce itself with mDNS. It works on Linux only.
-- Without host networking, publish the port with `-p 9090:9090` and add `-e UC_DISABLE_MDNS_PUBLISH=true`.
-  Add the driver to the Remote with the IP address of the computer, and enter the IP address of the
-  Apple TV in the setup.
+- The image runs as user `65532`. A named volume works as it is. For a folder on the host, give
+  that user write access.
+- `--network host` lets the driver find the Apple TV and announce itself with mDNS. It works on
+  Linux only.
+- Without host networking, publish the port with `-p 9090:9090` and add
+  `-e UC_DISABLE_MDNS_PUBLISH=true`. Add the driver to the Remote with the IP address of the
+  computer. Enter the IP address of the Apple TV in the setup.
 - The image has no shell. To change a setting, use the variables in the table above.
 
 ## Debug log
 
-For an error report, turn on the debug log: tick _Debug log_ on the _Restore_ page of a new setup, or run the
-setup again, tick _Debug log_ and choose _Save settings_.
-The driver and ratv then write more lines to the log. It takes effect at once and stays on after a restart.
-Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
+For an error report, turn on the debug log. Either:
 
-Log line layout: `[<UTC time> <level> <target>] <message> <fields> <spans>`. Nested spans are joined with `:`, for
-example `device{name="Living Room"}:session{protocol="apple tv" id=1}:session{protocol="mrp" id=3
+- Tick _Debug log_ on the _Restore_ page of a new setup.
+- Or run the setup again, tick _Debug log_ and choose _Save settings_.
+
+The driver and ratv then write more lines to the log. It takes effect at once and stays on after a
+restart. Turn it off the same way when you are done. `RUST_LOG` overrides this setting.
+
+_Siri protocol_ is on the same pages. Keep it at _Auto_: Siri then uses the same protocol as the
+iPhone remote. _MRP only_ is only for finding errors.
+
+### Log format
+
+Log line layout: `[<UTC time> <level> <target>] <message> <fields> <spans>`.
+Nested spans are joined with `:`, for example
+`device{name="Living Room"}:session{protocol="apple tv" id=1}:session{protocol="mrp" id=3
 addr=192.168.1.20:49152}` (one line).
 
 - `device{name=...}`: the Apple TV that the driver works with.
 - `setup{ws=...}`: the setup of the Remote connection with this address.
-- `session{...}`: the ratv connection, pairing or connect. Each session gets its own `id`, so all lines of one
-  connection have the same `id`.
+- `session{...}`: the ratv connection, pairing or connect. Each session gets its own `id`, so all
+  lines of one connection have the same `id`.
 
 New spans start only at debug level: with the debug log on, or with `RUST_LOG` set to
-`info,uc_intg_appletv=debug,ratv=debug`. A connection keeps the spans it got when it connected: after the debug log is
-turned on or off, or after the Apple TV is renamed, its lines show the new spans from the next connect.
+`info,uc_intg_appletv=debug,ratv=debug`.
 
-On Linux, when the output goes to the systemd journal (`JOURNAL_STREAM` names the stderr of the driver), each log
-entry starts with a priority prefix such as `<7>`. The journal then gets the level of each entry, and
-`journalctl -p warning` shows only warnings and errors. The second and later lines of a message with more than one
-line, and the output of a panic, get the default priority of the journal.
+A connection keeps the spans it got when it connected. After the debug log is turned on or off, or
+after the Apple TV is renamed, its lines show the new spans from the next connect.
 
-_Siri protocol_ is on the same pages. Keep it at _Auto_: Siri then uses the same protocol as the iPhone remote.
-_MRP only_ is only for finding errors.
+### systemd journal
+
+On Linux, the output can go to the systemd journal (`JOURNAL_STREAM` names the stderr of the
+driver). Then each log entry starts with a priority prefix such as `<7>`:
+
+- The journal gets the level of each entry, and `journalctl -p warning` shows only warnings and
+  errors.
+- The second and later lines of a message with more than one line, and the output of a panic, get
+  the default priority of the journal.
 
 ## Backup and restore
 
-Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a text field.
-Copy it and keep it in a safe place.
+Run the setup again on the Remote and choose _Backup configuration_. The driver shows the data in a
+text field. Copy it and keep it in a safe place.
 
-To restore, choose _Restore configuration from backup_ in the setup, or tick _Restore from backup_ on the
-_Restore_ page of a new setup. Paste the data. It replaces all configured devices.
+To restore, choose _Restore configuration from backup_ in the setup, or tick _Restore from backup_ on
+the _Restore_ page of a new setup. Paste the data. It replaces all configured devices.
 
-The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never writes the backup
-data to the log. With `UC_API_MSG_TRACING`, the backup data and the PIN are shown as `***`.
+The backup contains the pairing keys of the Apple TV devices. Do not share it. The driver never
+writes the backup data to the log. With `UC_API_MSG_TRACING`, the backup data and the PIN are
+shown as `***`.
 
 ## Build
 
@@ -216,16 +234,33 @@ cargo test --locked --features dhat-heap dhat_ -- --ignored --test-threads=1
 To add one, measure with `util::alloc_count::blocks` and set the limit to the measured count.
 Name it `dhat_…`, gate it with the `dhat-heap` feature and mark it `#[ignore]`.
 
+ratv is a git dependency with a fixed commit. To test local ratv changes, add this to
+`~/.cargo/config.toml` and remove it when you are done:
+
+```toml
+[patch."https://github.com/henrikwidlund/ratv"]
+ratv = { path = "/path/to/ratv/crates/ratv" }
+```
+
+### Manual tests
+
 `tools/manual_test.sh` runs the tests that need a person, and the tests that `tools/remote-sim` does
-not have yet, with a real Apple TV and Remote, one step at a time.
+not have yet. It uses a real Apple TV and Remote and runs one step at a time.
 It saves the results to `test-results/manual-test-results-<time>.md`.
 
+### Device tests with remote-sim
+
 `tools/remote-sim` tests the driver with a real Apple TV without a Remote. It starts the driver,
-connects to it like a Remote and runs the checks. It uses the driver pairing
-in `config.json`. `pair-driver` makes this file: it runs the setup of the driver and asks for the
-PIN. An old file is kept as `config.json.old-<time>`. A second connection with its own pairing
-reads the values of the Apple TV to compare them with the driver. `pair` pairs it. Each pairing
-command adds a paired device on the Apple TV.
+connects to it like a Remote and runs the checks.
+
+It uses two pairings:
+
+- The driver pairing in `config.json`. `pair-driver` makes this file: it runs the setup of the
+  driver and asks for the PIN. An old file is kept as `config.json.old-<time>`.
+- A second connection with its own pairing. It reads the values of the Apple TV to compare them
+  with the driver. `pair` pairs it.
+
+Each pairing command adds a paired device on the Apple TV.
 
 ```shell
 cargo build --release
@@ -235,53 +270,84 @@ tools/remote-sim/target/debug/remote-sim pair 192.168.1.20
 tools/remote-sim/target/debug/remote-sim 192.168.1.20
 ```
 
-Start a movie with chapters and more than one audio or subtitle language in the Apple TV app before
-the run. The checks also test commands, artwork and Siri right after a wake from standby, Home while
-an app plays, and playback speeds set on the Apple TV. `wake_home` pauses the video, presses Home
-and checks that the driver shows no old item after a wake onto the Home Screen. When the second
-connection shows the Home Screen and nothing plays, the checks accept a cleared title and source on
-the driver; `standby` requires title, image and source cleared. Some checks ask on the terminal: to
-start the right video when it is missing, to choose a speed on the TV when tvOS does not take it
-from the second connection, and whether Siri answered. The prompt says what each key does. Without a
-terminal the checks do not ask. On a terminal, remote-sim reads it from the start, so lines typed
-before a prompt are dropped. A run in the background with a terminal stdin stops; use `< /dev/null`
-there. The results file has the questions and the answers. The time of a step includes the time you
-need to answer. The Siri checks use the macOS `say` command to speak "What time is it". Siri answers
-some seconds after the audio. Closing the Apple TV connection earlier loses the answer, so the Siri
-checks keep the connections open until you answer, or for 20 s without a terminal. Then they close
-the answer with Back. Do not close it with Apple's Siri Remote during a run. If the TV stays dimmed
-after a Siri check, press Siri on a remote, then Back twice. The audio ends 300 ms after the speech.
-`--siri-hold` sends 1500 ms of silence instead, like a user who holds the button past the end of
-listening. On tvOS 27.2.1 this leaves the dimmed Siri overlay on the Apple TV, which blocks
-navigation until Siri and then Back twice are pressed. It is for testing that. `siri_wake` tests
-Siri at wake in the _Auto_ mode: Siri over MRP does not work on tvOS 27 and later. `siri_direct`
-sends the same audio to Siri through ratv directly, without the driver, to compare with Siri through
-the driver. `third_party` asks you to open YouTube and start a video, checks that the driver shows
-its app and title, then pauses it, opens Settings and checks that the source stays Settings until
-4.5 s after the command; it runs only with `--only third_party`. `atv_restart` asks you to restart
-the Apple TV and measures the reconnect; it runs only with `--only atv_restart`.
-
-`--only a,b` and `--skip a,b` choose the checks; both can be given more than once. `--only` also
-runs `setup`, `entities` and `states`, because the other checks need them, and `restore_power`
-and `log` at the end, unless `--skip` names them. Unknown step names are refused. If `setup`,
-`entities` or `states` fails, only `restore_power` and `log` run after it. With `--skip setup`,
-`entities` fails, because the driver has no device. `--no-power` skips the `power` check.
-`restore_power` still turns the Apple TV off at the end if it was off at the start. To keep the
-Apple TV on, add `--skip restore_power`. The results are saved to
-`test-results/remote-sim-results-<time>.md`. `RUST_LOG` is added to the driver log filter, and its
-values win, for example `RUST_LOG=ratv::mrp=trace`. The checks read debug lines of the driver, so a
-`RUST_LOG` must keep `uc_intg_appletv` at debug or trace.
+Before the run, start a movie with chapters and more than one audio or subtitle language in the
+Apple TV app.
 
 CI checks the format of the tool, runs clippy and runs its unit tests, but not the checks
 against an Apple TV.
 
-ratv is a git dependency with a fixed commit. To test local ratv changes, add this to
-`~/.cargo/config.toml` and remove it when you are done:
+#### Checks
 
-```toml
-[patch."https://github.com/henrikwidlund/ratv"]
-ratv = { path = "/path/to/ratv/crates/ratv" }
-```
+The checks also test:
+
+- Commands, artwork and Siri right after a wake from standby.
+- Home while an app plays.
+- Playback speeds set on the Apple TV.
+
+When the second connection shows the Home Screen and nothing plays, the checks accept a cleared
+title and source on the driver. `standby` requires title, image and source cleared.
+
+Some checks in detail:
+
+- `wake_home` pauses the video and presses Home. Then it checks that the driver shows no old item
+  after a wake onto the Home Screen.
+- `siri_wake` tests Siri at wake in the _Auto_ mode. Siri over MRP does not work on tvOS 27 and
+  later.
+- `siri_direct` sends the same audio to Siri through ratv directly, without the driver. This
+  compares Siri with and without the driver.
+- `third_party` asks you to open YouTube and start a video. It checks that the driver shows its app
+  and title. Then it pauses the video, opens Settings and checks that the source stays Settings
+  until 4.5 s after the command. It runs only with `--only third_party`.
+- `atv_restart` asks you to restart the Apple TV and measures the reconnect. It runs only with
+  `--only atv_restart`.
+
+#### Questions on the terminal
+
+Some checks ask on the terminal:
+
+- To start the right video when it is missing.
+- To choose a speed on the TV when tvOS does not take it from the second connection.
+- Whether Siri answered.
+
+The prompt says what each key does. The results file has the questions and the answers.
+The time of a step includes the time you need to answer.
+
+- Without a terminal, the checks do not ask.
+- On a terminal, remote-sim reads it from the start, so lines typed before a prompt are dropped.
+- A run in the background with a terminal stdin stops. Use `< /dev/null` there.
+
+#### Siri checks
+
+- The Siri checks use the macOS `say` command to speak "What time is it". The audio ends 300 ms
+  after the speech.
+- Siri answers some seconds after the audio. Closing the Apple TV connection earlier loses the
+  answer. So the Siri checks keep the connections open until you answer, or for 20 s without a
+  terminal. Then they close the answer with Back.
+- Do not close the answer with Apple's Siri Remote during a run.
+- If the TV stays dimmed after a Siri check, press Siri on a remote, then Back twice.
+- `--siri-hold` sends 1500 ms of silence after the speech instead of 300 ms, like a user who holds
+  the button past the end of listening. On tvOS 27.2.1 this leaves the dimmed Siri overlay on the
+  Apple TV. The overlay blocks navigation until Siri and then Back twice are pressed. The option is
+  for testing that.
+
+#### Choose checks
+
+- `--only a,b` and `--skip a,b` choose the checks. Both can be given more than once. Unknown step
+  names are refused.
+- `--only` also runs `setup`, `entities` and `states`, because the other checks need them. At the
+  end it runs `restore_power` and `log`, unless `--skip` names them.
+- If `setup`, `entities` or `states` fails, only `restore_power` and `log` run after it.
+- With `--skip setup`, `entities` fails, because the driver has no device.
+- `--no-power` skips the `power` check. `restore_power` still turns the Apple TV off at the end if
+  it was off at the start. To keep the Apple TV on, add `--skip restore_power`.
+
+#### Results and log
+
+The results are saved to `test-results/remote-sim-results-<time>.md`.
+
+`RUST_LOG` is added to the driver log filter, and its values win, for example
+`RUST_LOG=ratv::mrp=trace`. The checks read debug lines of the driver, so a `RUST_LOG` must keep
+`uc_intg_appletv` at debug or trace.
 
 ## License
 
