@@ -2,5 +2,6 @@
 linker = "ucr2-aarch64-none-linux-gnu-gcc"
 rustflags = "-C target-cpu=cortex-a55"
 
+# The test job in .github/workflows/ci.yml repeats this flag: RUSTFLAGS replaces it.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
